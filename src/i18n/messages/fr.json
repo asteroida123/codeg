@@ -1740,6 +1740,7 @@
     "conversationCard": {
       "untitledConversation": "Conversation sans titre",
       "newConversation": "Nouvelle conversation",
+      "attachToCurrentSession": "Ajouter à la session",
       "rename": "Renommer",
       "status": "Statut",
       "delete": "Supprimer",
@@ -1822,6 +1823,16 @@
         "cacheRead": "Lecture cache",
         "cacheWrite": "Écriture cache",
         "total": "Total des tokens"
+      },
+      "quickActions": {
+        "title": "Actions rapides",
+        "groups": {
+          "workspace": "Espace de travail",
+          "sessions": "Sessions",
+          "automation": "Automatisation et tâches",
+          "more": "Plus"
+        },
+        "showPet": "Afficher la mascotte"
       }
     },
     "auxPanel": {
@@ -2684,6 +2695,7 @@
         "slashCommands": "Commandes slash",
         "slashSearchPlaceholder": "Rechercher des commandes...",
         "slashSearchEmpty": "Aucune commande correspondante",
+        "slashLoading": "Chargement des commandes…",
         "experts": "Experts",
         "office": "Bureautique",
         "research": "Recherche",
@@ -3329,7 +3341,9 @@
         },
         "recovered": "Rétabli",
         "retryUnavailable": "Aucun message précédent à renvoyer.",
-        "toggleDetails": "Afficher/masquer les détails"
+        "toggleDetails": "Afficher/masquer les détails",
+        "dismiss": "Ignorer",
+        "moreIncidents": "+{count} autre(s)"
       },
       "backgroundTasks": {
         "running": "{count, plural, one {# tâche en arrière-plan en cours} other {# tâches en arrière-plan en cours}}",

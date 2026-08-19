@@ -1740,6 +1740,7 @@
     "conversationCard": {
       "untitledConversation": "محادثة بدون عنوان",
       "newConversation": "محادثة جديدة",
+      "attachToCurrentSession": "إضافة إلى الجلسة",
       "rename": "إعادة تسمية",
       "status": "الحالة",
       "delete": "حذف",
@@ -1822,6 +1823,16 @@
         "cacheRead": "قراءة الكاش",
         "cacheWrite": "كتابة الكاش",
         "total": "الإجمالي"
+      },
+      "quickActions": {
+        "title": "إجراءات سريعة",
+        "groups": {
+          "workspace": "مساحة العمل",
+          "sessions": "الجلسات",
+          "automation": "الأتمتة والمهام",
+          "more": "المزيد"
+        },
+        "showPet": "إظهار الحيوان الأليف"
       }
     },
     "auxPanel": {
@@ -2684,6 +2695,7 @@
         "slashCommands": "أوامر الشرطة المائلة",
         "slashSearchPlaceholder": "البحث عن الأوامر...",
         "slashSearchEmpty": "لا توجد أوامر مطابقة",
+        "slashLoading": "جارٍ تحميل الأوامر…",
         "experts": "الخبراء",
         "office": "الأعمال المكتبية",
         "research": "البحث العلمي",
@@ -3329,7 +3341,9 @@
         },
         "recovered": "تم التعافي",
         "retryUnavailable": "لا توجد رسالة سابقة لإعادة إرسالها.",
-        "toggleDetails": "تبديل التفاصيل"
+        "toggleDetails": "تبديل التفاصيل",
+        "dismiss": "تجاهل",
+        "moreIncidents": "+{count} أخرى"
       },
       "backgroundTasks": {
         "running": "{count, plural, one {مهمة خلفية واحدة قيد التشغيل} two {مهمتا خلفية قيد التشغيل} few {# مهام خلفية قيد التشغيل} other {# مهمة خلفية قيد التشغيل}}",

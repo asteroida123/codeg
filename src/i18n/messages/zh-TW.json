@@ -1740,6 +1740,7 @@
     "conversationCard": {
       "untitledConversation": "未命名會話",
       "newConversation": "新增會話",
+      "attachToCurrentSession": "添加到會話",
       "rename": "重新命名",
       "status": "狀態",
       "delete": "刪除",
@@ -1822,6 +1823,16 @@
         "cacheRead": "快取讀取",
         "cacheWrite": "快取寫入",
         "total": "總計"
+      },
+      "quickActions": {
+        "title": "快捷操作",
+        "groups": {
+          "workspace": "工作區",
+          "sessions": "會話",
+          "automation": "自動化與待辦",
+          "more": "更多"
+        },
+        "showPet": "顯示寵物"
       }
     },
     "auxPanel": {
@@ -2684,6 +2695,7 @@
         "slashCommands": "斜線命令",
         "slashSearchPlaceholder": "搜尋命令...",
         "slashSearchEmpty": "沒有符合的指令",
+        "slashLoading": "正在載入指令…",
         "experts": "專家",
         "office": "日常辦公",
         "research": "科學研究",
@@ -3329,7 +3341,9 @@
         },
         "recovered": "已恢復",
         "retryUnavailable": "沒有可重發的訊息。",
-        "toggleDetails": "展開/收合詳情"
+        "toggleDetails": "展開/收合詳情",
+        "dismiss": "忽略",
+        "moreIncidents": "另 {count} 條"
       },
       "backgroundTasks": {
         "running": "{count} 個背景任務執行中",

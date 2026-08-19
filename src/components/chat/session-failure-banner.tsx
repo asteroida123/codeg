@@ -9,22 +9,34 @@
  *   (`retry` / `login` / `new_session` — the vocabulary the adapters emit;
  *   unknown actions are simply not rendered). Terminal errors stay until the
  *   user acts: sending a new prompt settles them (reducer), and a recurrence
- *   re-arms via a higher revision.
+ *   re-arms via a higher revision. Every error renders its own strip.
  * - ACTIVE severity-"warning" records use the amber palette (matching the
- *   config-stale banner) with no buttons — they represent in-flight retry
- *   incidents that settle at the turn boundary; on advertising connections
- *   codex routes what used to be the `turn_retrying` channel here.
+ *   config-stale banner) and collapse to the LATEST one plus a hidden count:
+ *   they are in-flight retry incidents that settle as soon as the turn makes
+ *   progress, and on advertising connections codex routes what used to be the
+ *   single-slot `turn_retrying` channel here — one strip per record stacked a
+ *   fresh row for every reconnect of a long turn (issue #496).
+ *
  * - Of the RESOLVED records only the most recent recovered WARNING renders,
  *   as one muted "recovered" line — evidence of what happened mid-turn
- *   without stacking history under the composer. Resolved records still live
- *   in the reducer table as revision watermarks; resolved errors (settled by
- *   the user acting) render nothing.
+ *   without stacking history under the composer. It is a TRANSIENT
+ *   confirmation: it self-dismisses after `RECOVERED_VISIBLE_MS`, because
+ *   records are retained forever as revision watermarks and nothing else
+ *   would ever take it down. Resolved records still live in the reducer table
+ *   as watermarks; resolved errors (settled by the user acting) render
+ *   nothing.
+ *
+ * EVERY strip carries a close button, recovered line included. Retry actions
+ * stay off warnings (re-prompting mid-recovery would enqueue a second turn),
+ * but dismissing is always the user's to do — and unlike the settle passes it
+ * is available to viewers, since it only touches their own client's
+ * projection.
  *
  * Adapter-authored `title`/`details` are shown verbatim (already user-facing
  * prose); a blank title falls back to the localized category label.
  */
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { useTranslations } from "next-intl"
 import {
   AlertCircle,
@@ -39,17 +51,21 @@ import {
   RefreshCw,
   ServerCrash,
   WifiOff,
+  X,
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 import type { SessionFailureRecord } from "@/lib/types"
 import {
-  activeSessionFailures,
+  activeSessionFailureView,
   knownSessionFailureActions,
-  resolvedSessionFailures,
+  mostRecentRecoveredWarning,
   type SessionFailureAction,
 } from "@/lib/session-failures"
+
+/** How long the muted "recovered" confirmation stays before self-dismissing. */
+const RECOVERED_VISIBLE_MS = 10_000
 
 const CATEGORY_ICONS: Record<string, typeof AlertCircle> = {
   connection: WifiOff,
@@ -100,26 +116,46 @@ interface Props {
     action: SessionFailureAction,
     failure: SessionFailureRecord
   ) => void
+  /** Closes a strip (client-local), taking every id that strip stands for —
+   *  the collapsed warning bar closes its hidden siblings too. Omitted only
+   *  where there is no store to write back to; unlike `onAction` this is NOT
+   *  gated on session ownership. */
+  onDismiss?: (ids: string[]) => void
 }
 
-export function SessionFailureBanner({ failures, onAction }: Props) {
-  const active = activeSessionFailures(failures)
-  const recoveredWarnings = resolvedSessionFailures(failures).filter(
-    (f) => f.severity === "warning"
-  )
-  const recovered = recoveredWarnings[recoveredWarnings.length - 1]
-  if (active.length === 0 && !recovered) return null
+export function SessionFailureBanner({ failures, onAction, onDismiss }: Props) {
+  const { errors, warning, hiddenWarnings, warningIds } =
+    activeSessionFailureView(failures)
+  const recovered = mostRecentRecoveredWarning(failures)
+  const hasActive = errors.length > 0 || warning !== null
+  if (!hasActive && !recovered) return null
   return (
     <>
-      {active.map((failure) => (
+      {errors.map((failure) => (
         <ActiveFailureStrip
           key={failure.id}
           failure={failure}
+          dismissIds={[failure.id]}
           onAction={onAction}
+          onDismiss={onDismiss}
         />
       ))}
-      {active.length === 0 && recovered && (
-        <RecoveredStrip failure={recovered} />
+      {warning && (
+        <ActiveFailureStrip
+          key={warning.id}
+          failure={warning}
+          hiddenCount={hiddenWarnings}
+          dismissIds={warningIds}
+          onAction={onAction}
+          onDismiss={onDismiss}
+        />
+      )}
+      {!hasActive && recovered && (
+        <RecoveredStrip
+          key={`${recovered.id}@${recovered.revision}`}
+          failure={recovered}
+          onDismiss={onDismiss}
+        />
       )}
     </>
   )
@@ -127,10 +163,18 @@ export function SessionFailureBanner({ failures, onAction }: Props) {
 
 function ActiveFailureStrip({
   failure,
+  hiddenCount = 0,
+  dismissIds,
   onAction,
+  onDismiss,
 }: {
   failure: SessionFailureRecord
+  /** Older active warnings folded behind this one, shown as a count. */
+  hiddenCount?: number
+  /** Every record this strip stands for — what its close button dismisses. */
+  dismissIds: string[]
   onAction?: Props["onAction"]
+  onDismiss?: Props["onDismiss"]
 }) {
   const t = useTranslations("Folder.chat.sessionFailure")
   const [expanded, setExpanded] = useState(false)
@@ -163,6 +207,11 @@ function ActiveFailureStrip({
         >
           {title}
         </span>
+        {hiddenCount > 0 && (
+          <span className="shrink-0 text-[10px] font-medium opacity-70">
+            {t("moreIncidents", { count: hiddenCount })}
+          </span>
+        )}
         {actions.map((action) => {
           const ActionIcon = ACTION_ICONS[action]
           return (
@@ -189,6 +238,22 @@ function ActiveFailureStrip({
             <DetailsChevron aria-hidden="true" className="h-3.5 w-3.5" />
           </button>
         )}
+        {onDismiss && (
+          <Button
+            size="icon"
+            variant="ghost"
+            className={cn(
+              "h-6 w-6 shrink-0",
+              warning
+                ? "text-amber-700/70 hover:bg-amber-500/20 hover:text-amber-800 dark:text-amber-300/70 dark:hover:text-amber-200"
+                : "text-destructive/70 hover:bg-destructive/10 hover:text-destructive"
+            )}
+            onClick={() => onDismiss(dismissIds)}
+            aria-label={t("dismiss")}
+          >
+            <X aria-hidden="true" className="h-3.5 w-3.5" />
+          </Button>
+        )}
       </div>
       {expanded && details && (
         <p className="mt-1.5 ps-[22px] text-[11px] whitespace-pre-wrap break-words opacity-80">
@@ -199,18 +264,47 @@ function ActiveFailureStrip({
   )
 }
 
-function RecoveredStrip({ failure }: { failure: SessionFailureRecord }) {
+function RecoveredStrip({
+  failure,
+  onDismiss,
+}: {
+  failure: SessionFailureRecord
+  onDismiss?: Props["onDismiss"]
+}) {
   const t = useTranslations("Folder.chat.sessionFailure")
   const title =
     failure.title.trim() ||
     t(CATEGORY_LABEL_KEYS[knownCategory(failure.category)])
+  // Self-expire. Records are retained forever as revision watermarks, so
+  // nothing else would ever take this line down — it used to sit under the
+  // composer for the rest of the session announcing a hiccup that was over
+  // (field report 2026-08-17). Auto-dismiss WRITES to the store rather than
+  // just hiding locally, so remounting the panel cannot resurrect it.
+  const id = failure.id
+  const dismiss = onDismiss
+  useEffect(() => {
+    if (!dismiss) return
+    const timer = setTimeout(() => dismiss([id]), RECOVERED_VISIBLE_MS)
+    return () => clearTimeout(timer)
+  }, [dismiss, id])
   return (
     <div className="border-t border-border/50 bg-muted/30 px-4 py-1.5 text-[11px] text-muted-foreground">
       <div className="flex items-center gap-2">
         <CheckCircle2 aria-hidden="true" className="h-3 w-3 shrink-0" />
-        <span className="min-w-0 truncate">
+        <span className="min-w-0 flex-1 truncate">
           {t("recovered")} · {title}
         </span>
+        {dismiss && (
+          <Button
+            size="icon"
+            variant="ghost"
+            className="h-5 w-5 shrink-0 text-muted-foreground/70 hover:text-foreground"
+            onClick={() => dismiss([id])}
+            aria-label={t("dismiss")}
+          >
+            <X aria-hidden="true" className="h-3 w-3" />
+          </Button>
+        )}
       </div>
     </div>
   )

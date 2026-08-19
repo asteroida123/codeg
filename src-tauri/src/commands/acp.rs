@@ -6803,7 +6803,7 @@ async fn hermes_setup_argvs() -> (Vec<String>, Vec<String>) {
         // Unreachable: Hermes is always an Npx distribution. Fall through to
         // the npx guidance with the same pinned spec so a future match-arm
         // change can't resurrect a stale recipe.
-        _ => "hermes-agent@0.20.1",
+        _ => "hermes-agent@0.20.4",
     };
     let build = |tail: &[&str]| -> Vec<String> {
         let mut argv = vec![
@@ -7654,7 +7654,7 @@ pub(crate) fn skill_storage_spec(agent_type: AgentType) -> Option<SkillStorageSp
             ],
             project_rel_dirs: vec![".cursor/skills", ".agents/skills"],
         }),
-        // deepseek-acp 0.3.0 mounts the upstream skills chain
+        // deepseek-acp mounts the upstream skills chain
         // (`dsh-skill-filesystem`), which discovers BOTH directory bundles
         // (`<id>/SKILL.md`) and flat `<id>.md` files — hence Codex's spec
         // shape. Its roots, highest rank first: `<project>/.dsh/skills`,
@@ -7670,6 +7670,43 @@ pub(crate) fn skill_storage_spec(agent_type: AgentType) -> Option<SkillStorageSp
                 crate::parsers::deepseek::resolve_dsh_agents_home_dir().join("skills"),
             ],
             project_rel_dirs: vec![".dsh/skills", ".agents/skills"],
+        }),
+        // Qoder discovers directory bundles only — `<id>/SKILL.md`, never flat
+        // `<id>.md` files — hence Claude's spec shape rather than Codex's.
+        //
+        // Roots read verbatim off `SkillCommandHandler.enumerate` in the
+        // qodercli 1.1.23 bundle, which resolves them through
+        // `{projectDir: <workDir>/<projectConfigDirName>, userDir: <globalDir>}`
+        // (both config dir names default to `.qoder`):
+        //
+        //   home       `<globalDir>/skills`            ← relocated by QODER_CONFIG_DIR
+        //   home       `~/.agents/skills`              ← only if loadFromAgentsDirectory
+        //   workspace  `<cwd>/.qoder/skills`
+        //   workspace  `<cwd>/.agents/skills`          ← only if loadFromAgentsDirectory
+        //
+        // Qoder's OWN dirs lead in both scopes because they are the ones it
+        // always scans: the `.agents` pair is gated behind
+        // `loadSkillsFromAgentsDirectory`, which defaults to FALSE. Writing
+        // installs to `.agents` alone (and to a bare `<cwd>/skills`, which
+        // nothing scans) is why this used to install skills the agent never
+        // loaded — while leaving whatever the user already had in
+        // `~/.qoder/skills` invisible to codeg. Both `.agents` roots stay in
+        // the list so a user who did turn the setting on still sees them.
+        AgentType::Qoder => Some(SkillStorageSpec {
+            kind: SkillStorageKind::SkillDirectoryOnly,
+            global_dirs: vec![
+                crate::parsers::qoder::resolve_qoder_config_dir().join("skills"),
+                // `getGlobalAgentsDir()` joins `.agents` onto Qoder's CLI HOME,
+                // not the OS home — the shared store moves with
+                // `QODER_CLI_HOME` even though it lives outside the config dir.
+                crate::parsers::qoder::resolve_qoder_home()
+                    .join(".agents")
+                    .join("skills"),
+            ],
+            project_rel_dirs: vec![
+                crate::parsers::qoder::qoder_project_skills_rel_dir(),
+                ".agents/skills",
+            ],
         }),
         // codeg cannot detect where an arbitrary ACP agent loads skills from,
         // so custom agents are gated on the user's own declaration: that the
@@ -8564,6 +8601,21 @@ fn agent_env_keys(agent_type: AgentType) -> (&'static str, &'static str, &'stati
             "DEEPSEEK_API_KEY",
             "DEEPSEEK_ACP_MODEL",
         ),
+        // Qoder's non-interactive credential is `QODER_PERSONAL_ACCESS_TOKEN`
+        // — "设置后自动使用 PAT 认证" in the 1.1.23 package's own README, and the
+        // only way to authenticate a headless/server/Docker install, where the
+        // `qoder login` browser flow cannot run. (An interactive login still
+        // outranks it; the credential itself lives in the machine key store.)
+        // `QODER_MODEL` is real too — the README lists it as the env twin of
+        // `-m/--model`. There is NO endpoint override, so the base-url slot
+        // stays an inert `QODER_BASE_URL` placeholder for the same reason
+        // `CURSOR_MODEL` above is one: it keeps the generic cascade off the
+        // OPENAI_* keys. `QODER_API_KEY` was never a thing Qoder reads.
+        AgentType::Qoder => (
+            "QODER_BASE_URL",
+            "QODER_PERSONAL_ACCESS_TOKEN",
+            "QODER_MODEL",
+        ),
         _ => ("OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"),
     }
 }
@@ -8986,6 +9038,13 @@ fn cascade_update_agent_config(
             // as a runtime env var through the generic agent settings panel;
             // it has no codeg-managed config file and does not participate in
             // the model-provider credential cascade.
+        }
+        AgentType::Qoder => {
+            // Qoder talks only to Qoder's own service — no endpoint override
+            // and no BYO-provider key — so it stays off the model-provider
+            // credential cascade even though its env slots are real. The PAT
+            // (`QODER_PERSONAL_ACCESS_TOKEN`) is set directly in the agent's
+            // env; there is no codeg-managed config file to reconcile it with.
         }
         AgentType::Custom(_) => {
             // Custom agents are deliberately configuration-free: codeg writes
@@ -16388,7 +16447,7 @@ wire_api = "chat"
                     .expect("npx recipe must pin via --package");
                 assert_eq!(
                     argv.get(pkg_idx + 1).map(String::as_str),
-                    Some("hermes-agent@0.20.1")
+                    Some("hermes-agent@0.20.4")
                 );
                 assert_eq!(argv.get(pkg_idx + 2).map(String::as_str), Some("hermes"));
             } else {
@@ -17000,7 +17059,7 @@ model = "gpt"
             )
         };
 
-        let annotated = annotate_npm_bootstrap_failure("hermes-agent@0.20.1", download());
+        let annotated = annotate_npm_bootstrap_failure("hermes-agent@0.20.4", download());
         let text = annotated.to_string();
         assert!(text.contains("fetch failed"), "keeps the original error");
         assert!(text.contains("HTTP(S)_PROXY"), "adds the proxy hint");
@@ -17012,7 +17071,7 @@ model = "gpt"
 
         // A hermes failure that isn't a download stays untouched.
         let permissions = annotate_npm_bootstrap_failure(
-            "hermes-agent@0.20.1",
+            "hermes-agent@0.20.4",
             AcpError::Protocol("failed to install npm package globally: EACCES".to_string()),
         );
         assert!(!permissions.to_string().contains("HTTP(S)_PROXY"));

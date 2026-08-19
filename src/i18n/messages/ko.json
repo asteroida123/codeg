@@ -1740,6 +1740,7 @@
     "conversationCard": {
       "untitledConversation": "제목 없는 대화",
       "newConversation": "새 대화",
+      "attachToCurrentSession": "세션에 추가",
       "rename": "이름 변경",
       "status": "상태",
       "delete": "삭제",
@@ -1822,6 +1823,16 @@
         "cacheRead": "캐시 읽기",
         "cacheWrite": "캐시 쓰기",
         "total": "합계"
+      },
+      "quickActions": {
+        "title": "빠른 작업",
+        "groups": {
+          "workspace": "워크스페이스",
+          "sessions": "세션",
+          "automation": "자동화 및 할 일",
+          "more": "기타"
+        },
+        "showPet": "펫 표시"
       }
     },
     "auxPanel": {
@@ -2684,6 +2695,7 @@
         "slashCommands": "슬래시 명령",
         "slashSearchPlaceholder": "명령 검색...",
         "slashSearchEmpty": "일치하는 명령이 없습니다",
+        "slashLoading": "명령을 불러오는 중…",
         "experts": "전문가",
         "office": "일상 업무",
         "research": "과학 연구",
@@ -3329,7 +3341,9 @@
         },
         "recovered": "복구됨",
         "retryUnavailable": "다시 보낼 메시지가 없습니다.",
-        "toggleDetails": "세부 정보 전환"
+        "toggleDetails": "세부 정보 전환",
+        "dismiss": "닫기",
+        "moreIncidents": "외 {count}건"
       },
       "backgroundTasks": {
         "running": "백그라운드 작업 {count}개 실행 중",

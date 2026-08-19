@@ -42,6 +42,43 @@ impl CodexParser {
         Self { base_dir }
     }
 
+    /// Load Codex's append-only session title index. The transcript remains the
+    /// fallback source, so a missing/unreadable index or a malformed line is
+    /// deliberately ignored. Later non-empty records for the same session win.
+    pub(crate) fn load_thread_name_index(&self) -> HashMap<String, String> {
+        let mut titles = HashMap::new();
+        let Some(home_dir) = self.base_dir.parent() else {
+            return titles;
+        };
+        let Ok(file) = fs::File::open(home_dir.join("session_index.jsonl")) else {
+            return titles;
+        };
+
+        for line in BufReader::new(file).lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(_) => break,
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let session_id = value.get("id").and_then(serde_json::Value::as_str);
+            let thread_name = value
+                .get("thread_name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty());
+            if let (Some(id), Some(name)) = (session_id, thread_name) {
+                titles.insert(id.to_string(), truncate_str(name, 100));
+            }
+        }
+
+        titles
+    }
+
     fn parse_jsonl_summary(
         &self,
         path: &PathBuf,
@@ -292,6 +329,10 @@ impl AgentParser for CodexParser {
             return Ok(conversations);
         }
 
+        // Apply this outside `summary_cache`: changing only session_index.jsonl
+        // must refresh a title even when the rollout itself is unchanged.
+        let indexed_titles = self.load_thread_name_index();
+
         for entry in WalkDir::new(&self.base_dir)
             .into_iter()
             .filter_map(|e| e.ok())
@@ -308,7 +349,12 @@ impl AgentParser for CodexParser {
             match super::summary_cache::get_or_parse(AgentType::Codex, &path, || {
                 self.parse_jsonl_summary(&path)
             }) {
-                Ok(Some(summary)) => conversations.push(summary),
+                Ok(Some(mut summary)) => {
+                    if let Some(title) = indexed_titles.get(&summary.id) {
+                        summary.title = Some(title.clone());
+                    }
+                    conversations.push(summary);
+                }
                 _ => continue,
             }
         }
@@ -335,7 +381,11 @@ impl AgentParser for CodexParser {
             }
             let fname = path.file_name().unwrap_or_default().to_string_lossy();
             if fname.contains(conversation_id) {
-                return self.parse_conversation_detail(&path, conversation_id);
+                let mut detail = self.parse_conversation_detail(&path, conversation_id)?;
+                if let Some(title) = self.load_thread_name_index().get(conversation_id) {
+                    detail.summary.title = Some(title.clone());
+                }
+                return Ok(detail);
             }
         }
 
@@ -4171,6 +4221,7 @@ mod tests {
     use super::COLLAB_OP_KEY;
     use super::should_skip_duplicate_user_message;
     use super::strip_blocked_resource_mentions;
+    use super::AgentParser;
     use super::CodexParser;
     use super::CODEX_SCRIPT_TOOL_NAME;
     use crate::models::{
@@ -4181,6 +4232,188 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn write_index_title_fixture(
+        conversation_id: &str,
+    ) -> (tempfile::TempDir, CodexParser, PathBuf) {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let codex_home = temp_dir.path().join(".codex");
+        let sessions_dir = codex_home.join("sessions");
+        let rollout_dir = sessions_dir.join("2026").join("08").join("15");
+        fs::create_dir_all(&rollout_dir).expect("create rollout dir");
+
+        let rollout_path = rollout_dir.join(format!(
+            "rollout-2026-08-15T16-00-00-{conversation_id}.jsonl"
+        ));
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-08-15T08:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": conversation_id, "cwd": "/tmp/Temp"}
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-08-15T08:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Makefile 文件的作用"}
+            })
+            .to_string(),
+        ];
+        fs::write(&rollout_path, format!("{}\n", lines.join("\n"))).expect("write rollout");
+
+        let index_path = codex_home.join("session_index.jsonl");
+        let parser = CodexParser::with_base_dir(sessions_dir);
+        (temp_dir, parser, index_path)
+    }
+
+    #[test]
+    fn session_index_title_wins_for_list_and_detail() {
+        let conversation_id = "01a00496-1418-7273-a06f-dc4fae5cfa64";
+        let (_temp_dir, parser, index_path) = write_index_title_fixture(conversation_id);
+        let index_lines = [
+            serde_json::json!({
+                "id": conversation_id,
+                "thread_name": "旧标题",
+                "updated_at": "2026-08-15T08:01:00Z"
+            })
+            .to_string(),
+            "{malformed json".to_string(),
+            serde_json::json!({
+                "id": conversation_id,
+                "thread_name": "  解释 Makefile 文件作用  ",
+                "updated_at": "2026-08-15T08:02:00Z"
+            })
+            .to_string(),
+            serde_json::json!({
+                "id": conversation_id,
+                "thread_name": "   ",
+                "updated_at": "2026-08-15T08:03:00Z"
+            })
+            .to_string(),
+        ];
+        fs::write(&index_path, format!("{}\n", index_lines.join("\n"))).expect("write index");
+
+        let summaries = parser.list_conversations().expect("list conversations");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].title.as_deref(),
+            Some("解释 Makefile 文件作用")
+        );
+
+        let detail = parser
+            .get_conversation(conversation_id)
+            .expect("get conversation");
+        assert_eq!(
+            detail.summary.title.as_deref(),
+            Some("解释 Makefile 文件作用")
+        );
+    }
+
+    #[test]
+    fn session_index_title_wins_over_rollout_thread_name_update() {
+        let conversation_id = "index-vs-rollout-title";
+        let (_temp_dir, parser, index_path) = write_index_title_fixture(conversation_id);
+        let rollout_path = parser
+            .base_dir
+            .join("2026")
+            .join("08")
+            .join("15")
+            .join(format!(
+                "rollout-2026-08-15T16-00-00-{conversation_id}.jsonl"
+            ));
+        let mut rollout = fs::read_to_string(&rollout_path).expect("read rollout");
+        rollout.push_str(
+            &serde_json::json!({
+                "timestamp": "2026-08-15T08:00:02Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "thread_name_updated",
+                    "thread_name": "rollout thread title"
+                }
+            })
+            .to_string(),
+        );
+        rollout.push('\n');
+        fs::write(&rollout_path, rollout).expect("append rollout title");
+        fs::write(
+            &index_path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "id": conversation_id,
+                    "thread_name": "session index title",
+                    "updated_at": "2026-08-15T08:01:00Z"
+                })
+            ),
+        )
+        .expect("write index title");
+
+        let summaries = parser.list_conversations().expect("list conversations");
+        assert_eq!(summaries[0].title.as_deref(), Some("session index title"));
+        let detail = parser
+            .get_conversation(conversation_id)
+            .expect("get conversation");
+        assert_eq!(detail.summary.title.as_deref(), Some("session index title"));
+    }
+
+    #[test]
+    fn session_index_title_refreshes_after_summary_cache_hit() {
+        let conversation_id = "cache-title-session";
+        let (_temp_dir, parser, index_path) = write_index_title_fixture(conversation_id);
+        fs::write(
+            &index_path,
+            format!(
+                "{}\n",
+                serde_json::json!({"id": conversation_id, "thread_name": "索引标题甲"})
+            ),
+        )
+        .expect("write first index title");
+
+        let first = parser.list_conversations().expect("first list");
+        assert_eq!(first[0].title.as_deref(), Some("索引标题甲"));
+
+        // The rollout file is unchanged, so its summary is served from cache.
+        // The independently-read index must still replace the cached title.
+        fs::write(
+            &index_path,
+            format!(
+                "{}\n",
+                serde_json::json!({"id": conversation_id, "thread_name": "索引标题乙"})
+            ),
+        )
+        .expect("update index title");
+        let second = parser.list_conversations().expect("second list");
+        assert_eq!(second[0].title.as_deref(), Some("索引标题乙"));
+    }
+
+    #[test]
+    fn unavailable_session_index_preserves_rollout_title_fallback() {
+        let conversation_id = "index-fallback-session";
+        let (_temp_dir, parser, index_path) = write_index_title_fixture(conversation_id);
+
+        let missing = parser.list_conversations().expect("list without index");
+        assert_eq!(missing[0].title.as_deref(), Some("Makefile 文件的作用"));
+
+        fs::write(
+            &index_path,
+            format!(
+                "not json\n{}\n",
+                serde_json::json!({"id": conversation_id, "thread_name": "  "})
+            ),
+        )
+        .expect("write unusable index records");
+        let malformed = parser.list_conversations().expect("list malformed index");
+        assert_eq!(malformed[0].title.as_deref(), Some("Makefile 文件的作用"));
+
+        fs::remove_file(&index_path).expect("remove index file");
+        fs::create_dir(&index_path).expect("make index path unreadable as a file");
+        let unreadable = parser.list_conversations().expect("list unreadable index");
+        assert_eq!(unreadable[0].title.as_deref(), Some("Makefile 文件的作用"));
+        let detail = parser
+            .get_conversation(conversation_id)
+            .expect("detail unreadable index");
+        assert_eq!(detail.summary.title.as_deref(), Some("Makefile 文件的作用"));
+    }
 
     #[test]
     fn skips_agents_instructions_title_candidate() {

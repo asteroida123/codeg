@@ -538,7 +538,7 @@ fn transcript_dir_for(agent_type: AgentType) -> Option<&'static str> {
 /// built-ins, and idempotent per session (a reconnect keeps the original
 /// header, so the session's original cwd/start time survive).
 fn record_transcript_header(agent_type: AgentType, session_id: &str, cwd: &str) {
-    record_transcript_header_continuing(agent_type, session_id, cwd, None);
+    drop(queue_transcript_header(agent_type, session_id, cwd, None));
 }
 
 /// [`record_transcript_header`] for a session that carries an existing
@@ -548,15 +548,46 @@ fn record_transcript_header(agent_type: AgentType, session_id: &str, cwd: &str) 
 /// agent session for the same conversation: the earlier turns stay where they
 /// are and this header links back to them, so the reader still sees one
 /// history. See [`crate::acp_transcript::TranscriptHeader::continues_from`].
-fn record_transcript_header_continuing(
+async fn record_transcript_header_continuing(
     agent_type: AgentType,
     session_id: &str,
     cwd: &str,
     continues_from: Option<&str>,
 ) {
-    let Some(dir) = transcript_dir_for(agent_type) else {
+    let Some(ack) = queue_transcript_header(agent_type, session_id, cwd, continues_from) else {
         return;
     };
+    // Wait for the link to be DURABLE before returning, so it is on disk before
+    // the caller emits `SessionStarted`. Same shape and same reason as
+    // `record_prompt` below: the writer is a background thread, and readers go
+    // to the file.
+    //
+    // The specific reader here is `acp::continued_session_ids`, which the
+    // session-binding guard consults to tell "this conversation continues under
+    // a new agent session" from "an unrelated session landed on this row". Emit
+    // first and a subscriber can read an empty chain, conclude the sessions are
+    // unrelated, and split the conversation in two — and nothing removes that
+    // row once the header lands, so the duplicate is permanent.
+    //
+    // Costs one disk write per continuation, i.e. per restart of a conversation
+    // whose agent forgot it. `record_prompt` accepts the same cost per TURN.
+    // A stalled writer falls back to the old racy behaviour after the timeout
+    // rather than blocking the session: the failure mode there is a duplicate
+    // row, never lost history.
+    if continues_from.is_some() {
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(2000), ack).await;
+    }
+}
+
+/// Build and enqueue the header write. `None` for agents with their own store
+/// (nothing is recorded); otherwise the writer's completion ack.
+fn queue_transcript_header(
+    agent_type: AgentType,
+    session_id: &str,
+    cwd: &str,
+    continues_from: Option<&str>,
+) -> Option<tokio::sync::oneshot::Receiver<()>> {
+    let dir = transcript_dir_for(agent_type)?;
     let mut header = crate::acp_transcript::TranscriptHeader::new(
         &agent_type.as_wire(),
         session_id,
@@ -566,7 +597,7 @@ fn record_transcript_header_continuing(
     if let Some(previous) = continues_from.filter(|p| !p.is_empty() && *p != session_id) {
         header = header.continuing(previous);
     }
-    drop(crate::acp_transcript::record_header(dir, &header));
+    Some(crate::acp_transcript::record_header(dir, &header))
 }
 
 /// Record an outgoing prompt for a custom agent, and wait (briefly) for it to
@@ -3283,9 +3314,18 @@ fn load_mcp_servers_for_agent(agent_type: AgentType) -> Vec<McpServer> {
     // DeepSeek is deliberately NOT in this set: deepseek-acp reads no MCP file
     // at all, so `$DSH_HOME/mcp.json` (codeg's own store) reaches it ONLY
     // through the wire — skipping it would silently drop every user server.
+    //
+    // Qoder joins the skip set: the CLI reads `mcpServers` out of its own
+    // `~/.qoder/settings.json` (gemini-schema settings file) at startup, which
+    // codeg's MCP settings UI manages directly — forwarding the same servers
+    // over the wire would double-mount them.
     if matches!(
         agent_type,
-        AgentType::Hermes | AgentType::KimiCode | AgentType::Grok | AgentType::Cursor
+        AgentType::Hermes
+            | AgentType::KimiCode
+            | AgentType::Grok
+            | AgentType::Cursor
+            | AgentType::Qoder
     ) {
         return Vec::new();
     }
@@ -4832,12 +4872,17 @@ async fn run_connection(
                         // Same conversation, new agent session: link the fresh
                         // transcript to the one the failed load was for, so the
                         // turns codeg already recorded keep rendering.
+                        // Awaited: the link must be on disk before
+                        // `SessionStarted` goes out, or the session-binding
+                        // guard can read an empty chain and split this
+                        // conversation into a permanent duplicate.
                         record_transcript_header_continuing(
                             agent_type,
                             &fallback_sid,
                             &cwd.to_string_lossy(),
                             Some(sid.as_str()),
-                        );
+                        )
+                        .await;
                         emit_with_state(
                             &state,
                             &emitter_clone,

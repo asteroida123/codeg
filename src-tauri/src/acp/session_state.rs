@@ -723,6 +723,7 @@ impl SessionState {
                 // — a snapshot would then hand that ghost to every client
                 // (the same disease the #870 held-turn work fenced off).
                 // Main-thread chunks keep today's unconditional append.
+                self.settle_retry_incidents_on_progress();
                 if parent_tool_use_id.is_none() || self.status == ConnectionStatus::Prompting {
                     self.append_text_delta(text, parent_tool_use_id.as_deref());
                 }
@@ -731,6 +732,7 @@ impl SessionState {
                 text,
                 parent_tool_use_id,
             } => {
+                self.settle_retry_incidents_on_progress();
                 if parent_tool_use_id.is_none() || self.status == ConnectionStatus::Prompting {
                     self.append_thinking_delta(text, parent_tool_use_id.as_deref());
                 }
@@ -747,6 +749,7 @@ impl SessionState {
                 meta,
                 images,
             } => {
+                self.settle_retry_incidents_on_progress();
                 self.upsert_tool_call(
                     tool_call_id,
                     Some(kind),
@@ -911,6 +914,11 @@ impl SessionState {
                 // a recovered warning (2026-08-15 field report), so those
                 // leave the warnings active — the `UserMessage` arm's
                 // settle-all still sweeps them at the next prompt.
+                //
+                // Incidents that recovered MID-turn were already settled by
+                // `settle_retry_incidents_on_progress`; this boundary catches
+                // the ones still in flight at the end, plus the
+                // category-"unknown" notices that progress deliberately skips.
                 if stop_reason == "end_turn" {
                     for failure in self.session_failures.values_mut() {
                         if failure.severity == "warning" {
@@ -1394,6 +1402,24 @@ impl SessionState {
         self.live_message
             .as_mut()
             .expect("live_message just initialized")
+    }
+
+    /// Settle in-flight AIR retry incidents because the turn produced output
+    /// again — codex's own `completeRetryIncidentOnTurnProgress`: the warning
+    /// goes up when the upstream drops, and the next chunk is the proof it came
+    /// back. Mirrors the frontend's `"retry_incidents"` settle scope.
+    ///
+    /// Category "unknown" is deliberately left alone: it is where BOTH adapters
+    /// route non-incident notices (codex config/skill-budget warnings, claude
+    /// `model_refusal_fallback` advisories). Nothing "recovers" those, and
+    /// settling them on the next chunk would flash them away before they can be
+    /// read — they keep waiting for the turn boundary.
+    fn settle_retry_incidents_on_progress(&mut self) {
+        for failure in self.session_failures.values_mut() {
+            if !failure.resolved && failure.severity == "warning" && failure.category != "unknown" {
+                failure.resolved = true;
+            }
+        }
     }
 
     fn append_text_delta(&mut self, text: &str, parent_tool_use_id: Option<&str>) {
@@ -1958,6 +1984,85 @@ mod tests {
         s.apply_event(&turn_complete("end_turn"));
         assert!(s.session_failures["w2"].resolved);
         assert!(!s.session_failures["t1:error"].resolved);
+    }
+
+    /// Issue #496: a long turn that reconnects N times stacked N permanent
+    /// strips, because the only settle points were a clean `end_turn` and the
+    /// next prompt. Turn PROGRESS settles the incident instead — codex's own
+    /// `completeRetryIncidentOnTurnProgress`.
+    #[test]
+    fn session_failure_retry_incidents_settle_on_turn_progress() {
+        fn failure(id: &str, category: &str, severity: &str) -> AcpEvent {
+            AcpEvent::SessionFailure {
+                record: SessionFailureRecord {
+                    id: id.into(),
+                    revision: 1,
+                    category: category.into(),
+                    severity: severity.into(),
+                    title: format!("{id} title"),
+                    details: None,
+                    actions: vec![],
+                    resolved: false,
+                },
+            }
+        }
+        fn text(text: &str) -> AcpEvent {
+            AcpEvent::ContentDelta {
+                text: text.into(),
+                parent_tool_use_id: None,
+            }
+        }
+
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::StatusChanged {
+            status: ConnectionStatus::Prompting,
+        });
+        s.apply_event(&failure("i1", "connection", "warning"));
+        s.apply_event(&failure("i2", "service", "warning"));
+        // Non-incident informational records: codex config/skill-budget
+        // notices and claude advisories both land on category "unknown".
+        // Nothing "recovers" those, so progress must leave them readable.
+        s.apply_event(&failure("notice", "unknown", "warning"));
+        s.apply_event(&failure("err", "connection", "error"));
+
+        s.apply_event(&text("back online"));
+        assert!(s.session_failures["i1"].resolved);
+        assert!(s.session_failures["i2"].resolved);
+        assert!(!s.session_failures["notice"].resolved);
+        assert!(!s.session_failures["err"].resolved);
+
+        // Thinking and a fresh tool call are turn output too.
+        s.apply_event(&failure("i3", "limit", "warning"));
+        s.apply_event(&AcpEvent::Thinking {
+            text: "hmm".into(),
+            parent_tool_use_id: None,
+        });
+        assert!(s.session_failures["i3"].resolved);
+
+        s.apply_event(&failure("i4", "connection", "warning"));
+        s.apply_event(&AcpEvent::ToolCall {
+            tool_call_id: "tc-1".into(),
+            title: "Read".into(),
+            kind: "read".into(),
+            status: "in_progress".into(),
+            content: None,
+            raw_input: None,
+            raw_output: None,
+            locations: None,
+            meta: None,
+            images: None,
+        });
+        assert!(s.session_failures["i4"].resolved);
+
+        // The notice still waits for the clean turn boundary; the terminal
+        // error survives it, exactly as before.
+        s.apply_event(&AcpEvent::TurnComplete {
+            session_id: "sid".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: "codex".into(),
+        });
+        assert!(s.session_failures["notice"].resolved);
+        assert!(!s.session_failures["err"].resolved);
     }
 
     #[test]

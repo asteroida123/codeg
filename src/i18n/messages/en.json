@@ -1740,6 +1740,7 @@
     "conversationCard": {
       "untitledConversation": "Untitled conversation",
       "newConversation": "New Conversation",
+      "attachToCurrentSession": "Add to session",
       "rename": "Rename",
       "status": "Status",
       "delete": "Delete",
@@ -1822,6 +1823,16 @@
         "cacheRead": "Cache Read",
         "cacheWrite": "Cache Write",
         "total": "Total"
+      },
+      "quickActions": {
+        "title": "Quick actions",
+        "groups": {
+          "workspace": "Workspace",
+          "sessions": "Sessions",
+          "automation": "Automation & to-dos",
+          "more": "More"
+        },
+        "showPet": "Show pet"
       }
     },
     "auxPanel": {
@@ -2686,6 +2697,7 @@
         "slashCommands": "Slash commands",
         "slashSearchPlaceholder": "Search commands...",
         "slashSearchEmpty": "No matching commands",
+        "slashLoading": "Loading commands…",
         "experts": "Experts",
         "office": "Office Work",
         "research": "Scientific Research",
@@ -3329,7 +3341,9 @@
         },
         "recovered": "Recovered",
         "retryUnavailable": "No previous message to resend.",
-        "toggleDetails": "Toggle details"
+        "toggleDetails": "Toggle details",
+        "dismiss": "Dismiss",
+        "moreIncidents": "+{count} more"
       },
       "backgroundTasks": {
         "running": "{count, plural, one {# background task running} other {# background tasks running}}",

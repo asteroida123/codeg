@@ -710,7 +710,9 @@ export function inferGrokMode(
   return (env[GROK_API_KEY_ENV] ?? "").trim() ? "api_key" : "subscription"
 }
 
-function importantEnvKeysByAgent(agentType: AgentType): ImportantEnvKeys {
+export function importantEnvKeysByAgent(
+  agentType: AgentType
+): ImportantEnvKeys {
   if (agentType === "claude_code") {
     return {
       apiBaseUrl: ["ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "API_BASE_URL"],
@@ -757,10 +759,49 @@ function importantEnvKeysByAgent(agentType: AgentType): ImportantEnvKeys {
       model: ["DEEPSEEK_ACP_MODEL"],
     }
   }
+  if (agentType === "qoder") {
+    // `QODER_PERSONAL_ACCESS_TOKEN` is Qoder's non-interactive credential
+    // ("设置后自动使用 PAT 认证" in the CLI package's own README) and the only
+    // way to authenticate a headless/server/Docker install, where the
+    // `qoder login` browser flow cannot run. `QODER_MODEL` is the env twin of
+    // `-m/--model`. Qoder talks only to its own service, so there is no
+    // endpoint var at all — an EMPTY list here hides that field rather than
+    // offering a box whose value nothing reads (see `importantFieldsFor`).
+    // Generic OPENAI_*/API_KEY aliases are deliberately absent: Qoder reads
+    // neither, and listing them would let the panel report "configured" off a
+    // key that never reaches it. Mirrors the backend `agent_env_keys(Qoder)`.
+    return {
+      apiBaseUrl: [],
+      apiKey: ["QODER_PERSONAL_ACCESS_TOKEN"],
+      model: ["QODER_MODEL"],
+    }
+  }
   return {
     apiBaseUrl: ["OPENAI_BASE_URL", "API_BASE_URL"],
     apiKey: ["OPENAI_API_KEY", "API_KEY"],
     model: ["OPENAI_MODEL", "MODEL"],
+  }
+}
+
+/**
+ * Which of the three generic env fields this agent actually has a variable for.
+ *
+ * An empty list in {@link importantEnvKeysByAgent} means "this agent reads no
+ * env var for that slot" — Qoder, for instance, talks only to its own service
+ * and has no endpoint override. Rendering the input anyway offers a box whose
+ * value nothing will ever read, and (before `patchEnvByImportantKey` guarded
+ * it) wrote the typed value to an env var literally named `undefined`.
+ */
+export function importantFieldsFor(agentType: AgentType): {
+  apiBaseUrl: boolean
+  apiKey: boolean
+  model: boolean
+} {
+  const keys = importantEnvKeysByAgent(agentType)
+  return {
+    apiBaseUrl: keys.apiBaseUrl.length > 0,
+    apiKey: keys.apiKey.length > 0,
+    model: keys.model.length > 0,
   }
 }
 
@@ -3259,21 +3300,32 @@ export function materializeClaudeHardeningFlags(
   return { configText: nextConfig, envText: nextEnv }
 }
 
-function patchEnvByImportantKey(
+export function patchEnvByImportantKey(
   agentType: AgentType,
   envText: string,
   key: ImportantConfigKey,
   value: string
 ): string {
   const keys = importantEnvKeysByAgent(agentType)
+  // The FIRST key of each list is the one codeg writes; the rest are aliases it
+  // only reads. An agent that has no env var for a slot leaves that list empty,
+  // and `[0]` is then `undefined` — which `patchEnvText` would happily write as
+  // an env var literally named `undefined`, silently swallowing what the user
+  // typed. `writeKey` turns that into a no-op instead; the field is also hidden
+  // (see `importantFieldsFor`), so this is the belt to that suspenders.
+  const writeKey = (candidates: string[]): string | undefined => candidates[0]
+  const patch = (candidates: string[]): string => {
+    const target = writeKey(candidates)
+    return target ? patchEnvText(envText, { [target]: value }) : envText
+  }
   if (key === "apiBaseUrl") {
-    return patchEnvText(envText, { [keys.apiBaseUrl[0]]: value })
+    return patch(keys.apiBaseUrl)
   }
   if (key === "apiKey") {
-    return patchEnvText(envText, { [keys.apiKey[0]]: value })
+    return patch(keys.apiKey)
   }
   if (key === "model") {
-    return patchEnvText(envText, { [keys.model[0]]: value })
+    return patch(keys.model)
   }
   return patchEnvText(envText, { [CLAUDE_MODEL_ENV_KEYS[key]]: value })
 }
@@ -11108,38 +11160,14 @@ supports_websockets = true`}
                       selectedDraft.claudeAuthMode === "custom" ||
                       selectedDraft.claudeAuthMode === "model_provider") && (
                       <>
-                        <div className="space-y-1.5">
-                          <label className="text-[11px] text-muted-foreground">
-                            API URL
-                          </label>
-                          <Input
-                            value={selectedDraft.apiBaseUrl}
-                            readOnly={
-                              selectedAgent.agent_type === "claude_code" &&
-                              selectedDraft.claudeAuthMode === "model_provider"
-                            }
-                            onChange={(event) => {
-                              handleImportantConfigChange(
-                                "apiBaseUrl",
-                                event.target.value
-                              )
-                            }}
-                            placeholder="https://api.example.com"
-                          />
-                        </div>
-
-                        <div className="space-y-1.5">
-                          <label className="text-[11px] text-muted-foreground">
-                            API Key
-                          </label>
-                          <div className="flex items-center gap-2">
+                        {importantFieldsFor(selectedAgent.agent_type)
+                          .apiBaseUrl && (
+                          <div className="space-y-1.5">
+                            <label className="text-[11px] text-muted-foreground">
+                              API URL
+                            </label>
                             <Input
-                              type={
-                                showApiKeys[selectedAgent.agent_type]
-                                  ? "text"
-                                  : "password"
-                              }
-                              value={selectedDraft.apiKey}
+                              value={selectedDraft.apiBaseUrl}
                               readOnly={
                                 selectedAgent.agent_type === "claude_code" &&
                                 selectedDraft.claudeAuthMode ===
@@ -11147,37 +11175,68 @@ supports_websockets = true`}
                               }
                               onChange={(event) => {
                                 handleImportantConfigChange(
-                                  "apiKey",
+                                  "apiBaseUrl",
                                   event.target.value
                                 )
                               }}
-                              placeholder="sk-..."
+                              placeholder="https://api.example.com"
                             />
-                            <Button
-                              type="button"
-                              variant="outline"
-                              size="sm"
-                              onClick={() => {
-                                setShowApiKeys((prev) => ({
-                                  ...prev,
-                                  [selectedAgent.agent_type]:
-                                    !prev[selectedAgent.agent_type],
-                                }))
-                              }}
-                              title={
-                                showApiKeys[selectedAgent.agent_type]
-                                  ? t("actions.hideApiKey")
-                                  : t("actions.showApiKey")
-                              }
-                            >
-                              {showApiKeys[selectedAgent.agent_type] ? (
-                                <EyeOff className="h-3.5 w-3.5" />
-                              ) : (
-                                <Eye className="h-3.5 w-3.5" />
-                              )}
-                            </Button>
                           </div>
-                        </div>
+                        )}
+
+                        {importantFieldsFor(selectedAgent.agent_type)
+                          .apiKey && (
+                          <div className="space-y-1.5">
+                            <label className="text-[11px] text-muted-foreground">
+                              API Key
+                            </label>
+                            <div className="flex items-center gap-2">
+                              <Input
+                                type={
+                                  showApiKeys[selectedAgent.agent_type]
+                                    ? "text"
+                                    : "password"
+                                }
+                                value={selectedDraft.apiKey}
+                                readOnly={
+                                  selectedAgent.agent_type === "claude_code" &&
+                                  selectedDraft.claudeAuthMode ===
+                                    "model_provider"
+                                }
+                                onChange={(event) => {
+                                  handleImportantConfigChange(
+                                    "apiKey",
+                                    event.target.value
+                                  )
+                                }}
+                                placeholder="sk-..."
+                              />
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => {
+                                  setShowApiKeys((prev) => ({
+                                    ...prev,
+                                    [selectedAgent.agent_type]:
+                                      !prev[selectedAgent.agent_type],
+                                  }))
+                                }}
+                                title={
+                                  showApiKeys[selectedAgent.agent_type]
+                                    ? t("actions.hideApiKey")
+                                    : t("actions.showApiKey")
+                                }
+                              >
+                                {showApiKeys[selectedAgent.agent_type] ? (
+                                  <EyeOff className="h-3.5 w-3.5" />
+                                ) : (
+                                  <Eye className="h-3.5 w-3.5" />
+                                )}
+                              </Button>
+                            </div>
+                          </div>
+                        )}
                       </>
                     )}
 
@@ -11426,22 +11485,24 @@ supports_websockets = true`}
                         </div>
                       </div>
                     ) : (
-                      <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
-                          Model
-                        </label>
-                        <Input
-                          value={selectedDraft.model}
-                          readOnly={selectedDraft.modelProviderId != null}
-                          onChange={(event) => {
-                            handleImportantConfigChange(
-                              "model",
-                              event.target.value
-                            )
-                          }}
-                          placeholder="gpt-5 / claude-sonnet / gemini-2.5-pro"
-                        />
-                      </div>
+                      importantFieldsFor(selectedAgent.agent_type).model && (
+                        <div className="space-y-1.5">
+                          <label className="text-[11px] text-muted-foreground">
+                            Model
+                          </label>
+                          <Input
+                            value={selectedDraft.model}
+                            readOnly={selectedDraft.modelProviderId != null}
+                            onChange={(event) => {
+                              handleImportantConfigChange(
+                                "model",
+                                event.target.value
+                              )
+                            }}
+                            placeholder="gpt-5 / claude-sonnet / gemini-2.5-pro"
+                          />
+                        </div>
+                      )
                     )}
 
                     <div className="space-y-1.5">

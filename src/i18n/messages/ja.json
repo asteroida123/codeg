@@ -1740,6 +1740,7 @@
     "conversationCard": {
       "untitledConversation": "無題の会話",
       "newConversation": "新しい会話",
+      "attachToCurrentSession": "セッションに追加",
       "rename": "名前を変更",
       "status": "ステータス",
       "delete": "削除",
@@ -1822,6 +1823,16 @@
         "cacheRead": "キャッシュ読み取り",
         "cacheWrite": "キャッシュ書き込み",
         "total": "合計"
+      },
+      "quickActions": {
+        "title": "クイック操作",
+        "groups": {
+          "workspace": "ワークスペース",
+          "sessions": "セッション",
+          "automation": "オートメーションと ToDo",
+          "more": "その他"
+        },
+        "showPet": "ペットを表示"
       }
     },
     "auxPanel": {
@@ -2684,6 +2695,7 @@
         "slashCommands": "スラッシュコマンド",
         "slashSearchPlaceholder": "コマンドを検索...",
         "slashSearchEmpty": "一致するコマンドがありません",
+        "slashLoading": "コマンドを読み込み中…",
         "experts": "エキスパート",
         "office": "日常業務",
         "research": "科学研究",
@@ -3329,7 +3341,9 @@
         },
         "recovered": "回復済み",
         "retryUnavailable": "再送信できるメッセージがありません。",
-        "toggleDetails": "詳細の切り替え"
+        "toggleDetails": "詳細の切り替え",
+        "dismiss": "閉じる",
+        "moreIncidents": "他 {count} 件"
       },
       "backgroundTasks": {
         "running": "{count} 件のバックグラウンドタスクを実行中",
