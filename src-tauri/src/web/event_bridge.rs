@@ -355,6 +355,30 @@ pub enum WorkTaskChange {
     Refresh,
 }
 
+/// Broadcast whenever a batch's own row changes: created, its aggregate status
+/// recomputed from the members, canceled, or a member's cleanup outcome
+/// recorded.
+///
+/// A channel of its own rather than a variant of [`WORK_TASK_CHANGED_EVENT`]:
+/// members already emit task events for their own transitions, and a batch view
+/// needs to know when the *grouping* changed — which is a different question
+/// from "a task changed" and is asked by a different screen. Broadcast like
+/// every other channel, so a second window, a server client, and a phone all
+/// converge on the same truth; nothing about a batch lives in one client's
+/// memory.
+pub const WORK_TASK_BATCH_CHANGED_EVENT: &str = "task-batch://changed";
+
+/// Payload for [`WORK_TASK_BATCH_CHANGED_EVENT`]. Ids only — clients refetch.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkTaskBatchChange {
+    /// Insert-or-replace by id (create, aggregate status change, cleanup
+    /// outcome).
+    Upsert { id: i32 },
+    /// Soft-deleted by id.
+    Deleted { id: i32 },
+}
+
 /// Progress of a token-usage sync, emitted while the dashboard's materialized
 /// facts are rebuilt from the agents' transcripts. Throttled by the emitter
 /// (see `commands::token_usage`), so a multi-thousand-conversation pass sends

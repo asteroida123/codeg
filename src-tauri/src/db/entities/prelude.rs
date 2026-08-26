@@ -19,6 +19,8 @@ pub use super::quick_message::Entity as QuickMessage;
 pub use super::token_usage_sync::Entity as TokenUsageSync;
 pub use super::token_usage_turn::Entity as TokenUsageTurn;
 pub use super::work_task::Entity as WorkTask;
+pub use super::work_task_batch::Entity as WorkTaskBatch;
+pub use super::work_task_batch_member::Entity as WorkTaskBatchMember;
 pub use super::work_task_event::Entity as WorkTaskEvent;
 pub use super::work_task_settings::Entity as WorkTaskSettings;
 pub use super::work_task_template::Entity as WorkTaskTemplate;

@@ -37,6 +37,10 @@ import type {
   WorkTaskEvent,
   WorkTaskFolderSettings,
   WorkTaskTemplate,
+  WorkTaskBatch,
+  WorkTaskBatchSpec,
+  BatchMemberOutcome,
+  BatchCleanupOutcome,
   ConversationSummary,
   ConversationDetail,
   ConversationTurnsPage,
@@ -3389,6 +3393,84 @@ export async function workTaskTemplateSave(draft: {
 
 export async function workTaskTemplateDelete(id: number): Promise<void> {
   return getTransport().call("work_task_template_delete", { id })
+}
+
+// Work task batches
+//
+// A batch groups existing tasks over one immutable base commit and answers to
+// aggregate commands. Every call here is a *command to the backend*, which
+// remains the single execution authority: the client sends the command and
+// subscribes to `task-batch://changed`, and never drives members itself. That is
+// what makes closing this window, opening a second one, or attaching a phone
+// leave the running batch untouched.
+
+export async function workTaskBatchList(
+  folderId?: number | null
+): Promise<WorkTaskBatch[]> {
+  return getTransport().call("work_task_batch_list", {
+    folderId: folderId ?? null,
+  })
+}
+
+export async function workTaskBatchGet(id: number): Promise<WorkTaskBatch> {
+  return getTransport().call("work_task_batch_get", { id })
+}
+
+/** Create a batch and its member tasks in one transaction. The base commit is
+ *  resolved server-side from the folder's HEAD; an empty repository, a detached
+ *  HEAD, or (without `allow_dirty`) modified tracked files are refused — and
+ *  nothing is ever committed on the user's behalf to make one of those work. */
+export async function workTaskBatchCreate(
+  spec: WorkTaskBatchSpec
+): Promise<WorkTaskBatch> {
+  return getTransport().call("work_task_batch_create", {
+    spec: {
+      ...spec,
+      members: spec.members.map((m) => ({
+        ...m,
+        config: stripUploadedTaskConfig(m.config),
+      })),
+    },
+  })
+}
+
+/** Start every startable member. Returns one outcome per member: a member that
+ *  refuses does not stop the others, so callers must surface the individual
+ *  failures rather than reducing the array to a single verdict. */
+export async function workTaskBatchStart(
+  id: number
+): Promise<BatchMemberOutcome[]> {
+  return getTransport().call("work_task_batch_start", { id })
+}
+
+/** Cancel every cancelable member. The backend marks the batch canceled before
+ *  touching any member, so a member still in setup cannot later be reported as
+ *  a normal completion. Worktrees are kept — cleanup is separate and explicit. */
+export async function workTaskBatchCancel(
+  id: number
+): Promise<BatchMemberOutcome[]> {
+  return getTransport().call("work_task_batch_cancel", { id })
+}
+
+/**
+ * Remove the members' worktrees and branches, keeping `keepTaskIds`.
+ *
+ * Returns `succeeded` / `failed` / `blocked` per member, each already persisted
+ * on its member row. Render them per member: a single "cleanup done" over this
+ * response is exactly the false success this API is shaped to prevent — the
+ * reviewed implementation reported one while every worktree stayed on disk.
+ */
+export async function workTaskBatchCleanup(
+  id: number,
+  keepTaskIds: number[] = []
+): Promise<BatchCleanupOutcome[]> {
+  return getTransport().call("work_task_batch_cleanup", { id, keepTaskIds })
+}
+
+/** Soft-delete the grouping. Member tasks and their worktrees are untouched —
+ *  they are ordinary tasks, and dropping a grouping must not destroy work. */
+export async function workTaskBatchDelete(id: number): Promise<void> {
+  return getTransport().call("work_task_batch_delete", { id })
 }
 
 // Directory browser (for web/server mode)

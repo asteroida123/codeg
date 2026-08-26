@@ -1709,6 +1709,129 @@ export interface WorkTaskTemplate {
   updated_at: string
 }
 
+// ─── Work task batches ─────────────────────────────────────────────────────
+// Mirrors src-tauri/src/models/work_task_batch.rs. A batch is a group of
+// existing work tasks sharing one immutable starting commit, with aggregate
+// start/cancel/cleanup. Core vocabulary only: members with slots and labels —
+// what a slot *means* is the caller's business, carried in `owner_extension`
+// and `metadata`.
+
+/** Aggregate state of a batch. A projection of the members' statuses, written
+ *  by the backend — never computed client-side, so a second window, a server
+ *  client, and a phone all read the same answer. */
+export type WorkTaskBatchStatus =
+  /** Members exist but none was ever launched. */
+  | "created"
+  /** At least one member is live (queued → merging). */
+  | "running"
+  /** Nothing is working any more and at least one member awaits a decision —
+   *  the moment a batch exists for. */
+  | "review"
+  /** Every member reached a terminal status. */
+  | "settled"
+  /** The user canceled the whole batch. One-way: no late member event can
+   *  repaint it as a normal completion. */
+  | "canceled"
+
+/** What a member's failure means for members that have not launched yet. */
+export type WorkTaskBatchFailurePolicy = "best_effort" | "fail_fast"
+
+/** Outcome of the last aggregate cleanup attempt on one member.
+ *  `blocked` = not attempted because the member is still live (stop it first),
+ *  as opposed to `failed`, which is retryable. */
+export type MemberCleanupResult = "succeeded" | "failed" | "blocked"
+
+export interface WorkTaskBatch {
+  id: number
+  folder_id: number
+  title: string
+  /** The commit every member branches from, resolved once at creation. */
+  base_sha: string
+  base_branch: string
+  status: WorkTaskBatchStatus
+  failure_policy: WorkTaskBatchFailurePolicy
+  /** null = defer to the folder's own max_concurrent. */
+  max_concurrent: number | null
+  /** Reverse-DNS id of the module that created the batch; opaque to Core. */
+  owner_extension?: string | null
+  metadata?: Record<string, unknown> | null
+  members: WorkTaskBatchMember[]
+  created_at: string
+  updated_at: string
+  settled_at: string | null
+}
+
+/** One member. The task's own status is read live from the task row on every
+ *  fetch rather than mirrored here, so the two can never disagree. */
+export interface WorkTaskBatchMember {
+  id: number
+  batch_id: number
+  task_id: number
+  slot_index: number
+  label?: string | null
+  /** `ResolvedLaunchProfile` snapshot captured when the member was added:
+   *  requested vs. applied configuration and every gap between them. What lets
+   *  a comparison state the real configuration instead of the intended one. */
+  profile_snapshot?: Record<string, unknown> | null
+  /** Absent = cleanup never attempted for this member. */
+  cleanup_result?: MemberCleanupResult | null
+  cleanup_error?: string | null
+  /** null if the underlying task row was deleted. */
+  task_status: WorkTaskStatus | null
+  task_title: string
+  conversation_id: number | null
+  connection_id: string | null
+  files_changed: number | null
+  additions: number | null
+  deletions: number | null
+}
+
+/** Create payload. The base commit is deliberately absent: it is resolved
+ *  server-side from the folder's HEAD, so a client cannot pin a commit the
+ *  repository never had. */
+export interface WorkTaskBatchSpec {
+  folder_id: number
+  title: string
+  members: WorkTaskBatchMemberSpec[]
+  failure_policy?: WorkTaskBatchFailurePolicy | null
+  max_concurrent?: number | null
+  owner_extension?: string | null
+  metadata?: Record<string, unknown> | null
+  /** Create even though the project folder has modified tracked files.
+   *  Members branch from the recorded commit, so uncommitted work is absent
+   *  from all of them — this flag makes that a decision rather than a
+   *  discovery. It never causes anything to be committed or stashed. */
+  allow_dirty?: boolean
+}
+
+export interface WorkTaskBatchMemberSpec {
+  title: string
+  config: WorkTaskConfig
+  label?: string | null
+  profile_snapshot?: Record<string, unknown> | null
+}
+
+/** Per-member outcome of an aggregate start/cancel. Aggregates answer per
+ *  member, never with one boolean: a member that refuses leaves the others
+ *  running, and the UI has to be able to say which refused and why. */
+export interface BatchMemberOutcome {
+  task_id: number
+  slot_index: number
+  ok: boolean
+  error?: string | null
+}
+
+/** Per-member outcome of an aggregate cleanup. Already persisted on the member
+ *  row by the time it arrives, so a failure survives the window that asked for
+ *  it. Render these individually — a blanket "cleanup done" over this array is
+ *  precisely the false success the shape exists to prevent. */
+export interface BatchCleanupOutcome {
+  task_id: number
+  slot_index: number
+  result: MemberCleanupResult
+  error?: string | null
+}
+
 /** Per-folder task defaults (work_task_settings.config). */
 export interface WorkTaskFolderSettings {
   default_agent_type?: AgentType | null

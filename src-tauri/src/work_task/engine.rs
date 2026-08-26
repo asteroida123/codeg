@@ -39,7 +39,9 @@ use crate::commands::folders::{
 use crate::db::entities::conversation::{self, ConversationStatus};
 use crate::db::entities::work_task::WorkTaskStatus;
 use crate::db::entities::{folder, folder_command};
-use crate::db::service::{conversation_service, tab_service, work_task_service};
+use crate::db::service::{
+    conversation_service, tab_service, work_task_batch_service, work_task_service,
+};
 use crate::db::AppDatabase;
 use crate::forge::deliver::{
     adopt_pull_request, pull_request_body, writeback_comment_body, DeliveryCtx, ForgeDeliveryApi,
@@ -745,7 +747,343 @@ impl TaskEngine {
         if let Some(folder_id) = task.map(|t| t.folder_id) {
             self.pump_folder(folder_id).await;
         }
+        // A member canceled from the task board is still a member: the batch it
+        // belongs to has to see it stop, whether the cancel came from here or
+        // from an aggregate.
+        self.refresh_batch_of_task(task_id).await;
         Ok(())
+    }
+
+    // ── batch aggregates ────────────────────────────────────────────────────
+
+    /// Start every startable member of a batch, in slot order.
+    ///
+    /// "Aggregate" means *fan-out over the existing per-task entry points* —
+    /// [`Self::start`] for a `todo` member, [`Self::retry`] for a `failed` one —
+    /// not a second launch path. Every member therefore inherits the whole
+    /// engine: its `run_seq` claim, the folder's concurrency cap, the preflight,
+    /// crash recovery. A batch adds exactly two things on top: the shared base
+    /// commit (pinned at creation, applied in
+    /// [`Self::batch_checkout_point`]) and the per-member answer below.
+    ///
+    /// Returns one outcome per member. A member that cannot start does not fail
+    /// the batch — the others still run, and the caller can say which refused
+    /// and why. `fail_fast` governs what a member's *failure while running*
+    /// means for the rest, not what a refusal at the gate means.
+    pub async fn batch_start(
+        self: &Arc<Self>,
+        batch_id: i32,
+    ) -> Result<Vec<crate::models::BatchMemberOutcome>, String> {
+        let members = work_task_batch_service::member_models(&self.db.conn, batch_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if members.is_empty() {
+            return Err("batch has no members".to_string());
+        }
+
+        let mut outcomes = Vec::with_capacity(members.len());
+        for m in &members {
+            let task = match work_task_service::get_model(&self.db.conn, m.task_id).await {
+                Ok(t) => t,
+                Err(e) => {
+                    outcomes.push(crate::models::BatchMemberOutcome {
+                        task_id: m.task_id,
+                        slot_index: m.slot_index,
+                        ok: false,
+                        error: Some(e.to_string()),
+                    });
+                    continue;
+                }
+            };
+            // Already live: not an error, and explicitly not a re-launch. An
+            // aggregate start pressed twice must not double-claim a member.
+            if work_task_batch_service::is_live(task.status) {
+                outcomes.push(crate::models::BatchMemberOutcome {
+                    task_id: m.task_id,
+                    slot_index: m.slot_index,
+                    ok: true,
+                    error: None,
+                });
+                continue;
+            }
+            let result = match task.status {
+                WorkTaskStatus::Todo => self.start(m.task_id).await,
+                WorkTaskStatus::Failed => self.retry(m.task_id, None, Vec::new(), false).await,
+                other => Err(format!(
+                    "member is {} — an aggregate start only claims todo and failed members",
+                    work_task_service::status_str(other)
+                )),
+            };
+            outcomes.push(crate::models::BatchMemberOutcome {
+                task_id: m.task_id,
+                slot_index: m.slot_index,
+                ok: result.is_ok(),
+                error: result.err(),
+            });
+        }
+
+        self.refresh_batch(batch_id).await;
+        Ok(outcomes)
+    }
+
+    /// Cancel every cancelable member of a batch.
+    ///
+    /// The batch is marked `canceled` **first**, before any member is touched.
+    /// That order is the fix for the review finding "cancel had no gate": with
+    /// the intent recorded up front, a member still in setup cannot be reported
+    /// as a normal completion by an event that arrives afterwards
+    /// ([`work_task_batch_service::recompute_status`] refuses to move a canceled
+    /// batch), and a client that reconnects mid-cancel reads the cancellation
+    /// rather than a batch that still looks live. Per member, the actual
+    /// cancellation remains the engine's own CAS-guarded [`Self::cancel`].
+    ///
+    /// Worktrees are kept, exactly as a single task's cancel keeps them —
+    /// cleanup is a separate, explicit aggregate.
+    pub async fn batch_cancel(
+        self: &Arc<Self>,
+        batch_id: i32,
+    ) -> Result<Vec<crate::models::BatchMemberOutcome>, String> {
+        work_task_batch_service::mark_canceled(&self.db.conn, batch_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.emit_batch_upsert(batch_id);
+
+        let members = work_task_batch_service::member_models(&self.db.conn, batch_id)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let mut outcomes = Vec::with_capacity(members.len());
+        for m in &members {
+            let task = match work_task_service::get_model(&self.db.conn, m.task_id).await {
+                Ok(t) => t,
+                Err(e) => {
+                    outcomes.push(crate::models::BatchMemberOutcome {
+                        task_id: m.task_id,
+                        slot_index: m.slot_index,
+                        ok: false,
+                        error: Some(e.to_string()),
+                    });
+                    continue;
+                }
+            };
+            // Already terminal — nothing to cancel, and saying so is not a
+            // failure of the aggregate.
+            if work_task_batch_service::is_terminal(task.status) {
+                outcomes.push(crate::models::BatchMemberOutcome {
+                    task_id: m.task_id,
+                    slot_index: m.slot_index,
+                    ok: true,
+                    error: None,
+                });
+                continue;
+            }
+            let result = self.cancel(m.task_id, Some("batch canceled".into())).await;
+            outcomes.push(crate::models::BatchMemberOutcome {
+                task_id: m.task_id,
+                slot_index: m.slot_index,
+                ok: result.is_ok(),
+                error: result.err(),
+            });
+        }
+
+        self.emit_batch_upsert(batch_id);
+        Ok(outcomes)
+    }
+
+    /// Remove the worktrees and branches of a batch's members.
+    ///
+    /// Every member gets its own answer, and every answer is **persisted before
+    /// it is returned** ([`work_task_batch_service::set_member_cleanup`]). This
+    /// is the direct counter-design to the reviewed failure where a UI reported
+    /// cleanup success while N complete repository copies stayed on disk: the
+    /// per-member failures had been collected by a `Promise.allSettled` and
+    /// dropped, and the paths cleared regardless. Here a failure is a row a
+    /// later screen can read, explain, and retry — and a member that is still
+    /// live is reported `blocked` rather than force-removed.
+    ///
+    /// `keep_task_ids` survives untouched; empty means clean every member.
+    pub async fn batch_cleanup(
+        self: &Arc<Self>,
+        batch_id: i32,
+        keep_task_ids: &[i32],
+    ) -> Result<Vec<crate::models::BatchCleanupOutcome>, String> {
+        let members = work_task_batch_service::member_models(&self.db.conn, batch_id)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let mut outcomes = Vec::with_capacity(members.len());
+        for m in &members {
+            if keep_task_ids.contains(&m.task_id) {
+                continue;
+            }
+            let (result, error) = match self.cleanup_task(m.task_id).await {
+                Ok(()) => (crate::models::MemberCleanupResult::Succeeded, None),
+                Err(e) => {
+                    // `cleanup_task` refuses a live task by design. That is a
+                    // "not yet", not a "failed" — the difference decides whether
+                    // the UI offers a retry or tells the user to stop the member
+                    // first.
+                    let live = work_task_service::get_model(&self.db.conn, m.task_id)
+                        .await
+                        .map(|t| work_task_batch_service::is_live(t.status))
+                        .unwrap_or(false);
+                    let kind = if live {
+                        crate::models::MemberCleanupResult::Blocked
+                    } else {
+                        crate::models::MemberCleanupResult::Failed
+                    };
+                    (kind, Some(e))
+                }
+            };
+            // Persist first, answer second: a caller that never reads the answer
+            // must still leave a trace of what happened.
+            //
+            // If the ledger write itself fails, the member is reported `failed`
+            // whatever git did. That looks harsh when the removal actually
+            // succeeded, and it is the right way round: the alternative reports a
+            // success that no later screen can corroborate, which is the failure
+            // mode this whole ledger exists to rule out. A `failed` member offers
+            // a retry, and a retry of an already-removed worktree converges
+            // quietly.
+            let mut result = result;
+            let mut error = error;
+            if let Err(e) = work_task_batch_service::set_member_cleanup(
+                &self.db.conn,
+                batch_id,
+                m.task_id,
+                result,
+                error.as_deref(),
+            )
+            .await
+            {
+                tracing::warn!(
+                    "[work_task] batch {batch_id} member {} cleanup outcome not recorded: {e}",
+                    m.task_id
+                );
+                result = crate::models::MemberCleanupResult::Failed;
+                error = Some(format!(
+                    "the worktree removal could not be recorded, so its result is not \
+                     trustworthy — retry: {e}"
+                ));
+            }
+            outcomes.push(crate::models::BatchCleanupOutcome {
+                task_id: m.task_id,
+                slot_index: m.slot_index,
+                result,
+                error,
+            });
+        }
+
+        self.emit_batch_upsert(batch_id);
+        Ok(outcomes)
+    }
+
+    /// Recompute a batch's aggregate status and broadcast the row.
+    ///
+    /// Called after every aggregate command and — via
+    /// [`Self::refresh_batch_of_task`] — whenever a member settles.
+    async fn refresh_batch(self: &Arc<Self>, batch_id: i32) {
+        match work_task_batch_service::recompute_status(&self.db.conn, batch_id).await {
+            Ok(_) => self.emit_batch_upsert(batch_id),
+            Err(e) => {
+                tracing::warn!("[work_task] batch {batch_id} status recompute failed: {e}")
+            }
+        }
+    }
+
+    /// If a task belongs to a batch, refresh that batch — and, under
+    /// `fail_fast`, cancel the members that have not started yet.
+    ///
+    /// The engine's one call into batch logic, made where a task reaches a
+    /// terminal status. Deliberately shaped as "ask whether this task is in a
+    /// batch" rather than "notify the batch": the task engine keeps no batch
+    /// state, so no member's lifecycle can depend on a grouping being loaded,
+    /// and a task whose batch row was deleted simply answers `None`.
+    async fn refresh_batch_of_task(self: &Arc<Self>, task_id: i32) {
+        let Ok(Some(batch_id)) = work_task_batch_service::batch_of_task(&self.db.conn, task_id).await
+        else {
+            return;
+        };
+        self.apply_fail_fast(batch_id, task_id).await;
+        self.refresh_batch(batch_id).await;
+    }
+
+    /// Under `fail_fast`, a member's failure cancels the members that have not
+    /// launched yet.
+    ///
+    /// Only `todo` members are canceled — the ones still waiting for a slot.
+    /// Members already running are left to finish: they hold a worktree and a
+    /// live agent, and their partial work is exactly what the user will want to
+    /// read when explaining why the batch stopped. `fail_fast` bounds what the
+    /// batch *starts*, not what it destroys.
+    ///
+    /// Cancels through [`work_task_service::cancel`] rather than
+    /// [`Self::cancel`], for two reasons. The narrow one: a `todo` member has no
+    /// connection, no worktree, and no conversation, so every teardown step of
+    /// the full cancel is a no-op on it — the CAS write and the broadcast are
+    /// the whole job. The structural one: the full cancel calls
+    /// [`Self::refresh_batch_of_task`], which calls this — an async cycle that
+    /// cannot be typed, and would be worth avoiding even if it could.
+    async fn apply_fail_fast(self: &Arc<Self>, batch_id: i32, failed_task_id: i32) {
+        let Ok(batch) = work_task_batch_service::get_model(&self.db.conn, batch_id).await else {
+            return;
+        };
+        if batch.failure_policy != crate::models::WorkTaskBatchFailurePolicy::FailFast {
+            return;
+        }
+        let Ok(failed) = work_task_service::get_model(&self.db.conn, failed_task_id).await else {
+            return;
+        };
+        // Only an actual failure triggers the policy. A member the user canceled
+        // by hand, or one that simply finished, is not a batch-stopping event —
+        // and this guard is also what keeps a fail_fast cascade from feeding
+        // itself, since the members it cancels land in `canceled`, not `failed`.
+        if failed.status != WorkTaskStatus::Failed {
+            return;
+        }
+        let Ok(members) = work_task_batch_service::member_models(&self.db.conn, batch_id).await
+        else {
+            return;
+        };
+        let mut folder_ids: Vec<i32> = Vec::new();
+        for m in members {
+            if m.task_id == failed_task_id {
+                continue;
+            }
+            let Ok(task) = work_task_service::get_model(&self.db.conn, m.task_id).await else {
+                continue;
+            };
+            if task.status != WorkTaskStatus::Todo {
+                continue;
+            }
+            let reason = format!("batch stopped: member task {failed_task_id} failed (fail_fast)");
+            match work_task_service::cancel(&self.db.conn, m.task_id, Some(&reason)).await {
+                Ok(true) => {
+                    self.emit_upsert(m.task_id);
+                    if !folder_ids.contains(&task.folder_id) {
+                        folder_ids.push(task.folder_id);
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => tracing::info!(
+                    "[work_task] fail_fast could not cancel batch {batch_id} member {}: {e}",
+                    m.task_id
+                ),
+            }
+        }
+        // Members left the queue — let the folder hand their slots to whatever
+        // else is waiting.
+        for folder_id in folder_ids {
+            self.pump_folder(folder_id).await;
+        }
+    }
+
+    fn emit_batch_upsert(&self, batch_id: i32) {
+        emit_event(
+            &self.emitter,
+            crate::web::event_bridge::WORK_TASK_BATCH_CHANGED_EVENT,
+            crate::web::event_bridge::WorkTaskBatchChange::Upsert { id: batch_id },
+        );
     }
 
     // ── scheduler ───────────────────────────────────────────────────────────
@@ -932,6 +1270,11 @@ impl TaskEngine {
                     .unwrap_or(false);
                     if failed {
                         engine.emit_upsert(task_id);
+                        // A setup failure is terminal for this member: the batch
+                        // it belongs to has to hear about it, and — under
+                        // `fail_fast` — stop handing slots to the members still
+                        // waiting.
+                        engine.refresh_batch_of_task(task_id).await;
                     }
                 }
             }
@@ -1345,19 +1688,24 @@ impl TaskEngine {
         // Where the task's branch starts, and what its diff is measured
         // against. Normally both are the project folder's current HEAD; a task
         // that IS a pull request starts at that pull request's head instead,
-        // and measures against the merge base (see `pr_checkout_point`).
+        // and measures against the merge base (see `pr_checkout_point`); a task
+        // that belongs to a BATCH starts at the commit the batch pinned when it
+        // was created (see `batch_checkout_point`).
         let (base_branch, base_sha, start_at) = match self.pr_checkout_point(task, root).await? {
             Some(point) => point,
-            None => {
-                let head = resolve_git_head(&root.path).await.map_err(|e| e.to_string())?;
-                let base_branch = head.branch.ok_or_else(|| {
-                    "project folder is not on a branch (detached HEAD?)".to_string()
-                })?;
-                let base_sha = task_git::rev_parse(&root.path, "HEAD")
-                    .await
-                    .map_err(|e| e.to_string())?;
-                (base_branch, base_sha.clone(), base_sha)
-            }
+            None => match self.batch_checkout_point(task, root).await? {
+                Some(point) => point,
+                None => {
+                    let head = resolve_git_head(&root.path).await.map_err(|e| e.to_string())?;
+                    let base_branch = head.branch.ok_or_else(|| {
+                        "project folder is not on a branch (detached HEAD?)".to_string()
+                    })?;
+                    let base_sha = task_git::rev_parse(&root.path, "HEAD")
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    (base_branch, base_sha.clone(), base_sha)
+                }
+            },
         };
 
         let branch = format!("task/{}", task.id);
@@ -1416,6 +1764,67 @@ impl TaskEngine {
             folder_id: wt.id,
             path: wt.path,
         })
+    }
+
+    /// `(base branch, base sha, start commit)` for a task that belongs to a
+    /// batch; `None` for every other task.
+    ///
+    /// This one method is what makes a batch a batch. Members are launched over
+    /// a span of time — a concurrency cap holds some back, an earlier one may
+    /// run for minutes — and during that span the user is free to commit, pull,
+    /// or switch branches in the project folder. Resolving HEAD per member would
+    /// hand each a different starting tree, and every comparison of their
+    /// results would be measuring the base drift as much as the agents. So the
+    /// commit the batch recorded at creation wins over the folder's current
+    /// HEAD, for as long as members keep launching.
+    ///
+    /// Ordering against `pr_checkout_point`: a pull-request task keeps its own
+    /// checkout point. Its subject *is* that pull request, and a batch grouping
+    /// cannot redefine what the task is about. In practice the two never meet —
+    /// batch members are created by the batch itself and carry no forge
+    /// provenance — but the precedence is written down rather than left to
+    /// whichever branch happens to be evaluated first.
+    ///
+    /// **Errors are not downgraded to `None`.** A member of a batch either
+    /// starts on the batch's commit or does not start: falling back to HEAD
+    /// would launch it on a base its siblings do not share, and the resulting
+    /// comparison would be quietly meaningless — worse than a failure, because
+    /// nothing about it looks wrong. Two ways to get an error here:
+    /// - the batch lookup fails (a database problem);
+    /// - the pinned commit is no longer in the repository, because history was
+    ///   rewritten or `git gc` ran after the batch was created. Checked
+    ///   explicitly so the message names that cause, rather than surfacing as
+    ///   `worktree add failed: fatal: not a valid object name`.
+    ///
+    /// A batch row that has been deleted resolves to `None`, not an error: the
+    /// member is an ordinary task again and starts where any ordinary task
+    /// starts.
+    async fn batch_checkout_point(
+        &self,
+        task: &crate::db::entities::work_task::Model,
+        root: &crate::models::FolderDetail,
+    ) -> Result<Option<(String, String, String)>, String> {
+        let pinned = work_task_batch_service::pinned_base_of_task(&self.db.conn, task.id)
+            .await
+            .map_err(|e| {
+                format!(
+                    "could not read the batch this task belongs to, so its shared base commit \
+                     cannot be honoured: {e}"
+                )
+            })?;
+        let Some((branch, sha)) = pinned else {
+            return Ok(None);
+        };
+        // A pin is only as good as the object it names.
+        if task_git::rev_parse(&root.path, &sha).await.is_err() {
+            return Err(format!(
+                "the commit this batch pinned ({}) is no longer in the repository — history was \
+                 rewritten or garbage-collected since the batch was created. Create a new batch \
+                 to compare against the current code.",
+                &sha[..sha.len().min(12)]
+            ));
+        }
+        Ok(Some((branch, sha.clone(), sha)))
     }
 
     /// `(base branch, base sha, start commit)` for a task triggered from a
@@ -2217,6 +2626,11 @@ impl TaskEngine {
         };
         if changed {
             self.emit_upsert(task_id);
+            // The member's own transition is published; now let the grouping it
+            // may belong to catch up. Guarded by `changed` for the same reason
+            // the broadcast is: a stale generation's event moved nothing, and a
+            // batch must not be repainted by it.
+            self.refresh_batch_of_task(task_id).await;
         }
         // A slot freed up — keep the queue draining.
         if let Ok(task) = work_task_service::get_model(&self.db.conn, task_id).await {
@@ -2565,6 +2979,7 @@ impl TaskEngine {
             return Err("task left review before it could be completed".to_string());
         }
         self.emit_upsert(task_id);
+        self.refresh_batch_of_task(task_id).await;
         // The third settlement gets a comment too: the setting promises one
         // whenever a forge task finishes, and "accepted, nothing to land" is
         // an outcome the issue's readers want as much as the other two. The
@@ -2983,6 +3398,7 @@ impl TaskEngine {
                     .unwrap_or(false);
                 if landed {
                     self.emit_upsert(task_id);
+                    self.refresh_batch_of_task(task_id).await;
                     // Only on the transition — `merge_landed` is a CAS, so a
                     // second settle of the same generation posts nothing.
                     self.spawn_forge_writeback(task_id, WritebackOutcome::Merged(commit));
@@ -3886,6 +4302,7 @@ impl TaskEngine {
             ));
         }
         self.emit_upsert(task_id);
+        self.refresh_batch_of_task(task_id).await;
         // Behind the same CAS as the settle, so the retry of a delivery that
         // already finished cannot comment twice.
         self.spawn_forge_writeback(task_id, WritebackOutcome::Delivered(pr.html_url.clone()));
@@ -4514,6 +4931,7 @@ impl TaskEngine {
                     .unwrap_or(false);
                 if landed {
                     self.emit_upsert(task_id);
+                    self.refresh_batch_of_task(task_id).await;
                     self.spawn_forge_writeback(task_id, WritebackOutcome::Merged(commit));
                     if state.delete_worktree {
                         self.remove_worktree_locked(task_id, None).await;
@@ -10476,5 +10894,582 @@ mod tests {
         let (engine, _task_id) = running_task().await;
         engine.on_event(&delegation_started("conn-chat", "conn-other-child")).await;
         assert!(engine.delegation_parents.lock().await.is_empty());
+    }
+
+    // ── batch orchestration ─────────────────────────────────────────────────
+    //
+    // The engine's batch methods, driven against a real database. What these
+    // cover that the service tests cannot: the fan-out over the per-task entry
+    // points, the order in which a cancel records intent versus touching
+    // members, the per-member cleanup ledger, and the fail_fast cascade.
+    //
+    // No agent is ever spawned. A launch needs a real repository and a real
+    // agent CLI, so these tests exercise the orchestration around the launch —
+    // which is where every defect the review found actually lived.
+
+    /// A batch of `n` members over a nonexistent folder path, plus the engine.
+    /// The path never has to exist: nothing here reaches `ensure_worktree`.
+    async fn batch_fixture(n: usize) -> (Arc<TaskEngine>, i32, Vec<i32>) {
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/engine-batch").await;
+
+        let members: Vec<crate::models::WorkTaskBatchMemberSpec> = (0..n)
+            .map(|i| crate::models::WorkTaskBatchMemberSpec {
+                title: format!("slot {i}"),
+                config: serde_json::json!({
+                    "display_text": "do the thing",
+                    "prompt_blocks": [{ "type": "text", "text": "do the thing" }],
+                }),
+                label: Some(format!("member {i}")),
+                profile_snapshot: None,
+            })
+            .collect();
+
+        let info = work_task_batch_service::create(
+            &db.conn,
+            &crate::models::WorkTaskBatchSpec {
+                folder_id,
+                title: "compare".into(),
+                members,
+                failure_policy: None,
+                max_concurrent: None,
+                owner_extension: Some("codeg.test".into()),
+                metadata: None,
+                allow_dirty: false,
+            },
+            work_task_batch_service::ResolvedBase {
+                sha: "a".repeat(40),
+                branch: "main".into(),
+            },
+        )
+        .await
+        .expect("create batch");
+
+        let task_ids: Vec<i32> = info.members.iter().map(|m| m.task_id).collect();
+        (test_engine(db), info.id, task_ids)
+    }
+
+    async fn batch_status(
+        engine: &TaskEngine,
+        batch_id: i32,
+    ) -> crate::models::WorkTaskBatchStatus {
+        work_task_batch_service::get_model(&engine.db.conn, batch_id)
+            .await
+            .expect("batch row")
+            .status
+    }
+
+    /// An aggregate cancel records the batch's cancellation BEFORE it touches a
+    /// single member — the ordering that makes the gate work.
+    ///
+    /// The reviewed implementation cancelled members first and had no batch-level
+    /// intent at all, so a member still in setup could be written back to a live
+    /// state afterwards and the round would look like it had finished normally.
+    /// Here the intent lands first, which is what lets
+    /// `recompute_status` refuse every later projection.
+    #[tokio::test]
+    async fn an_aggregate_cancel_records_intent_before_touching_members() {
+        let (engine, batch_id, tasks) = batch_fixture(3).await;
+
+        // Two members are live, one never started.
+        for &t in &tasks[..2] {
+            let seq = work_task_service::claim_for_run(
+                &engine.db.conn,
+                t,
+                WorkTaskStatus::Todo,
+                "test",
+            )
+            .await
+            .expect("claim")
+            .expect("claimed");
+            assert!(work_task_service::begin_setup(&engine.db.conn, t, seq)
+                .await
+                .expect("begin_setup"));
+        }
+
+        let outcomes = engine.batch_cancel(batch_id).await.expect("batch cancel");
+
+        // Every member gets an answer, in slot order, and none is an error: the
+        // never-started member is "nothing to do", not a failure.
+        assert_eq!(outcomes.len(), 3);
+        assert_eq!(
+            outcomes.iter().map(|o| o.slot_index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(
+            outcomes.iter().all(|o| o.ok),
+            "an aggregate cancel reported a failure: {:?}",
+            outcomes.iter().filter(|o| !o.ok).collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            batch_status(&engine, batch_id).await,
+            crate::models::WorkTaskBatchStatus::Canceled
+        );
+        for &t in &tasks {
+            assert_eq!(
+                status_of(&engine, t).await,
+                WorkTaskStatus::Canceled,
+                "member {t} survived the aggregate cancel"
+            );
+        }
+    }
+
+    /// After an aggregate cancel, a member reporting a normal finish cannot make
+    /// the batch look completed — the end-to-end version of the service's CAS
+    /// test, driven through the engine's own settle hook.
+    #[tokio::test]
+    async fn a_member_settling_after_an_aggregate_cancel_leaves_the_batch_canceled() {
+        let (engine, batch_id, tasks) = batch_fixture(2).await;
+
+        engine.batch_cancel(batch_id).await.expect("batch cancel");
+        assert_eq!(
+            batch_status(&engine, batch_id).await,
+            crate::models::WorkTaskBatchStatus::Canceled
+        );
+
+        // A member is dragged to `review` behind the engine's back — the closest
+        // a test can get to a late event from a generation that was mid-flight.
+        let row = crate::db::entities::work_task::Entity::find_by_id(tasks[0])
+            .one(&engine.db.conn)
+            .await
+            .expect("query")
+            .expect("row");
+        let mut active = row.into_active_model();
+        active.status = Set(WorkTaskStatus::Review);
+        active.update(&engine.db.conn).await.expect("force review");
+
+        engine.refresh_batch_of_task(tasks[0]).await;
+
+        assert_eq!(
+            batch_status(&engine, batch_id).await,
+            crate::models::WorkTaskBatchStatus::Canceled,
+            "a late member settle repainted a canceled batch"
+        );
+    }
+
+    /// An aggregate start claims the members it can and explains the ones it
+    /// cannot, without letting one refusal stop the rest.
+    #[tokio::test]
+    async fn an_aggregate_start_answers_per_member() {
+        let (engine, batch_id, tasks) = batch_fixture(3).await;
+
+        // Middle member is already canceled: an aggregate start only claims
+        // `todo` and `failed`, so this one must refuse — and say why.
+        assert!(
+            work_task_service::cancel(&engine.db.conn, tasks[1], None)
+                .await
+                .expect("cancel")
+        );
+
+        let outcomes = engine.batch_start(batch_id).await.expect("batch start");
+
+        assert_eq!(outcomes.len(), 3);
+        let refused: Vec<_> = outcomes.iter().filter(|o| !o.ok).collect();
+        assert_eq!(refused.len(), 1, "expected exactly one refusal: {outcomes:?}");
+        assert_eq!(refused[0].slot_index, 1);
+        assert!(
+            refused[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("canceled"),
+            "the refusal must name the member's actual state, got {:?}",
+            refused[0].error
+        );
+
+        // The other two left `todo` — the folder's pump governs what runs next,
+        // which is the engine's business, not the batch's. (In this fixture the
+        // folder has no real repository, so the launch that follows fails; what
+        // matters here is that the aggregate claimed them at all.)
+        for &t in [tasks[0], tasks[2]].iter() {
+            assert_ne!(
+                status_of(&engine, t).await,
+                WorkTaskStatus::Todo,
+                "member {t} was not claimed by the aggregate start"
+            );
+        }
+        // The batch moved off `created`: something was claimed. Where it lands
+        // after that depends on whether the launches succeed, which needs a real
+        // repository — deliberately not asserted here.
+        assert_ne!(
+            batch_status(&engine, batch_id).await,
+            crate::models::WorkTaskBatchStatus::Created,
+            "the aggregate start claimed members without the batch noticing"
+        );
+    }
+
+    /// An aggregate start must not re-claim a member that is already working.
+    ///
+    /// A member IS re-claimed when it has failed — that is a retry, and it is the
+    /// point of pressing start again. The distinction is what this test pins: the
+    /// members here are held in `preparing`, so any `run_seq` movement would be a
+    /// genuine double-claim of live work.
+    #[tokio::test]
+    async fn an_aggregate_start_does_not_reclaim_a_working_member() {
+        let (engine, batch_id, tasks) = batch_fixture(2).await;
+
+        let mut seqs = Vec::new();
+        for &t in &tasks {
+            let seq = work_task_service::claim_for_run(
+                &engine.db.conn,
+                t,
+                WorkTaskStatus::Todo,
+                "test",
+            )
+            .await
+            .expect("claim")
+            .expect("claimed");
+            assert!(work_task_service::begin_setup(&engine.db.conn, t, seq)
+                .await
+                .expect("begin_setup"));
+            seqs.push(seq);
+        }
+
+        let outcomes = engine.batch_start(batch_id).await.expect("batch start");
+        assert!(
+            outcomes.iter().all(|o| o.ok),
+            "a live member was reported as a failure to start: {outcomes:?}"
+        );
+
+        for (i, &t) in tasks.iter().enumerate() {
+            let row = work_task_service::get_model(&engine.db.conn, t)
+                .await
+                .expect("row");
+            assert_eq!(
+                row.run_seq, seqs[i],
+                "member {t} was claimed a second time while working — run_seq moved"
+            );
+            assert_eq!(
+                row.status,
+                WorkTaskStatus::Preparing,
+                "member {t} was knocked out of its setup by a repeated start"
+            );
+        }
+    }
+
+    /// A failed member, by contrast, IS re-claimed: pressing start again on a
+    /// batch with a casualty is how the user retries it.
+    #[tokio::test]
+    async fn an_aggregate_start_retries_a_failed_member() {
+        let (engine, batch_id, tasks) = batch_fixture(2).await;
+
+        let seq = work_task_service::claim_for_run(
+            &engine.db.conn,
+            tasks[0],
+            WorkTaskStatus::Todo,
+            "test",
+        )
+        .await
+        .expect("claim")
+        .expect("claimed");
+        assert!(work_task_service::begin_setup(&engine.db.conn, tasks[0], seq)
+            .await
+            .expect("begin_setup"));
+        assert!(work_task_service::fail(
+            &engine.db.conn,
+            tasks[0],
+            &[WorkTaskStatus::Preparing],
+            Some(seq),
+            "setup_error",
+            Some("boom".into()),
+        )
+        .await
+        .expect("fail"));
+
+        let outcomes = engine.batch_start(batch_id).await.expect("batch start");
+        let retried = outcomes
+            .iter()
+            .find(|o| o.task_id == tasks[0])
+            .expect("an answer for the failed member");
+        assert!(retried.ok, "a failed member was not retried: {retried:?}");
+        assert!(
+            work_task_service::get_model(&engine.db.conn, tasks[0])
+                .await
+                .expect("row")
+                .run_seq
+                > seq,
+            "the retry did not claim a fresh generation"
+        );
+    }
+
+    /// A live member's cleanup is reported `blocked`, not `failed`, and never
+    /// force-removed. The two words tell the user different things to do: stop
+    /// the member first, versus retry.
+    #[tokio::test]
+    async fn cleanup_reports_a_live_member_blocked_and_persists_it() {
+        let (engine, batch_id, tasks) = batch_fixture(2).await;
+
+        // Make one member live.
+        let seq = work_task_service::claim_for_run(
+            &engine.db.conn,
+            tasks[0],
+            WorkTaskStatus::Todo,
+            "test",
+        )
+        .await
+        .expect("claim")
+        .expect("claimed");
+        assert!(work_task_service::begin_setup(&engine.db.conn, tasks[0], seq)
+            .await
+            .expect("begin_setup"));
+
+        let outcomes = engine
+            .batch_cleanup(batch_id, &[])
+            .await
+            .expect("batch cleanup");
+
+        assert_eq!(outcomes.len(), 2);
+        let live = outcomes
+            .iter()
+            .find(|o| o.task_id == tasks[0])
+            .expect("an answer for the live member");
+        assert_eq!(
+            live.result,
+            crate::models::MemberCleanupResult::Blocked,
+            "a live member's cleanup must be blocked, not failed"
+        );
+
+        // And the answer is on the row, not just in the response — a second
+        // window has to be able to read it.
+        let persisted = work_task_batch_service::get(&engine.db.conn, batch_id)
+            .await
+            .expect("batch")
+            .members
+            .into_iter()
+            .find(|m| m.task_id == tasks[0])
+            .expect("member");
+        assert_eq!(
+            persisted.cleanup_result,
+            Some(crate::models::MemberCleanupResult::Blocked),
+            "the cleanup outcome was returned but never persisted"
+        );
+    }
+
+    /// `keep_task_ids` members are not touched at all — no answer, no ledger
+    /// entry, nothing removed.
+    #[tokio::test]
+    async fn cleanup_leaves_the_keep_list_entirely_alone() {
+        let (engine, batch_id, tasks) = batch_fixture(3).await;
+
+        let outcomes = engine
+            .batch_cleanup(batch_id, &[tasks[1]])
+            .await
+            .expect("batch cleanup");
+
+        assert_eq!(outcomes.len(), 2, "the keep list was cleaned: {outcomes:?}");
+        assert!(outcomes.iter().all(|o| o.task_id != tasks[1]));
+
+        let kept = work_task_batch_service::get(&engine.db.conn, batch_id)
+            .await
+            .expect("batch")
+            .members
+            .into_iter()
+            .find(|m| m.task_id == tasks[1])
+            .expect("member");
+        assert!(
+            kept.cleanup_result.is_none(),
+            "a kept member got a cleanup verdict it never asked for"
+        );
+    }
+
+    /// Under `fail_fast`, a member's failure cancels the members still waiting
+    /// for a slot — and leaves the ones already working alone, because their
+    /// partial output is what explains why the batch stopped.
+    #[tokio::test]
+    async fn fail_fast_stops_the_queue_but_spares_the_running() {
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/engine-batch-ff").await;
+
+        let members: Vec<crate::models::WorkTaskBatchMemberSpec> = (0..3)
+            .map(|i| crate::models::WorkTaskBatchMemberSpec {
+                title: format!("slot {i}"),
+                config: serde_json::json!({
+                    "display_text": "x",
+                    "prompt_blocks": [{ "type": "text", "text": "x" }],
+                }),
+                label: None,
+                profile_snapshot: None,
+            })
+            .collect();
+        let info = work_task_batch_service::create(
+            &db.conn,
+            &crate::models::WorkTaskBatchSpec {
+                folder_id,
+                title: "fail fast".into(),
+                members,
+                failure_policy: Some(crate::models::WorkTaskBatchFailurePolicy::FailFast),
+                max_concurrent: None,
+                owner_extension: None,
+                metadata: None,
+                allow_dirty: false,
+            },
+            work_task_batch_service::ResolvedBase {
+                sha: "b".repeat(40),
+                branch: "main".into(),
+            },
+        )
+        .await
+        .expect("create batch");
+        let tasks: Vec<i32> = info.members.iter().map(|m| m.task_id).collect();
+        let engine = test_engine(db);
+
+        // Slot 0 fails. Slot 1 is mid-flight. Slot 2 is still queued behind them.
+        let seq0 = work_task_service::claim_for_run(
+            &engine.db.conn,
+            tasks[0],
+            WorkTaskStatus::Todo,
+            "test",
+        )
+        .await
+        .expect("claim")
+        .expect("claimed");
+        assert!(work_task_service::begin_setup(&engine.db.conn, tasks[0], seq0)
+            .await
+            .expect("begin_setup"));
+        assert!(work_task_service::fail(
+            &engine.db.conn,
+            tasks[0],
+            &[WorkTaskStatus::Preparing],
+            Some(seq0),
+            "setup_error",
+            Some("boom".into()),
+        )
+        .await
+        .expect("fail"));
+
+        let seq1 = work_task_service::claim_for_run(
+            &engine.db.conn,
+            tasks[1],
+            WorkTaskStatus::Todo,
+            "test",
+        )
+        .await
+        .expect("claim")
+        .expect("claimed");
+        assert!(work_task_service::begin_setup(&engine.db.conn, tasks[1], seq1)
+            .await
+            .expect("begin_setup"));
+
+        engine.refresh_batch_of_task(tasks[0]).await;
+
+        assert_eq!(status_of(&engine, tasks[0]).await, WorkTaskStatus::Failed);
+        assert_eq!(
+            status_of(&engine, tasks[1]).await,
+            WorkTaskStatus::Preparing,
+            "fail_fast destroyed work already in flight"
+        );
+        assert_eq!(
+            status_of(&engine, tasks[2]).await,
+            WorkTaskStatus::Canceled,
+            "fail_fast let a queued member start after the batch had stopped"
+        );
+        // The batch is not settled — slot 1 is still working.
+        assert_eq!(
+            batch_status(&engine, info.id).await,
+            crate::models::WorkTaskBatchStatus::Running
+        );
+    }
+
+    /// `best_effort` (the default) keeps the rest of the round going: three
+    /// agents compared is still useful when one fell over.
+    #[tokio::test]
+    async fn best_effort_lets_the_other_members_run() {
+        let (engine, batch_id, tasks) = batch_fixture(3).await;
+
+        let seq = work_task_service::claim_for_run(
+            &engine.db.conn,
+            tasks[0],
+            WorkTaskStatus::Todo,
+            "test",
+        )
+        .await
+        .expect("claim")
+        .expect("claimed");
+        assert!(work_task_service::begin_setup(&engine.db.conn, tasks[0], seq)
+            .await
+            .expect("begin_setup"));
+        assert!(work_task_service::fail(
+            &engine.db.conn,
+            tasks[0],
+            &[WorkTaskStatus::Preparing],
+            Some(seq),
+            "setup_error",
+            Some("boom".into()),
+        )
+        .await
+        .expect("fail"));
+
+        engine.refresh_batch_of_task(tasks[0]).await;
+
+        for &t in &tasks[1..] {
+            assert_eq!(
+                status_of(&engine, t).await,
+                WorkTaskStatus::Todo,
+                "best_effort canceled member {t} over another member's failure"
+            );
+        }
+        assert_eq!(batch_status(&engine, batch_id).await, crate::models::WorkTaskBatchStatus::Created);
+    }
+
+    /// A task outside any batch takes the fast path and changes nothing — the
+    /// hook has to be free for the overwhelming majority of tasks.
+    #[tokio::test]
+    async fn the_batch_hook_is_a_no_op_for_an_ordinary_task() {
+        let (engine, task_id) = running_task().await;
+        // Must not panic, must not write anything.
+        engine.refresh_batch_of_task(task_id).await;
+        assert_eq!(status_of(&engine, task_id).await, WorkTaskStatus::Running);
+    }
+
+    /// An aggregate over a batch whose members were all deleted is an error, not
+    /// a silent success — there is nothing to start, and saying "started" would
+    /// be a lie.
+    #[tokio::test]
+    async fn an_aggregate_start_on_an_empty_batch_is_an_error() {
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/engine-batch-empty").await;
+        let info = work_task_batch_service::create(
+            &db.conn,
+            &crate::models::WorkTaskBatchSpec {
+                folder_id,
+                title: "one".into(),
+                members: vec![crate::models::WorkTaskBatchMemberSpec {
+                    title: "slot".into(),
+                    config: serde_json::json!({
+                        "display_text": "x",
+                        "prompt_blocks": [{ "type": "text", "text": "x" }],
+                    }),
+                    label: None,
+                    profile_snapshot: None,
+                }],
+                failure_policy: None,
+                max_concurrent: None,
+                owner_extension: None,
+                metadata: None,
+                allow_dirty: false,
+            },
+            work_task_batch_service::ResolvedBase {
+                sha: "c".repeat(40),
+                branch: "main".into(),
+            },
+        )
+        .await
+        .expect("create");
+        let engine = test_engine(db);
+
+        // Drop the membership rows, leaving a batch with no members.
+        use crate::db::entities::work_task_batch_member as member_entity;
+        use sea_orm::{ColumnTrait as _, QueryFilter as _};
+        member_entity::Entity::delete_many()
+            .filter(member_entity::Column::BatchId.eq(info.id))
+            .exec(&engine.db.conn)
+            .await
+            .expect("delete members");
+
+        assert!(engine.batch_start(info.id).await.is_err());
     }
 }

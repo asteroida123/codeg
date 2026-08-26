@@ -12,6 +12,7 @@ pub mod remote_workspace_connection;
 pub mod system;
 pub mod token_usage;
 pub mod work_task;
+pub mod work_task_batch;
 
 pub use agent::AgentType;
 pub use automation::{
@@ -49,6 +50,11 @@ pub use work_task::{
     WorkTaskFolderSettings, WorkTaskInfo, WorkTaskMergeOp, WorkTaskMergeState, WorkTaskPreflight,
     WorkTaskQueuedMerge, WorkTaskSource, WorkTaskStatus, WorkTaskTemplateDraft,
     WorkTaskTemplateInfo, DELIVERABLE_REPORT, STAGE_PROMPT_ALL,
+};
+pub use work_task_batch::{
+    BatchCleanupOutcome, BatchCleanupPolicy, BatchMemberOutcome, MemberCleanupResult,
+    WorkTaskBatchFailurePolicy, WorkTaskBatchInfo, WorkTaskBatchMemberInfo,
+    WorkTaskBatchMemberSpec, WorkTaskBatchSpec, WorkTaskBatchStatus,
 };
 #[cfg(feature = "tauri-runtime")]
 pub use system::{SystemAutostartSettings, SystemRenderingSettings};

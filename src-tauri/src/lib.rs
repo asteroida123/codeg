@@ -78,6 +78,7 @@ mod tauri_app {
         system_settings, terminal as terminal_commands,
         token_usage as token_usage_commands,
         forge as forge_commands, version_control, windows, work_task as work_task_commands,
+        work_task_batch as work_task_batch_commands,
         workspace_state as workspace_state_commands,
     };
     use crate::terminal::manager::TerminalManager;
@@ -1400,6 +1401,13 @@ mod tauri_app {
                 work_task_commands::work_task_template_list,
                 work_task_commands::work_task_template_save,
                 work_task_commands::work_task_template_delete,
+                work_task_batch_commands::work_task_batch_create,
+                work_task_batch_commands::work_task_batch_list,
+                work_task_batch_commands::work_task_batch_get,
+                work_task_batch_commands::work_task_batch_start,
+                work_task_batch_commands::work_task_batch_cancel,
+                work_task_batch_commands::work_task_batch_cleanup,
+                work_task_batch_commands::work_task_batch_delete,
                 forge_commands::folder_forge_remote,
                 forge_commands::forge_list_issues,
                 forge_commands::forge_tab_count,

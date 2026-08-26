@@ -1284,6 +1284,35 @@ pub fn build_router(
             "/work_task_events",
             post(handlers::work_task::work_task_events),
         )
+        // ─── Work task batches ───
+        .route(
+            "/work_task_batch_list",
+            post(handlers::work_task_batch::work_task_batch_list),
+        )
+        .route(
+            "/work_task_batch_get",
+            post(handlers::work_task_batch::work_task_batch_get),
+        )
+        .route(
+            "/work_task_batch_create",
+            post(handlers::work_task_batch::work_task_batch_create),
+        )
+        .route(
+            "/work_task_batch_start",
+            post(handlers::work_task_batch::work_task_batch_start),
+        )
+        .route(
+            "/work_task_batch_cancel",
+            post(handlers::work_task_batch::work_task_batch_cancel),
+        )
+        .route(
+            "/work_task_batch_cleanup",
+            post(handlers::work_task_batch::work_task_batch_cleanup),
+        )
+        .route(
+            "/work_task_batch_delete",
+            post(handlers::work_task_batch::work_task_batch_delete),
+        )
         .route(
             "/work_task_attention_count",
             post(handlers::work_task::work_task_attention_count),

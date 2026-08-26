@@ -136,3 +136,70 @@ consumer (e.g. `WorkTaskBatch` configuration experiments comparing
 with/without skills) is being built. The `SkillPolicy` value type lives on in
 `launch_profile.rs` as part of the launch-profile snapshot; execution stays
 out.
+
+## `WorkTaskBatch` — the composition primitive (2026-08-26)
+
+The second generic seam of Decision 3, and the one Arena's execution depends
+on. Shape and the reasoning behind each choice:
+
+**A join table, not a column.** Membership lives in `work_task_batch_member`
+rather than a `batch_id` on `work_task`. The task table and the ~10.5k-line
+engine that owns it are untouched, and the columns a batch adds — slot order,
+label, launch snapshot, cleanup outcome — live where they belong instead of
+widening every task row in the database. The unique index on `task_id` keeps
+the engine's lookup unambiguous: a task cannot be in two batches pinning
+different commits.
+
+**The batch status is a projection, not a state machine.** `status` is derived
+from the members by `recompute_status` and stored so a client reads one row
+instead of N, and so "this round finished" survives a restart. It grants no
+authority: the batch service never writes a `work_task` status, and every
+member transition still goes through the engine's CAS-guarded paths. The
+`review` value is deliberate — a round whose agents have all stopped but whose
+results nobody has accepted is neither "never started" nor "finished".
+
+**Cancellation is one-way, and guarded on the write.** `batch_cancel` records
+the batch's cancellation *before* touching any member, and the projection's
+UPDATE carries `WHERE status != 'canceled'`. Both halves are needed: the
+read-side check cannot see a cancel that lands after it, and without the write
+condition a projection computed a moment earlier lands last and erases the
+user's decision — the batch would report a normal completion after being
+canceled, which is finding 6 one level up. A canceled batch never reopens;
+retrying a member is allowed and runs, but a fresh round means a fresh batch,
+resolved against a fresh base.
+
+**One base commit, pinned once, verified at use.** `resolve_base` reads the
+project folder's HEAD at creation and refuses three states outright: not a
+repository, detached HEAD, no commits yet, plus modified tracked files unless
+the caller passes `allow_dirty`. Nothing on this path writes to the
+repository — no `add`, no `commit`, no `stash` — which is finding 1 answered at
+the source. `batch_checkout_point` then applies that commit in place of HEAD
+when the engine builds a member's worktree, mirroring the existing
+`pr_checkout_point` seam, and re-verifies the object still exists so a
+rewritten history produces a sentence about the batch rather than
+`fatal: not a valid object name`. Errors here are never downgraded to a
+fallback: a member launched on a base its siblings do not share would make a
+quietly meaningless comparison, which is worse than a visible failure.
+
+**Aggregates answer per member.** `start`, `cancel`, and `cleanup` each return
+one outcome per member, and cleanup persists each outcome on its member row
+*before* returning it — including the failures, and including the case where
+the ledger write itself fails (reported `failed`, because a success no later
+screen can corroborate is the exact false success of finding 2). `blocked` is
+distinct from `failed` on purpose: one says stop the member first, the other
+offers a retry.
+
+**Core stays free of business nouns.** `owner_extension` carries a reverse-DNS
+id and `metadata` an opaque JSON blob; neither is ever branched on. A batch has
+members with slots and labels — what a slot *means* is the caller's business.
+Grepping the new Core files for the forbidden vocabulary returns nothing,
+comments included.
+
+Coverage: 35 tests — 18 on the service (projection walk, the cancel gate on
+both read and write, atomic create, deleted members, the cleanup ledger), 6 on
+the git base resolution (unborn HEAD leaves the staged index intact, dirty tree
+refused and never tidied, detached HEAD, exact-commit pinning, untracked files
+allowed), and 11 driving the engine's aggregates against a real database
+(cancel-before-touch ordering, per-member start answers, no re-claim of working
+members, retry of failed ones, `blocked` persistence, keep-list, `fail_fast`
+sparing in-flight work, `best_effort` continuing).
