@@ -3875,7 +3875,7 @@ fn parse_grok_settings(raw_toml: &str) -> GrokSettings {
 /// errors out. `migrate_grok_permission_mode` maps those legacy markers onto the
 /// real modes so the settings dropdown, the launch flag, and grok's own TUI all
 /// agree.
-const GROK_PERMISSION_MODES: &[&str] = &[
+pub(crate) const GROK_PERMISSION_MODES: &[&str] = &[
     "default",
     "acceptEdits",
     "auto",

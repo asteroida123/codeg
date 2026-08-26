@@ -1049,6 +1049,22 @@ impl TaskEngine {
             wt
         };
 
+        // ResolvedLaunchProfile: requested vs applied capability snapshot in
+        // the audit trail (ADR 0001 decision 3). Effort aliases cover the keys
+        // the adapters actually use; skills/mcp inherit by contract until a
+        // session-level policy exists (launch_profile PR-02 → skill policy).
+        let profile_request = crate::acp::launch_profile::LaunchProfileRequest {
+            model: config_values.get("model").cloned(),
+            effort: ["effort", "reasoning_effort", "effortLevel"]
+                .into_iter()
+                .find_map(|key| config_values.get(key).cloned()),
+            permission: config_values.get("permission_mode").cloned(),
+            skills: Default::default(),
+            mcp: Default::default(),
+        };
+        let profile =
+            crate::acp::launch_profile::resolve_launch_profile(agent_type, &profile_request);
+
         let _ = work_task_service::record_event(
             &self.db.conn,
             task_id,
@@ -1058,6 +1074,8 @@ impl TaskEngine {
                 "agent": agent_str,
                 "mode": mode_id,
                 "model": config_values.get("model"),
+                "profile": serde_json::to_value(&profile)
+                    .unwrap_or(serde_json::Value::Null),
             })),
         )
         .await;
