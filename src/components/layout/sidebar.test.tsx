@@ -9,6 +9,8 @@ import { Sidebar } from "./sidebar"
 // stub's imperative handle to the real component's contract.
 import type { SidebarConversationListHandle } from "@/components/conversations/sidebar-conversation-list"
 import enMessages from "@/i18n/messages/en.json"
+import { resetWorkbenchContributionsForTest } from "@/lib/workbench/contributions"
+import { activateFirstPartyModules } from "@/lib/workbench/first-party"
 
 // Stable spies + mutable active-folder, referenced from the hoisted mock
 // factories below (vi.mock is hoisted above imports).
@@ -106,6 +108,21 @@ vi.mock("@/hooks/use-mobile", () => ({ useIsMobile: () => false }))
 vi.mock("@/hooks/use-appearance", () => ({
   useZoomLevel: () => ({ zoomLevel: 100, setZoomLevel: () => {} }),
 }))
+
+/**
+ * The nav rows come from the workbench contribution registry, so a test that
+ * renders the sidebar has to populate it first — the sidebar itself knows about
+ * no route in particular.
+ *
+ * Deliberately the REAL first-party registrations rather than stubs: that makes
+ * these assertions parity checks on what actually ships (ids, icons, message
+ * keys, badges, order), which is the only place that pairing is verified now
+ * that it no longer lives in a typed map.
+ */
+beforeEach(() => {
+  resetWorkbenchContributionsForTest()
+  activateFirstPartyModules()
+})
 
 function renderSidebar() {
   return render(

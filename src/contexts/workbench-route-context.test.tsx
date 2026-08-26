@@ -1,6 +1,10 @@
 import { fireEvent, render } from "@testing-library/react"
-import { describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
+import {
+  registerWorkbenchView,
+  resetWorkbenchContributionsForTest,
+} from "@/lib/workbench/contributions"
 import {
   WorkbenchRouteProvider,
   useWorkbenchRoute,
@@ -19,6 +23,17 @@ function Probe() {
   )
 }
 
+beforeEach(() => {
+  resetWorkbenchContributionsForTest()
+  // The provider only accepts a route a page is registered for, so a test that
+  // navigates has to register one. A stub page is enough — nothing renders it.
+  registerWorkbenchView({ id: "automations", page: () => null })
+})
+
+afterEach(() => {
+  resetWorkbenchContributionsForTest()
+})
+
 describe("WorkbenchRouteProvider", () => {
   it("defaults to the conversation workspace and switches routes", () => {
     const { getByTestId, getByText } = render(
@@ -34,6 +49,23 @@ describe("WorkbenchRouteProvider", () => {
     expect(getByTestId("isConv").textContent).toBe("false")
 
     fireEvent.click(getByText("back"))
+    expect(getByTestId("route").textContent).toBe("conversations")
+    expect(getByTestId("isConv").textContent).toBe("true")
+  })
+
+  /**
+   * A route whose page is not registered — a module that was disabled, or a
+   * caller holding an id from an older build — falls back to the workspace
+   * instead of leaving the content region blank with no way back.
+   */
+  it("falls back to the workspace for a route no page is registered for", () => {
+    resetWorkbenchContributionsForTest()
+    const { getByTestId, getByText } = render(
+      <WorkbenchRouteProvider>
+        <Probe />
+      </WorkbenchRouteProvider>
+    )
+    fireEvent.click(getByText("go"))
     expect(getByTestId("route").textContent).toBe("conversations")
     expect(getByTestId("isConv").textContent).toBe("true")
   })

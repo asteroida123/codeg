@@ -40,6 +40,14 @@ import {
   WorkbenchRouteStrip,
   useHasWorkbenchRouteStrip,
 } from "@/components/workbench/workbench-content"
+import { activateFirstPartyModules } from "@/lib/workbench/first-party"
+
+// Registered at module scope, before any component renders: the sidebar and the
+// content region both read the contribution registry during their FIRST render,
+// so an effect would be a frame too late and would flash an empty nav block.
+// Idempotent — re-registering an id replaces it — so a re-evaluated module (hot
+// reload) converges instead of doubling the sidebar.
+activateFirstPartyModules()
 import {
   AuxPanelProvider,
   useAuxPanelContext,

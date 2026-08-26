@@ -6,26 +6,20 @@ import {
   Eye,
   ListChevronsDownUp,
   ListChevronsUpDown,
-  LayoutTemplate,
-  ListTodo,
   Menu,
   MessagesSquare,
   SquarePen,
-  Zap,
   type LucideIcon,
 } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useSidebarContext } from "@/contexts/sidebar-context"
 import { useTabActions } from "@/contexts/tab-context"
-import { useAutomationsView } from "@/contexts/automations-view-context"
-import { useTasksView } from "@/contexts/tasks-view-context"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import {
   SidebarConversationList,
   type SidebarConversationListHandle,
 } from "@/components/conversations/sidebar-conversation-list"
-import { ForgeBetaBadge } from "@/components/forge/forge-beta-badge"
 import { Button } from "@/components/ui/button"
 import {
   DropdownMenu,
@@ -64,13 +58,13 @@ import {
   saveSortMode,
   saveSectionOrder,
   DEFAULT_SECTION_ORDER,
-  SIDEBAR_NAV_ITEM_IDS,
   type SidebarNavItemId,
   type SidebarNavItemVisibility,
   type SidebarSectionId,
   type SidebarSortMode,
   type SidebarSectionOrder,
 } from "@/lib/sidebar-view-mode-storage"
+import { listSidebarNavigationItems } from "@/lib/workbench/contributions"
 import { SidebarSectionOrderControl } from "./sidebar-section-order-control"
 import { cn } from "@/lib/utils"
 
@@ -95,15 +89,6 @@ const SHORTCUT_BADGE_CLASS = cn(
 // visibility toggle today.
 const NO_HIDDEN_SECTIONS: ReadonlySet<SidebarSectionId> = new Set()
 const RECENT_HIDDEN: ReadonlySet<SidebarSectionId> = new Set(["recent"])
-
-// Icon per optional nav row. The visibility checkboxes in the view-options menu
-// carry the same glyph as the row they switch, so that group reads as a mirror
-// of the nav block rather than three bare labels.
-const NAV_ITEM_ICONS: Record<SidebarNavItemId, LucideIcon> = {
-  automations: Zap,
-  tasks: ListTodo,
-  forge: LayoutTemplate,
-}
 
 /**
  * A fixed top-of-sidebar action / route row. `active` marks the row as the
@@ -151,9 +136,12 @@ export function Sidebar() {
   const { isOpen, toggle } = useSidebarContext()
   const { activeFolder } = useActiveFolder()
   const { openNewConversationTab, openChatModeTab } = useTabActions()
-  const { unseenFailures } = useAutomationsView()
-  const { attentionCount } = useTasksView()
   const { routeId, setRoute, openConversations } = useWorkbenchRoute()
+  // Read once per render rather than memoized: the registry is populated at
+  // import time and never mutates in production, so there is nothing to cache
+  // against — and a stale memo would be the one way a newly enabled module could
+  // fail to appear.
+  const sidebarNavItems = listSidebarNavigationItems()
   const isMac = useIsMac()
   const { isMac: platformIsMac } = usePlatform()
   const { zoomLevel } = useZoomLevel()
@@ -432,26 +420,26 @@ export function Sidebar() {
                   <Menu className="text-muted-foreground" />
                   {t("navigationItems")}
                 </DropdownMenuSubTrigger>
-                {/* Driven by the id list itself, so a route added there can
-                    never ship a row without its toggle. Each id doubles as its
-                    message key. Hiding one only drops the sidebar shortcut: the
-                    status bar's quick-actions menu still reaches every route, so
-                    no choice here can strand the user on a page. */}
+                {/* Driven by the same registrations as the rows themselves, so a
+                    route can never ship a row without its toggle. Each id
+                    doubles as its message key. Hiding one only drops the sidebar
+                    shortcut: the status bar's quick-actions menu still reaches
+                    every route, so no choice here can strand the user on a
+                    page. */}
                 <DropdownMenuSubContent>
-                  {SIDEBAR_NAV_ITEM_IDS.map((id) => {
-                    const Icon = NAV_ITEM_ICONS[id]
-                    return (
-                      <DropdownMenuCheckboxItem
-                        key={id}
-                        checked={isNavItemVisible(navItems, id)}
-                        onCheckedChange={(value) => handleSetNavItem(id, value)}
-                        onSelect={(event) => event.preventDefault()}
-                      >
-                        <Icon className="text-muted-foreground" />
-                        {t(id)}
-                      </DropdownMenuCheckboxItem>
-                    )
-                  })}
+                  {sidebarNavItems.map((item) => (
+                    <DropdownMenuCheckboxItem
+                      key={item.id}
+                      checked={isNavItemVisible(navItems, item.id)}
+                      onCheckedChange={(value) =>
+                        handleSetNavItem(item.id, value)
+                      }
+                      onSelect={(event) => event.preventDefault()}
+                    >
+                      <item.icon className="text-muted-foreground" />
+                      {t(item.labelKey as never)}
+                    </DropdownMenuCheckboxItem>
+                  ))}
                 </DropdownMenuSubContent>
               </DropdownMenuSub>
               <DropdownMenuSeparator />
@@ -510,62 +498,30 @@ export function Sidebar() {
             window chrome (`LeftEdgeChrome`, plus the mobile `FolderTitleBar`),
             which — unlike this sidebar — never unmounts, so the button survives
             a collapse. ⌘K still works from anywhere. */}
-        {/* Each route row can be switched off from the view-options menu's
-            "Navigation items" group — for a workspace that never uses one of
-            them, this block is pure noise above the list. The routes stay
-            reachable from the status bar's quick-actions menu either way.
-            All three close the mobile Drawer on the way out, like tapping a
-            conversation card (handled by the list wrapper below) — otherwise the
-            page they just opened stays hidden behind the sidebar. */}
-        {isNavItemVisible(navItems, "automations") && (
-          <SidebarNavButton
-            icon={Zap}
-            label={t("automations")}
-            active={routeId === "automations"}
-            onClick={() => {
-              if (isMobile) toggle()
-              setRoute("automations")
-            }}
-            trailing={
-              unseenFailures > 0 ? (
-                <span className="ml-auto inline-flex h-[0.9375rem] min-w-[0.9375rem] shrink-0 items-center justify-center rounded-full bg-destructive/15 px-1 font-mono text-[0.625rem] font-medium leading-none text-destructive">
-                  {unseenFailures}
-                </span>
-              ) : null
-            }
-          />
-        )}
-        {isNavItemVisible(navItems, "tasks") && (
-          <SidebarNavButton
-            icon={ListTodo}
-            label={t("tasks")}
-            active={routeId === "tasks"}
-            onClick={() => {
-              if (isMobile) toggle()
-              setRoute("tasks")
-            }}
-            trailing={
-              attentionCount > 0 ? (
-                // Attention (not failure): tasks waiting on the user — primary
-                // tint like the shortcut chips, not destructive.
-                <span className="ml-auto inline-flex h-[0.9375rem] min-w-[0.9375rem] shrink-0 items-center justify-center rounded-full bg-primary/10 px-1 font-mono text-[0.625rem] font-medium leading-none text-primary">
-                  {attentionCount}
-                </span>
-              ) : null
-            }
-          />
-        )}
-        {isNavItemVisible(navItems, "forge") && (
-          <SidebarNavButton
-            icon={LayoutTemplate}
-            label={t("forge")}
-            active={routeId === "forge"}
-            onClick={() => {
-              if (isMobile) toggle()
-              setRoute("forge")
-            }}
-            trailing={<ForgeBetaBadge className="ml-auto" />}
-          />
+        {/* Route rows come from the workbench contribution registry, so a feature
+            gets its row by registering rather than by editing this block. Each
+            can be switched off from the view-options menu's "Navigation items"
+            group — for a workspace that never uses one, it is pure noise above
+            the list; the route stays reachable from the status bar's
+            quick-actions menu either way. Every row closes the mobile Drawer on
+            the way out, like tapping a conversation card, or the page it just
+            opened would stay hidden behind the sidebar. */}
+        {sidebarNavItems.map((item) =>
+          isNavItemVisible(navItems, item.id) ? (
+            <SidebarNavButton
+              key={item.id}
+              icon={item.icon}
+              label={t(item.labelKey as never)}
+              active={routeId === item.id}
+              onClick={() => {
+                if (isMobile) toggle()
+                setRoute(item.id)
+              }}
+              trailing={
+                item.trailing ? <item.trailing className="ml-auto" /> : null
+              }
+            />
+          ) : null
         )}
       </div>
 

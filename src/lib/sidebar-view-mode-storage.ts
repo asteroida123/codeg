@@ -1,5 +1,10 @@
 "use client"
 
+import {
+  listSidebarNavigationItems,
+  type WorkbenchRouteId,
+} from "@/lib/workbench/contributions"
+
 const FOLDER_EXPANDED_KEY = "workspace:sidebar-folder-expanded"
 const SHOW_COMPLETED_KEY = "workspace:sidebar-show-completed"
 const SHOW_WORKTREES_KEY = "workspace:sidebar-show-worktrees"
@@ -50,17 +55,19 @@ export interface SidebarSectionCollapsed {
 }
 
 /**
- * The optional route rows in the sidebar's fixed nav block, top to bottom.
- * Every id is BOTH a `WorkbenchRouteId` and a `Folder.sidebar` message key, so
- * one list drives the rows, their labels and their visibility toggles.
+ * The optional route rows in the sidebar's fixed nav block.
  *
- * "New chat" is deliberately absent: it is the block's primary action rather
- * than navigation, and it is the one row with no equivalent elsewhere in the
- * chrome. Adding a future route here gives it a toggle for free.
+ * No longer a hardcoded tuple: the rows come from the workbench contribution
+ * registry, so a feature that registers a navigation item gets its sidebar row
+ * and its visibility toggle without editing this file. The id doubles as a
+ * `Folder.sidebar` message key, which is what lets one registration drive the
+ * row, its label and its toggle.
+ *
+ * "New chat" is deliberately not among them: it is the block's primary action
+ * rather than navigation, and the one row with no equivalent elsewhere in the
+ * chrome.
  */
-export const SIDEBAR_NAV_ITEM_IDS = ["automations", "tasks", "forge"] as const
-
-export type SidebarNavItemId = (typeof SIDEBAR_NAV_ITEM_IDS)[number]
+export type SidebarNavItemId = WorkbenchRouteId
 
 /** Which optional nav rows are switched off. Absent key = shown (the default),
  *  mirroring {@link SidebarSectionCollapsed}: only rows the user explicitly
@@ -276,10 +283,14 @@ export function loadNavItemVisibility(): SidebarNavItemVisibility {
     if (!parsed || typeof parsed !== "object") return {}
     const obj = parsed as Record<string, unknown>
     const result: SidebarNavItemVisibility = {}
-    // Read through the known ids rather than copying the object: a stale entry
-    // for a route that no longer exists is dropped instead of lingering.
-    for (const id of SIDEBAR_NAV_ITEM_IDS) {
-      if (typeof obj[id] === "boolean") result[id] = obj[id]
+    // Read through the ids the registry currently offers rather than copying the
+    // object: an entry for a route whose feature is gone is dropped instead of
+    // lingering, and an entry written before a route existed simply leaves that
+    // route at its default (visible).
+    for (const item of listSidebarNavigationItems()) {
+      if (typeof obj[item.id] === "boolean") {
+        result[item.id] = obj[item.id] as boolean
+      }
     }
     return result
   } catch {

@@ -9,21 +9,14 @@ import {
   type ReactNode,
 } from "react"
 
-/**
- * The view occupying the main content region. `"conversations"` is the default
- * workspace (folder/conversation tabs); every other id is a full-page "route"
- * rendered in place of it (see WORKBENCH_ROUTES in workbench-content.tsx).
- *
- * To add a future left-sidebar route: extend this union, register a page
- * component in WORKBENCH_ROUTES, and add a SidebarNavButton that calls
- * `setRoute("<id>")`. Nothing else needs to change.
- */
-export type WorkbenchRouteId =
-  | "conversations"
-  | "automations"
-  | "tasks"
-  | "forge"
-  | "tokenUsage"
+import {
+  CONVERSATIONS_ROUTE,
+  isKnownRoute,
+  type WorkbenchRouteId,
+} from "@/lib/workbench/contributions"
+
+export { CONVERSATIONS_ROUTE }
+export type { WorkbenchRouteId }
 
 interface WorkbenchRouteContextValue {
   routeId: WorkbenchRouteId
@@ -44,6 +37,11 @@ const WorkbenchRouteContext = createContext<WorkbenchRouteContextValue | null>(
  * (which unmounts when collapsed) while the content swap is owned by
  * WorkspaceContent — both read this single source of truth.
  *
+ * Which ids exist is decided by the contribution registry
+ * (`@/lib/workbench/contributions`), not by a union here: a feature declares its
+ * own route from its own file. `conversations` is the one reserved id — the
+ * workspace surface every other route is drawn over.
+ *
  * State is in-memory only: a reload lands back on the conversation workspace.
  * That is deliberate; static export rules out URL route segments, and the
  * established pattern here is in-memory context rather than query params.
@@ -59,15 +57,24 @@ export function useWorkbenchRoute() {
 }
 
 export function WorkbenchRouteProvider({ children }: { children: ReactNode }) {
-  const [routeId, setRouteId] = useState<WorkbenchRouteId>("conversations")
+  const [routeId, setRouteId] = useState<WorkbenchRouteId>(CONVERSATIONS_ROUTE)
 
-  const setRoute = useCallback((id: WorkbenchRouteId) => setRouteId(id), [])
-  const openConversations = useCallback(() => setRouteId("conversations"), [])
+  const setRoute = useCallback((id: WorkbenchRouteId) => {
+    // Guard against an id no longer backed by a registered page — a module that
+    // was disabled, or a caller holding an id from an older build. Falling back
+    // to the workspace keeps the shell showing something real; the alternative
+    // is a blank content region with no way back.
+    setRouteId(isKnownRoute(id) ? id : CONVERSATIONS_ROUTE)
+  }, [])
+  const openConversations = useCallback(
+    () => setRouteId(CONVERSATIONS_ROUTE),
+    []
+  )
 
   const value = useMemo<WorkbenchRouteContextValue>(
     () => ({
       routeId,
-      isConversations: routeId === "conversations",
+      isConversations: routeId === CONVERSATIONS_ROUTE,
       setRoute,
       openConversations,
     }),

@@ -6,14 +6,11 @@ import {
   FolderGit2,
   FolderOpenDot,
   GamepadDirectional,
-  LayoutTemplate,
   ListChecks,
-  ListTodo,
   MonitorCloud,
   PawPrint,
   Rocket,
   Settings,
-  Zap,
 } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
@@ -30,9 +27,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { useActiveFolder } from "@/contexts/active-folder-context"
-import { useAutomationsView } from "@/contexts/automations-view-context"
-import { useTasksView } from "@/contexts/tasks-view-context"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
+import { listSidebarNavigationItems } from "@/lib/workbench/contributions"
 import { useRemoteWorkspaceConnections } from "@/hooks/use-remote-workspace-connections"
 import { openImportSessionsWindow, openProjectBootWindow } from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
@@ -41,7 +37,6 @@ import { CloneDialog } from "./clone-dialog"
 import { RemoteWorkspaceManageDialog } from "./remote-workspace-manage-dialog"
 import { WorkspaceFolderDialog } from "./workspace-folder-dialog"
 import { ConversationManageDialog } from "@/components/conversations/conversation-manage-dialog"
-import { ForgeBetaBadge } from "@/components/forge/forge-beta-badge"
 
 /**
  * The quick-actions launcher pinned to the status bar's leading edge — the
@@ -68,9 +63,11 @@ export function QuickActionsDropdown() {
   const tPet = useTranslations("Pet.manager")
 
   const { activeFolder } = useActiveFolder()
-  const { unseenFailures } = useAutomationsView()
-  const { attentionCount } = useTasksView()
   const { setRoute } = useWorkbenchRoute()
+  // The launcher lists what the sidebar CAN show, not what it currently is
+  // showing: hiding a sidebar row is about clutter up there, and this menu is
+  // the fallback that has to keep every route reachable.
+  const navigationItems = listSidebarNavigationItems()
 
   const [folderDialogOpen, setFolderDialogOpen] = useState(false)
   const [cloneOpen, setCloneOpen] = useState(false)
@@ -223,37 +220,30 @@ export function QuickActionsDropdown() {
           <DropdownMenuSeparator />
           <DropdownMenuLabel>{t("groups.navigation")}</DropdownMenuLabel>
           {/* Every full-page workbench route the sidebar lists, in the sidebar's
-              own order. The badged rows carry the same badges as their sidebar
-              twins: failures are destructive-tinted, tasks waiting on the user
-              are not. None of them mark the current route the way the sidebar
-              rows do — this is a launcher, not a nav list, and every other row
-              in it is stateless, so a tinted row here reads as hover/focus
-              rather than "you are here". */}
-          <DropdownMenuItem onSelect={() => setRoute("automations")}>
-            <Zap />
-            <span className="min-w-0 flex-1 truncate">
-              {tSidebar("automations")}
-            </span>
-            {unseenFailures > 0 && (
-              <span className="inline-flex h-[0.9375rem] min-w-[0.9375rem] shrink-0 items-center justify-center rounded-full bg-destructive/15 px-1 font-mono text-[0.625rem] font-medium leading-none text-destructive">
-                {unseenFailures}
+              own order — read from the same contribution registry, so a feature
+              gets its launcher row by registering rather than by being added
+              here. The badged rows carry the same badges as their sidebar twins
+              (the badge components are the registrations'), so failures stay
+              destructive-tinted and tasks waiting on the user do not.
+
+              Note this list follows what the sidebar *can* show, not what it is
+              currently showing: hiding a row there is about sidebar clutter, and
+              this menu is the fallback that must still reach every route — which
+              is exactly the promise the visibility toggles make.
+
+              None of them mark the current route the way the sidebar rows do —
+              this is a launcher, not a nav list, and every other row in it is
+              stateless, so a tinted row here would read as hover/focus rather
+              than "you are here". */}
+          {navigationItems.map((item) => (
+            <DropdownMenuItem key={item.id} onSelect={() => setRoute(item.id)}>
+              <item.icon />
+              <span className="min-w-0 flex-1 truncate">
+                {tSidebar(item.labelKey as never)}
               </span>
-            )}
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => setRoute("tasks")}>
-            <ListTodo />
-            <span className="min-w-0 flex-1 truncate">{tSidebar("tasks")}</span>
-            {attentionCount > 0 && (
-              <span className="inline-flex h-[0.9375rem] min-w-[0.9375rem] shrink-0 items-center justify-center rounded-full bg-primary/10 px-1 font-mono text-[0.625rem] font-medium leading-none text-primary">
-                {attentionCount}
-              </span>
-            )}
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => setRoute("forge")}>
-            <LayoutTemplate />
-            <span className="min-w-0 flex-1 truncate">{tSidebar("forge")}</span>
-            <ForgeBetaBadge />
-          </DropdownMenuItem>
+              {item.trailing ? <item.trailing className="" /> : null}
+            </DropdownMenuItem>
+          ))}
 
           {desktop && (
             <>

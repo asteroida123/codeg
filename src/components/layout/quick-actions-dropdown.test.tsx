@@ -83,6 +83,8 @@ vi.mock("@/components/conversations/conversation-manage-dialog", () => ({
 
 import { QuickActionsDropdown } from "./quick-actions-dropdown"
 import enMessages from "@/i18n/messages/en.json"
+import { resetWorkbenchContributionsForTest } from "@/lib/workbench/contributions"
+import { activateFirstPartyModules } from "@/lib/workbench/first-party"
 
 const FOLDER = { id: 7, name: "repo", path: "/tmp/repo" } as FolderDetail
 
@@ -113,6 +115,10 @@ const AUTOMATIONS_ROW = /^Automations/
 const FORGE_ROW = /^Repository panel/
 
 beforeEach(() => {
+  // The launcher's route rows come from the workbench contribution registry, so
+  // the real registrations have to be in place — same as the sidebar's.
+  resetWorkbenchContributionsForTest()
+  activateFirstPartyModules()
   desktop = true
   activeFolder = null
   vi.clearAllMocks()
