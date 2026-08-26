@@ -106,3 +106,33 @@ The mapping below is the "blocker backlog" of the rework.
   preview, no elimination tournaments.
 - New architecture decisions (e.g., Workflow Coordinator for CCG, Workbench
   Contribution Registry) will extend this ADR series rather than reopen it.
+
+## Explored and rejected (2026-08-27) — task/session skill controls
+
+Evaluated three ways to give tasks/sessions control over which skills an agent
+sees, and rejected all of them for now:
+
+1. **Session-level Skill Policy (**#541**, inherit/none/selected).** Agent
+   support is uneven (native flags/envs differ per agent); a first version
+   would serve 1–2 agents only, which is a narrow slice of users for a new
+   per-connection mechanism.
+2. **Per-connection config-root redirection** (e.g. `CLAUDE_CONFIG_DIR` /
+   `CODEX_HOME` pointing at a session-owned copy, empty/whitelist `skills`
+   subdir) to make `none` truly hide global skills. Works, but it is a
+   per-agent adapter project whose only purpose is "hide global skills".
+   Global-skill noise can already be controlled by the per-agent matrix, so the
+   added value did not justify the adapter surface.
+3. **Worktree-level assembly** (symlink selected skills into `wt/.claude/skills`
+   etc., agent discovers by cwd convention — uniform across 14/15 agents).
+   Cheap and uniform, but it can only **add** skills, never **hide** them
+   (global matrix skills remain visible in every task). Without the "hide"
+   half, the mechanism's edge over a prompt instruction ("don't use X") is
+   limited to context savings and verifiability, and its use case — tasks
+   needing skills outside the global matrix — is narrow.
+
+Revisit only when one of these holds: a uniform mechanism exists to make agent
+processes unable to discover skills (not per-agent adapters), or a concrete
+consumer (e.g. `WorkTaskBatch` configuration experiments comparing
+with/without skills) is being built. The `SkillPolicy` value type lives on in
+`launch_profile.rs` as part of the launch-profile snapshot; execution stays
+out.
