@@ -3843,7 +3843,7 @@ async fn send_load_session(
 /// (`feedback_tool_available`, a registered delegation token pi can never use).
 /// `supports_mcp` stays `true` for pi (session/new tolerates the field), so this
 /// is a separate, narrower gate. Gate codeg-mcp injection on it.
-pub(crate) fn agent_delivers_wire_mcp(agent_type: AgentType) -> bool {
+fn agent_delivers_wire_mcp(agent_type: AgentType) -> bool {
     !matches!(agent_type, AgentType::Pi)
 }
 

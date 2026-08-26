@@ -1816,7 +1816,38 @@ function timelineDetail(event: WorkTaskEvent): string | null {
     case "config_effective": {
       const agent = str("agent")
       const model = str("model")
-      return [agent, model].filter(Boolean).join(" · ") || null
+      // ResolvedLaunchProfile snapshot (engine-side audit): shows what the
+      // task actually ran with and any request/effective gaps.
+      const profile =
+        p.profile && typeof p.profile === "object"
+          ? (p.profile as {
+              applied?: Record<string, unknown>
+              warnings?: unknown[]
+            })
+          : null
+      const applied = profile?.applied ?? null
+      const effort =
+        applied && typeof applied.effort === "string" ? applied.effort : null
+      const permission =
+        applied && typeof applied.permission === "string"
+          ? applied.permission
+          : null
+      const warnings = Array.isArray(profile?.warnings)
+        ? (profile.warnings as unknown[]).filter(
+            (w): w is string => typeof w === "string"
+          )
+        : []
+      return (
+        [
+          agent,
+          model,
+          effort && `effort ${effort}`,
+          permission && `permission ${permission}`,
+          ...warnings,
+        ]
+          .filter(Boolean)
+          .join(" · ") || null
+      )
     }
     case "agent_progress":
       return str("message")
