@@ -1745,7 +1745,8 @@
       "automations": "オートメーション",
       "tasks": "ToDo タスク",
       "loadingSubsessions": "サブ会話を読み込み中…",
-      "forge": "リポジトリパネル"
+      "forge": "リポジトリパネル",
+      "arena": "アリーナ"
     },
     "conversation": {
       "reloadFailed": "会話の再読み込みに失敗しました: {message}",
@@ -5225,5 +5226,71 @@
     "settingsPromptScenarioHint": "このシナリオで作られたタスクにだけ付きます。",
     "settingsPromptPlaceholder": "例：日本語で回答する。終了前にプロジェクトのテストを実行する。",
     "save": "保存"
+  },
+  "Arena": {
+    "title": "アリーナ",
+    "newRound": "New round",
+    "openTranscript": "Transcript",
+    "noChangesYet": "No changes yet",
+    "diffStat": "{files} files · +{additions} −{deletions}",
+    "cleanupBlocked": "Worktree kept: stop this contender first, then clean up.",
+    "cleanupFailed": "Worktree could not be removed: {reason}",
+    "cleanupNoReason": "no reason reported",
+    "status": {
+      "created": "Not started",
+      "running": "Running",
+      "review": "Ready to compare",
+      "settled": "Finished",
+      "canceled": "Canceled"
+    },
+    "phase": {
+      "waiting": "Waiting",
+      "working": "Working",
+      "blocked": "Needs you",
+      "finished": "Done",
+      "stopped": "Stopped"
+    },
+    "actions": {
+      "start": "Start",
+      "cancel": "Cancel round",
+      "cleanup": "Remove {count} worktrees"
+    },
+    "empty": {
+      "title": "No rounds yet",
+      "description": "Give the same task to several agents from the same commit and compare what each one produced."
+    },
+    "launcher": {
+      "title": "New round",
+      "description": "One task, one starting commit, two to four agents running side by side.",
+      "folder": "Project",
+      "folderPlaceholder": "Choose a project",
+      "roundTitle": "Round name",
+      "roundTitlePlaceholder": "e.g. Rewrite the auth middleware",
+      "objective": "Task",
+      "objectivePlaceholder": "Describe the work exactly as you would to one agent.",
+      "objectiveHint": "Every contender receives this text unchanged — that is what makes the results comparable.",
+      "contenders": "Contenders",
+      "addContender": "Add",
+      "removeContender": "Remove contender",
+      "modelPlaceholder": "Model (optional)",
+      "contendersHint": "The same agent twice with different models is a valid — and the most controlled — round.",
+      "allowDirty": "Start even though the project has uncommitted changes. Contenders branch from the last commit, so those changes will be absent from all of them. Nothing is ever committed for you.",
+      "cancel": "Cancel",
+      "create": "Create round"
+    },
+    "toasts": {
+      "created": "Round created with {count} contenders",
+      "createFailed": "Could not create the round",
+      "started": "{count} contenders started",
+      "startedPartially": "{started} started, {refused} refused",
+      "startFailed": "Could not start the round",
+      "canceled": "Round canceled",
+      "canceledKeepsWorktrees": "Each contender's worktree is kept — remove them with Clean up.",
+      "canceledPartially": "Round canceled, but some contenders could not be stopped",
+      "cancelFailed": "Could not cancel the round",
+      "cleanedUp": "{count} worktrees removed",
+      "cleanupIncomplete": "{succeeded} removed, {failed} failed, {blocked} still running",
+      "cleanupFailed": "Could not run the cleanup"
+    }
   }
 }

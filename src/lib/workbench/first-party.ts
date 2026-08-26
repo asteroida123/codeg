@@ -1,6 +1,12 @@
 "use client"
 
-import { ChartColumn, LayoutTemplate, ListTodo, Zap } from "lucide-react"
+import {
+  ChartColumn,
+  LayoutTemplate,
+  ListTodo,
+  Swords,
+  Zap,
+} from "lucide-react"
 
 import {
   registerNavigationItem,
@@ -22,6 +28,8 @@ import {
 import { AutomationsNavBadge } from "@/components/automations/automations-nav-badge"
 import { TasksNavBadge } from "@/components/tasks/tasks-nav-badge"
 import { ForgeBetaBadge } from "@/components/forge/forge-beta-badge"
+import { ArenaPage, ArenaPageTitle } from "@/components/arena/arena-page"
+import { ArenaBetaBadge } from "@/components/arena/arena-beta-badge"
 
 /**
  * Route ids of the first-party workbench pages.
@@ -36,6 +44,7 @@ declare module "@/lib/workbench/contributions" {
     tasks: true
     forge: true
     tokenUsage: true
+    arena: true
   }
 }
 
@@ -90,6 +99,19 @@ export function activateFirstPartyModules(): Dispose {
       labelKey: "forge",
       order: 30,
       trailing: ForgeBetaBadge,
+    }),
+
+    registerWorkbenchView({
+      id: "arena",
+      page: ArenaPage,
+      strip: ArenaPageTitle,
+    }),
+    registerNavigationItem({
+      id: "arena",
+      icon: Swords,
+      labelKey: "arena",
+      order: 35,
+      trailing: ArenaBetaBadge,
     }),
 
     registerWorkbenchView({

@@ -169,6 +169,7 @@ describe("first-party registrations", () => {
 
   it("registers a page for every route that ships", () => {
     expect(registeredRouteIds().sort()).toEqual([
+      "arena",
       "automations",
       "forge",
       "tasks",
@@ -203,6 +204,7 @@ describe("first-party registrations", () => {
       "automations",
       "tasks",
       "forge",
+      "arena",
     ])
   })
 

@@ -1745,7 +1745,8 @@
       "automations": "自动化",
       "tasks": "待办任务",
       "loadingSubsessions": "正在加载子会话…",
-      "forge": "仓库面板"
+      "forge": "仓库面板",
+      "arena": "竞技场"
     },
     "conversation": {
       "reloadFailed": "会话重新加载失败：{message}",
@@ -5225,5 +5226,71 @@
     "settingsPromptScenarioHint": "只有这个场景创建的任务才会带上。",
     "settingsPromptPlaceholder": "例如：用中文回复；完成前先跑一遍项目的测试。",
     "save": "保存"
+  },
+  "Arena": {
+    "title": "竞技场",
+    "newRound": "新一轮",
+    "openTranscript": "查看会话",
+    "noChangesYet": "尚无改动",
+    "diffStat": "{files} 个文件 · +{additions} −{deletions}",
+    "cleanupBlocked": "worktree 已保留：请先停止该选手，再执行清理。",
+    "cleanupFailed": "worktree 未能删除：{reason}",
+    "cleanupNoReason": "后端未给出原因",
+    "status": {
+      "created": "未开始",
+      "running": "进行中",
+      "review": "可以对比了",
+      "settled": "已结束",
+      "canceled": "已取消"
+    },
+    "phase": {
+      "waiting": "等待中",
+      "working": "工作中",
+      "blocked": "等你处理",
+      "finished": "已完成",
+      "stopped": "已停止"
+    },
+    "actions": {
+      "start": "开始",
+      "cancel": "取消整轮",
+      "cleanup": "删除 {count} 个 worktree"
+    },
+    "empty": {
+      "title": "还没有任何一轮",
+      "description": "把同一个任务从同一个提交交给多个智能体，并排比较各自产出。"
+    },
+    "launcher": {
+      "title": "新一轮",
+      "description": "同一个任务、同一个起点提交，2 到 4 个智能体并排运行。",
+      "folder": "项目",
+      "folderPlaceholder": "选择项目",
+      "roundTitle": "本轮名称",
+      "roundTitlePlaceholder": "例如：重写鉴权中间件",
+      "objective": "任务",
+      "objectivePlaceholder": "像交给单个智能体那样描述这项工作。",
+      "objectiveHint": "每位选手收到的都是这段原文——这正是结果可比的前提。",
+      "contenders": "选手",
+      "addContender": "添加",
+      "removeContender": "移除选手",
+      "modelPlaceholder": "模型（可选）",
+      "contendersHint": "同一个智能体配不同模型同样成立，而且是控制变量最严格的一轮。",
+      "allowDirty": "项目存在未提交改动时仍然开始。选手从最后一个提交拉分支，因此这些改动不会出现在任何选手那里。Codeg 绝不会代你提交。",
+      "cancel": "取消",
+      "create": "创建"
+    },
+    "toasts": {
+      "created": "已创建，共 {count} 位选手",
+      "createFailed": "创建失败",
+      "started": "{count} 位选手已开始",
+      "startedPartially": "{started} 位已开始，{refused} 位被拒绝",
+      "startFailed": "开始失败",
+      "canceled": "本轮已取消",
+      "canceledKeepsWorktrees": "各选手的 worktree 已保留——需要时用「清理」删除。",
+      "canceledPartially": "本轮已取消，但部分选手未能停止",
+      "cancelFailed": "取消失败",
+      "cleanedUp": "已删除 {count} 个 worktree",
+      "cleanupIncomplete": "{succeeded} 个已删除，{failed} 个失败，{blocked} 个仍在运行",
+      "cleanupFailed": "清理未能执行"
+    }
   }
 }
