@@ -7705,6 +7705,146 @@ branch refs/heads/main";
         .await;
         assert!(res.is_err(), "dest containing '..' must be rejected");
     }
+
+    // ── ADR 0001 blocker regressions ────────────────────────────────────────
+    // The Arena branch's generic-worktree changes could seed a root commit
+    // from the user's staged index on an unborn HEAD; its cleanup caller also
+    // passed a linked worktree itself as `repo_path`, tripping the
+    // canonical-path guard below while the UI reported success. These tests
+    // pin the generic invariants so a rework — or any future caller — cannot
+    // regress them.
+
+    #[tokio::test]
+    async fn worktree_add_on_unborn_head_neither_seeds_a_commit_nor_touches_the_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        git_run(dir.path(), &["init", "-q", "-b", "main"]);
+        // The user has already staged work; the seed-commit bug would sweep
+        // this into a root commit with a hardcoded author.
+        std::fs::write(dir.path().join(".env"), "TOKEN=secret").expect("write");
+        std::fs::write(dir.path().join("src.rs"), "fn main() {}").expect("write");
+        git_run(dir.path(), &["add", ".env", "src.rs"]);
+
+        let repo = dir.path().to_str().expect("utf-8").to_string();
+        let wt = dir.path().join("wt");
+        let wt_str = wt.to_str().expect("utf-8").to_string();
+
+        // With no explicit base there is nothing to check out. Whether the
+        // underlying git accepts an unborn HEAD (newer git creates an empty
+        // worktree) or refuses it, the generic helper must never seed a root
+        // commit from the user's staged index.
+        match git_worktree_add(repo.clone(), "wt".into(), wt_str.clone(), None).await {
+            Ok(()) => {}
+            Err(_) => assert!(
+                !wt.exists(),
+                "a refused worktree add must not leave a directory"
+            ),
+        }
+
+        // No seed commit: HEAD is still unborn and the staged index is intact.
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn git");
+        assert!(!head.status.success(), "HEAD must remain unborn");
+
+        let staged = std::process::Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn git");
+        let staged = String::from_utf8_lossy(&staged.stdout);
+        assert!(
+            staged.contains(".env") && staged.contains("src.rs"),
+            "user's staged index must be untouched, got: {staged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_with_explicit_base_leaves_user_index_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        git_run(dir.path(), &["init", "-q", "-b", "main"]);
+        git_run(dir.path(), &["commit", "-q", "--allow-empty", "-m", "base"]);
+        std::fs::write(dir.path().join("draft.env"), "DRAFT=1").expect("write");
+        git_run(dir.path(), &["add", "draft.env"]);
+
+        let repo = dir.path().to_str().expect("utf-8").to_string();
+        let wt = dir.path().join("wt");
+        let wt_str = wt.to_str().expect("utf-8").to_string();
+
+        git_worktree_add(
+            repo.clone(),
+            "wt".into(),
+            wt_str.clone(),
+            Some("HEAD".into()),
+        )
+        .await
+        .expect("an explicit base pins the worktree start point");
+
+        let staged = std::process::Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn git");
+        assert_eq!(
+            String::from_utf8_lossy(&staged.stdout).trim(),
+            "draft.env",
+            "adding a worktree must not consume or commit staged changes"
+        );
+        let head = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%s"])
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn git");
+        assert_eq!(
+            String::from_utf8_lossy(&head.stdout).trim(),
+            "base",
+            "no seed commit may be created next to the user's index"
+        );
+        assert!(Path::new(&wt_str).exists(), "worktree was created");
+    }
+
+    #[tokio::test]
+    async fn remove_worktree_with_the_worktree_itself_as_repo_path_refuses_and_leaves_it_intact() {
+        let db = fresh_in_memory_db().await;
+        let (_dir, repo, wt_path) = repo_with_worktree();
+
+        // Pass the linked worktree itself as `repo_path` (what the Arena
+        // cleanup caller did). From its own perspective the target tree IS the
+        // canonical repo path, so the guard must refuse before any deletion —
+        // the caller is then responsible for surfacing the error, never for
+        // claiming success.
+        let refused = git_remove_worktree_core(
+            &test_emitter(),
+            &db,
+            wt_path.clone(),
+            "wt".into(),
+            0,
+            true,
+            false,
+        )
+        .await
+        .expect_err("the worktree itself is its own canonical repo path");
+
+        assert!(
+            format!("{refused:?}").contains("currently in use"),
+            "expected the canonical-path guard, got: {refused:?}"
+        );
+        assert!(
+            Path::new(&wt_path).exists(),
+            "refused removal keeps the directory"
+        );
+
+        let branch = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "refs/heads/wt"])
+            .current_dir(repo)
+            .output()
+            .expect("spawn git");
+        assert!(
+            branch.status.success(),
+            "refused removal keeps the branch"
+        );
+    }
 }
 
 // Symlink confinement that `read_workspace_file_base64` relies on. Unix-only
