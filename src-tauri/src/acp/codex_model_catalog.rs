@@ -183,6 +183,29 @@ fn slug_of(model: &Value) -> Option<&str> {
     model.get("slug").and_then(Value::as_str)
 }
 
+/// Per-model reasoning-effort vocabulary, from the bundled snapshot.
+///
+/// Effort tiers are a property of the **model** — codex's catalog carries a
+/// `supported_reasoning_levels` list on every ModelInfo entry — not of the
+/// agent as a whole. `ResolvedLaunchProfile` validates a requested effort
+/// against the model's own list once the model is known; unknown slugs answer
+/// `None` (no vocabulary to check, pass through).
+pub fn reasoning_levels_for_model(model_slug: &str) -> Option<Vec<String>> {
+    let snapshot = bundled_snapshot_models();
+    let model = snapshot
+        .iter()
+        .find(|m| slug_of(m) == Some(model_slug))?;
+    Some(
+        model
+            .get("supported_reasoning_levels")?
+            .as_array()?
+            .iter()
+            .filter_map(|level| level.get("effort").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
 fn is_listable(model: &Value) -> bool {
     model.get("visibility").and_then(Value::as_str) == Some("list")
 }

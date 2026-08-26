@@ -84,14 +84,14 @@ pub struct LaunchProfileRequest {
 /// - mcp：`supports_mcp`（registry）+ [`agent_delivers_wire_mcp`] 闸门
 /// - skills：`skill_storage_spec`（有存储规格 = 可注入，但为全局/项目级）
 /// - model / effort / permission：全部 agent 走 ACP config option，wire 级
-///   可送达；已知静态词表仅 grok（effort 四档、permission 六档）
+///   可送达；effort 词表是**模型维度**的属性（见 [`effort_levels_for`]），
+///   不挂在 agent 描述上；permission 已知静态词表仅 grok（launch flag 级，
+///   全模型共享）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentCapabilityDescriptor {
     pub agent_id: AgentType,
     pub models: CapabilitySupport,
     pub reasoning: CapabilitySupport,
-    /// 已知 effort 词表；`None` = 无公开词表，值原样透传且不校验。
-    pub reasoning_levels: Option<&'static [&'static str]>,
     pub permissions: CapabilitySupport,
     /// 已知 permission 词表；`None` = 无公开词表。
     pub permission_modes: Option<&'static [&'static str]>,
@@ -102,8 +102,28 @@ pub struct AgentCapabilityDescriptor {
 }
 
 /// Grok 的 reasoning-effort 档位，与 `connection.rs::grok_effort_label`
-/// 的 canonical id（low/medium/high/xhigh）保持一致。
+/// 的 canonical id（low/medium/high/xhigh）保持一致。Grok 的 per-model
+/// 可切换列表来自运行时 `sessionConfig` 事件，静态层没有按模型的词表，
+/// 因此这里以跨模型超集兜底（任何模型可能出现的档位都在其中）。
 const GROK_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh"];
+
+/// 按 (agent, model) 查询 effort 词表——effort 的合法值集跟随**模型**，
+/// 最终会体现到发给模型的请求中：
+/// - codex：直接读 bundled snapshot 里该模型的 `supported_reasoning_levels`
+/// - grok：静态层无 per-model 列表（运行时事件），以 agent 级超集兜底
+/// - 其余无公开词表 → `None`，值原样透传且不校验
+pub fn effort_levels_for(agent: AgentType, model: Option<&str>) -> Option<Vec<String>> {
+    match agent {
+        AgentType::Codex => crate::acp::codex_model_catalog::reasoning_levels_for_model(model?),
+        AgentType::Grok => Some(
+            GROK_EFFORT_LEVELS
+                .iter()
+                .map(|level| (*level).to_string())
+                .collect(),
+        ),
+        _ => None,
+    }
+}
 
 /// 基于仓库现有事实为内置 / 自定义 agent 构造能力描述。
 pub fn capability_descriptor(agent: AgentType) -> AgentCapabilityDescriptor {
@@ -122,15 +142,14 @@ pub fn capability_descriptor(agent: AgentType) -> AgentCapabilityDescriptor {
     } else {
         CapabilitySupport::Unsupported
     };
-    let (reasoning_levels, permission_modes) = match agent {
-        AgentType::Grok => (Some(GROK_EFFORT_LEVELS), Some(GROK_PERMISSION_MODES)),
-        _ => (None, None),
+    let permission_modes = match agent {
+        AgentType::Grok => Some(GROK_PERMISSION_MODES),
+        _ => None,
     };
     AgentCapabilityDescriptor {
         agent_id: agent,
         models: CapabilitySupport::Native,
         reasoning: CapabilitySupport::Native,
-        reasoning_levels,
         permissions: CapabilitySupport::Native,
         permission_modes,
         skills,
@@ -167,12 +186,13 @@ pub fn resolve_launch_profile(
     }
     if let Some(effort) = &request.effort {
         applied.insert("effort".into(), serde_json::Value::String(effort.clone()));
-        if let Some(levels) = descriptor.reasoning_levels {
-            if !levels.contains(&effort.as_str()) {
+        // 词表跟随模型（codex per-model、grok 超集兜底）；无词表 → 透传。
+        if let Some(levels) = effort_levels_for(agent, request.model.as_deref()) {
+            if !levels.iter().any(|level| level == effort) {
                 warnings.push(format!(
-                    "effort '{}' is not in the known vocabulary for {} ({:?}); \
+                    "effort '{}' is not in the known vocabulary for {} model {:?} ({:?}); \
                      delivered verbatim to the adapter",
-                    effort, meta.name, levels
+                    effort, meta.name, request.model, levels
                 ));
             }
         }
@@ -289,12 +309,80 @@ mod tests {
             "skills inject via per-agent symlink, global/project scope only"
         );
         let grok = capability_descriptor(AgentType::Grok);
-        assert_eq!(grok.reasoning_levels, Some(GROK_EFFORT_LEVELS));
         assert_eq!(grok.permission_modes, Some(GROK_PERMISSION_MODES));
         // All ACP agents take model/effort/permission via config options.
         assert_eq!(grok.models, CapabilitySupport::Native);
         assert_eq!(grok.reasoning, CapabilitySupport::Native);
         assert_eq!(grok.permissions, CapabilitySupport::Native);
+    }
+
+    #[test]
+    fn codex_effort_vocabulary_follows_the_model() {
+        let snapshot = crate::acp::codex_model_catalog::bundled_snapshot_models();
+        let model = snapshot
+            .iter()
+            .find(|m| {
+                m.get("supported_reasoning_levels")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some()
+            })
+            .expect("a bundled model with reasoning levels");
+        let slug = model
+            .get("slug")
+            .and_then(serde_json::Value::as_str)
+            .expect("slug");
+        let tier = model
+            .get("supported_reasoning_levels")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|levels| levels.first())
+            .and_then(|level| level.get("effort"))
+            .and_then(serde_json::Value::as_str)
+            .expect("first tier");
+
+        // 模型已知且档位在该模型自己的列表内 → 静默。
+        let ok = profile(
+            AgentType::Codex,
+            &LaunchProfileRequest {
+                model: Some(slug.to_string()),
+                effort: Some(tier.to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(ok.warnings.is_empty(), "{:?}", ok.warnings);
+
+        // 模型已知但档位不在该模型的列表内 → 告警（抓"档位对模型无效"）。
+        let bad = profile(
+            AgentType::Codex,
+            &LaunchProfileRequest {
+                model: Some(slug.to_string()),
+                effort: Some("nonexistent-tier".into()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            bad.warnings.iter().any(|w| w.contains("nonexistent-tier")),
+            "{:?}",
+            bad.warnings
+        );
+
+        // 模型未知 → 无词表可查，透传无告警。
+        let unknown = profile(
+            AgentType::Codex,
+            &LaunchProfileRequest {
+                model: Some("definitely-not-a-model".into()),
+                effort: Some("whatever".into()),
+                ..Default::default()
+            },
+        );
+        assert!(unknown.warnings.is_empty(), "{:?}", unknown.warnings);
+    }
+
+    #[test]
+    fn grok_effort_super_set_still_covers_model_requests() {
+        // grok 的 per-model 列表来自运行时事件；静态层以跨模型超集兜底。
+        assert!(effort_levels_for(AgentType::Grok, Some("grok-4.5")).is_some());
+        assert!(effort_levels_for(AgentType::Grok, None).is_some());
+        assert!(effort_levels_for(AgentType::ClaudeCode, None).is_none());
     }
 
     #[test]
