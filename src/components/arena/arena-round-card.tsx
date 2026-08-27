@@ -15,11 +15,11 @@ import { cn } from "@/lib/utils"
 import type { WorkTaskBatch, WorkTaskBatchMember } from "@/lib/types"
 import { ArenaMemberCard } from "./arena-member-card"
 import {
+  batchControls,
+  batchDiffTotals,
   refusedStarts,
-  roundControls,
-  roundDiffTotals,
   summarizeCleanup,
-} from "./arena-round-model"
+} from "@/lib/work-task-batch-model"
 
 interface ArenaRoundCardProps {
   round: WorkTaskBatch
@@ -46,8 +46,8 @@ export function ArenaRoundCard({
 }: ArenaRoundCardProps) {
   const t = useTranslations("Arena")
   const [busy, setBusy] = useState<Busy>(null)
-  const controls = roundControls(round)
-  const totals = roundDiffTotals(round)
+  const controls = batchControls(round)
+  const totals = batchDiffTotals(round)
 
   const handleStart = useCallback(async () => {
     setBusy("start")

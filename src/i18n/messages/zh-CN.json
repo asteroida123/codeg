@@ -5292,5 +5292,39 @@
       "cleanupIncomplete": "{succeeded} 个已删除，{failed} 个失败，{blocked} 个仍在运行",
       "cleanupFailed": "清理未能执行"
     }
+  },
+  "TaskBatch": {
+    "title": "把多个待办一起跑",
+    "description": "它们从同一个提交开始，并且共用一次取消、一次清理，每个 worktree 各自给出结果。",
+    "batchName": "分组名称",
+    "batchNamePlaceholder": "例如：周五收尾",
+    "pickTasks": "任务",
+    "pickTasksHint": "从同一个项目里选 2 到 {max} 个待办。已经有 worktree 的任务不会列出——它的起点提交已经定了。",
+    "otherProject": "其他项目",
+    "noEligible": "没有可用的待办。任务需要仍处于待办状态、且尚未拥有自己的 worktree，才能加入分组。",
+    "cancel": "取消",
+    "run": "一起运行 {count} 个",
+    "memberCount": "{count} 个任务",
+    "cancelAll": "全部取消",
+    "cleanUpAll": "清理 {count} 个",
+    "status": {
+      "created": "未开始",
+      "running": "进行中",
+      "review": "待评审",
+      "settled": "已结束",
+      "canceled": "已取消"
+    },
+    "toasts": {
+      "started": "{count} 个任务已一起开始",
+      "startedPartially": "{started} 个已开始，{refused} 个被拒绝",
+      "failed": "未能作为一组运行",
+      "canceled": "该组已取消",
+      "canceledKeepsWorktrees": "各任务的 worktree 已保留——需要时用「清理」删除。",
+      "canceledPartially": "该组已取消，但部分任务未能停止",
+      "cancelFailed": "取消失败",
+      "cleanedUp": "已删除 {count} 个 worktree",
+      "cleanupIncomplete": "{succeeded} 个已删除，{failed} 个失败，{blocked} 个仍在运行",
+      "cleanupFailed": "清理未能执行"
+    }
   }
 }

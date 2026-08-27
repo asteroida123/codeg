@@ -10,10 +10,10 @@ import {
   memberLabel,
   memberPhase,
   refusedStarts,
-  roundControls,
-  roundDiffTotals,
+  batchControls,
+  batchDiffTotals,
   summarizeCleanup,
-} from "./arena-round-model"
+} from "./work-task-batch-model"
 
 function member(over: Partial<WorkTaskBatchMember> = {}): WorkTaskBatchMember {
   return {
@@ -32,7 +32,7 @@ function member(over: Partial<WorkTaskBatchMember> = {}): WorkTaskBatchMember {
   }
 }
 
-function round(members: WorkTaskBatchMember[]): WorkTaskBatch {
+function batch(members: WorkTaskBatchMember[]): WorkTaskBatch {
   return {
     id: 1,
     folder_id: 7,
@@ -75,20 +75,20 @@ describe("memberPhase", () => {
   })
 })
 
-describe("roundControls", () => {
+describe("batchControls", () => {
   it("offers a start while any member has never run", () => {
-    const c = roundControls(round([member({ task_status: "todo" })]))
+    const c = batchControls(batch([member({ task_status: "todo" })]))
     expect(c.canStart).toBe(true)
   })
 
   it("offers a start for a failed member, so a casualty can be retried", () => {
-    const c = roundControls(round([member({ task_status: "failed" })]))
+    const c = batchControls(batch([member({ task_status: "failed" })]))
     expect(c.canStart).toBe(true)
   })
 
   it("offers no start once every member has finished", () => {
-    const c = roundControls(
-      round([
+    const c = batchControls(
+      batch([
         member({ task_id: 11, task_status: "review" }),
         member({ task_id: 12, task_status: "done" }),
       ])
@@ -99,24 +99,24 @@ describe("roundControls", () => {
   /** Cancellation is one-way; a canceled round is not a launch pad. A user who
    *  wants another go starts a new round, which also re-resolves the base. */
   it("offers no start on a canceled round", () => {
-    const r = round([member({ task_status: "canceled" })])
+    const r = batch([member({ task_status: "canceled" })])
     r.status = "canceled"
-    expect(roundControls(r).canStart).toBe(false)
+    expect(batchControls(r).canStart).toBe(false)
   })
 
   it("offers a cancel while anything is live or queued", () => {
     expect(
-      roundControls(round([member({ task_status: "running" })])).canCancel
+      batchControls(batch([member({ task_status: "running" })])).canCancel
     ).toBe(true)
     expect(
-      roundControls(round([member({ task_status: "awaiting_input" })]))
+      batchControls(batch([member({ task_status: "awaiting_input" })]))
         .canCancel
     ).toBe(true)
     expect(
-      roundControls(round([member({ task_status: "queued" })])).canCancel
+      batchControls(batch([member({ task_status: "queued" })])).canCancel
     ).toBe(true)
     expect(
-      roundControls(round([member({ task_status: "done" })])).canCancel
+      batchControls(batch([member({ task_status: "done" })])).canCancel
     ).toBe(false)
   })
 
@@ -124,8 +124,8 @@ describe("roundControls", () => {
    *  offering the button avoids inviting an action that is guaranteed to be
    *  partly refused. */
   it("withholds cleanup while a member is still live", () => {
-    const c = roundControls(
-      round([
+    const c = batchControls(
+      batch([
         member({ task_id: 11, task_status: "running" }),
         member({ task_id: 12, task_status: "review" }),
       ])
@@ -134,8 +134,8 @@ describe("roundControls", () => {
   })
 
   it("offers cleanup once nothing is live and something is left to remove", () => {
-    const c = roundControls(
-      round([
+    const c = batchControls(
+      batch([
         member({ task_id: 11, task_status: "review" }),
         member({ task_id: 12, task_status: "failed" }),
       ])
@@ -145,8 +145,8 @@ describe("roundControls", () => {
   })
 
   it("stops offering cleanup for members already cleaned", () => {
-    const c = roundControls(
-      round([
+    const c = batchControls(
+      batch([
         member({
           task_id: 11,
           task_status: "done",
@@ -166,8 +166,8 @@ describe("roundControls", () => {
   /** A previous failure has to stay actionable — that is the whole reason the
    *  outcome is persisted on the member row. */
   it("keeps offering cleanup to a member whose last attempt failed", () => {
-    const c = roundControls(
-      round([
+    const c = batchControls(
+      batch([
         member({
           task_id: 11,
           task_status: "done",
@@ -181,10 +181,10 @@ describe("roundControls", () => {
   })
 })
 
-describe("roundDiffTotals", () => {
+describe("batchDiffTotals", () => {
   it("sums the members, counting an absent measurement as nothing", () => {
-    const totals = roundDiffTotals(
-      round([
+    const totals = batchDiffTotals(
+      batch([
         member({ task_id: 11, files_changed: 3, additions: 40, deletions: 5 }),
         member({
           task_id: 12,

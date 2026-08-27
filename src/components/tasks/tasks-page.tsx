@@ -77,7 +77,13 @@ import { TaskMergeDialog } from "./task-merge-dialog"
 import { TaskRestartDialog, type TaskRestartKind } from "./task-restart-dialog"
 import { TaskScheduleDialog } from "./task-schedule-dialog"
 import { TaskSettingsDialog } from "./task-settings-dialog"
-import { OPEN_TASK_SETTINGS_EVENT } from "./tasks-chrome-actions"
+import {
+  OPEN_TASK_BATCH_EVENT,
+  OPEN_TASK_SETTINGS_EVENT,
+} from "./tasks-chrome-actions"
+import { TaskBatchDialog } from "./task-batch-dialog"
+import { TaskBatchStrip } from "./task-batch-strip"
+import { usePlainTaskBatches } from "@/hooks/use-plain-task-batches"
 import { TasksSkeleton } from "./tasks-skeleton"
 import { TaskTranscriptDialog } from "./task-transcript-dialog"
 import type { WorkTask, WorkTaskDraft } from "@/lib/types"
@@ -266,6 +272,16 @@ export function TasksPage() {
     window.addEventListener(OPEN_TASK_SETTINGS_EVENT, open)
     return () => window.removeEventListener(OPEN_TASK_SETTINGS_EVENT, open)
   }, [])
+
+  // Same chrome hand-off for the batch dialog.
+  const [batchOpen, setBatchOpen] = useState(false)
+  useEffect(() => {
+    const open = () => setBatchOpen(true)
+    window.addEventListener(OPEN_TASK_BATCH_EVENT, open)
+    return () => window.removeEventListener(OPEN_TASK_BATCH_EVENT, open)
+  }, [])
+  const { batches: plainBatches, refetch: refetchBatches } =
+    usePlainTaskBatches()
 
   const visibleTasks = useMemo(
     () =>
@@ -752,6 +768,10 @@ export function TasksPage() {
         </div>
       )}
 
+      {/* Aggregate controls for the batches made on this board. Above the board
+          rather than inside it: a batch is a group OF cards, not another card. */}
+      <TaskBatchStrip batches={plainBatches} folderNames={folderNames} />
+
       {/* Board / list */}
       {showSkeleton ? (
         <TasksSkeleton mode={viewMode} />
@@ -1031,6 +1051,17 @@ export function TasksPage() {
         open={settingsOpen}
         onOpenChange={setSettingsOpen}
         folderId={folderFilter}
+      />
+
+      {/* Sees every task, not the filtered view: the folder filter narrows what
+          the board shows, and a to-do hidden by it is still a legitimate member
+          of a batch the user is assembling. The dialog groups by project itself. */}
+      <TaskBatchDialog
+        open={batchOpen}
+        onOpenChange={setBatchOpen}
+        tasks={tasks}
+        folderNames={folderNames}
+        onCreated={() => void refetchBatches()}
       />
 
       {/* Drag preview. Portalled to the body because a fixed element is

@@ -12,7 +12,11 @@ import {
 
 import { cn } from "@/lib/utils"
 import type { WorkTaskBatchMember } from "@/lib/types"
-import { memberLabel, memberPhase, type MemberPhase } from "./arena-round-model"
+import {
+  memberLabel,
+  memberPhase,
+  type MemberPhase,
+} from "@/lib/work-task-batch-model"
 
 const PHASE_ICON: Record<MemberPhase, typeof Clock> = {
   waiting: Clock,

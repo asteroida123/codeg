@@ -29,6 +29,18 @@ pub struct CreateParams {
     pub spec: WorkTaskBatchSpec,
 }
 
+/// Group tasks that already exist. `allowDirty` defaults, so a body without it
+/// takes the safe path.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdoptParams {
+    pub folder_id: i32,
+    pub title: String,
+    pub task_ids: Vec<i32>,
+    #[serde(default)]
+    pub allow_dirty: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CleanupParams {
@@ -63,6 +75,22 @@ pub async fn work_task_batch_create(
     Json(params): Json<CreateParams>,
 ) -> Result<Json<WorkTaskBatchInfo>, AppCommandError> {
     let result = core::work_task_batch_create_core(&state.db, &state.emitter, params.spec).await?;
+    Ok(Json(result))
+}
+
+pub async fn work_task_batch_adopt(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AdoptParams>,
+) -> Result<Json<WorkTaskBatchInfo>, AppCommandError> {
+    let result = core::work_task_batch_adopt_core(
+        &state.db,
+        &state.emitter,
+        params.folder_id,
+        params.title,
+        params.task_ids,
+        params.allow_dirty,
+    )
+    .await?;
     Ok(Json(result))
 }
 

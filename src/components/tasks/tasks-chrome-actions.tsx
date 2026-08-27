@@ -1,7 +1,7 @@
 "use client"
 
 import { useTranslations } from "next-intl"
-import { Kanban, List, Settings2 } from "lucide-react"
+import { Kanban, Layers, List, Settings2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { useTasksView } from "@/contexts/tasks-view-context"
 import type { WorkbenchChromeActionsProps } from "@/components/workbench/workbench-content"
@@ -11,6 +11,10 @@ import type { WorkbenchChromeActionsProps } from "@/components/workbench/workben
  *  Lives here rather than in tasks-page.tsx because the sender is in the window
  *  chrome and the receiver is the page — neither should import the other. */
 export const OPEN_TASK_SETTINGS_EVENT = "codeg:open-task-settings"
+
+/** Same hand-off for the "run several to-dos together" dialog: the button is in
+ *  the window chrome, the dialog belongs to the page that owns the task list. */
+export const OPEN_TASK_BATCH_EVENT = "codeg:open-task-batch"
 
 /**
  * The Tasks route's own entries in the window's top-right chrome cluster,
@@ -27,7 +31,16 @@ export function TasksChromeActions({
   iconClassName,
 }: WorkbenchChromeActionsProps) {
   const t = useTranslations("Tasks")
+  const tBatch = useTranslations("TaskBatch")
   const { tasks, viewMode, setViewMode } = useTasksView()
+  // Same eligibility the dialog applies: a task with a worktree already has a
+  // starting commit, so a batch cannot pin one for it.
+  const eligibleForBatch = tasks.filter(
+    (task) =>
+      task.status === "todo" &&
+      task.worktree_folder_id == null &&
+      task.archived_at == null
+  ).length
   // A single toggle rather than a segmented pair, and it shows the mode it
   // would switch TO: on one button "what happens if I press this" is the only
   // reading that doesn't need a legend.
@@ -52,6 +65,20 @@ export function TasksChromeActions({
           ) : (
             <Kanban className={iconClassName} />
           )}
+        </Button>
+      ) : null}
+      {/* Offered only when there is something to group. Two, not one: a "batch"
+          of one is just the task, and its extra machinery would buy nothing. */}
+      {eligibleForBatch >= 2 ? (
+        <Button
+          variant="ghost"
+          size="icon"
+          className={buttonClassName}
+          onClick={() => window.dispatchEvent(new Event(OPEN_TASK_BATCH_EVENT))}
+          title={tBatch("title")}
+          aria-label={tBatch("title")}
+        >
+          <Layers className={iconClassName} />
         </Button>
       ) : null}
       <Button

@@ -231,6 +231,172 @@ pub async fn create(
     get(conn, batch.id).await
 }
 
+/// Group tasks that ALREADY EXIST into a batch over one pinned base.
+///
+/// The counterpart to [`create`], and the reason the two are separate functions
+/// rather than one with a flag: `create` mints its members, `adopt` takes rows
+/// the user already wrote. Nothing is created here and nothing is launched — the
+/// tasks keep their own titles, configs and sort order, and gain a shared
+/// starting commit plus the aggregate commands.
+///
+/// This is what a batch looks like without an app on top: pick several to-dos on
+/// the board, run them from one commit, cancel them together, and clean them up
+/// with a per-member answer for each. Every one of those is something the board
+/// could not do task-by-task — in particular there was no way to remove several
+/// worktrees and be told individually which removals actually succeeded.
+///
+/// Four refusals, each because the alternative would silently mean something
+/// other than what the user asked for:
+///
+/// - **A task that already has a worktree.** Its starting commit was fixed when
+///   that worktree was created, so a batch "pinning" it would record a base it
+///   does not have. The board's own requeue keeps the worktree deliberately;
+///   this refuses instead of quietly disagreeing with it.
+/// - **A task that is not `todo`.** A running or reviewed task's start is behind
+///   it. Grouping it would produce a batch whose shared base is fiction for that
+///   member.
+/// - **A task from another folder.** A batch's base is one repository's commit.
+/// - **A task already in a batch.** Two batches pinning different commits onto
+///   one task has no coherent meaning (the unique index enforces it; this reports
+///   it as itself rather than as a constraint violation).
+pub async fn adopt(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+    title: &str,
+    task_ids: &[i32],
+    base: ResolvedBase,
+) -> Result<WorkTaskBatchInfo, DbError> {
+    if title.trim().is_empty() {
+        return Err(DbError::Validation("batch title is required".into()));
+    }
+    if task_ids.is_empty() {
+        return Err(DbError::Validation(
+            "select at least one task to run as a batch".into(),
+        ));
+    }
+    if task_ids.len() > MAX_MEMBERS {
+        return Err(DbError::Validation(format!(
+            "a batch takes at most {MAX_MEMBERS} members, got {}",
+            task_ids.len()
+        )));
+    }
+    // A repeated id would take two slots for one task and then trip the unique
+    // index mid-transaction; caught here so the message names the real problem.
+    let mut seen = std::collections::BTreeSet::new();
+    for id in task_ids {
+        if !seen.insert(*id) {
+            return Err(DbError::Validation(format!(
+                "task {id} was selected more than once"
+            )));
+        }
+    }
+
+    let folder = folder::Entity::find_by_id(folder_id)
+        .one(conn)
+        .await?
+        .filter(|f| f.deleted_at.is_none())
+        .ok_or_else(|| DbError::NotFound(format!("folder {folder_id}")))?;
+    if folder.parent_id.is_some() {
+        return Err(DbError::Validation(
+            "a batch must target a project folder, not a worktree".into(),
+        ));
+    }
+
+    // Every eligibility check runs BEFORE the first write, so a rejected
+    // selection never leaves a batch row behind — and the user gets one clear
+    // reason instead of a partially-formed group.
+    for id in task_ids {
+        let task = work_task::Entity::find_by_id(*id)
+            .one(conn)
+            .await?
+            .filter(|t| t.deleted_at.is_none())
+            .ok_or_else(|| DbError::NotFound(format!("task {id}")))?;
+        if task.folder_id != folder_id {
+            return Err(DbError::Validation(format!(
+                "task {id} belongs to another project — a batch shares one repository's commit"
+            )));
+        }
+        if task.status != WorkTaskStatus::Todo {
+            return Err(DbError::Validation(format!(
+                "task {id} is {} — only to-do tasks can join a batch, because a batch fixes \
+                 where its members start",
+                crate::db::service::work_task_service::status_str(task.status)
+            )));
+        }
+        if task.worktree_folder_id.is_some() {
+            return Err(DbError::Validation(format!(
+                "task {id} already has a worktree, so its starting commit is already decided — \
+                 remove the worktree first, or leave it out of the batch"
+            )));
+        }
+        if batch_of_task(conn, *id).await?.is_some() {
+            return Err(DbError::Validation(format!(
+                "task {id} already belongs to a batch"
+            )));
+        }
+    }
+
+    let now = Utc::now();
+    let txn = conn.begin().await?;
+
+    let batch = work_task_batch::ActiveModel {
+        id: NotSet,
+        folder_id: Set(folder_id),
+        title: Set(title.trim().to_string()),
+        base_sha: Set(base.sha.clone()),
+        base_branch: Set(base.branch.clone()),
+        status: Set(WorkTaskBatchStatus::Created),
+        failure_policy: Set(WorkTaskBatchFailurePolicy::BestEffort),
+        max_concurrent: Set(None),
+        // No owner: a plain bulk operation, not an app's round. Which is exactly
+        // what makes this the primitive's second consumer.
+        owner_extension: Set(None),
+        metadata: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+        settled_at: Set(None),
+        deleted_at: Set(None),
+    }
+    .insert(&txn)
+    .await?;
+
+    for (slot, task_id) in task_ids.iter().enumerate() {
+        work_task_batch_member::ActiveModel {
+            id: NotSet,
+            batch_id: Set(batch.id),
+            task_id: Set(*task_id),
+            slot_index: Set(slot as i32),
+            // No label: the task's own title is the name here. An app supplies a
+            // label because "slot 2" means something to it; a bulk selection has
+            // nothing to add to what the user already called the task.
+            label: Set(None),
+            profile_snapshot: Set(None),
+            cleanup_result: Set(None),
+            cleanup_error: Set(None),
+            created_at: Set(now),
+        }
+        .insert(&txn)
+        .await?;
+
+        crate::db::service::work_task_service::record_event(
+            &txn,
+            *task_id,
+            "batch_joined",
+            "user",
+            Some(serde_json::json!({
+                "batch_id": batch.id,
+                "slot_index": slot,
+                "base_sha": base.sha,
+                "base_branch": base.branch,
+            })),
+        )
+        .await?;
+    }
+
+    txn.commit().await?;
+    get(conn, batch.id).await
+}
+
 fn validate_spec(spec: &WorkTaskBatchSpec) -> Result<(), DbError> {
     if spec.title.trim().is_empty() {
         return Err(DbError::Validation("batch title is required".into()));
@@ -705,6 +871,221 @@ mod tests {
                 .expect("member has a pinned base");
             assert_eq!(pinned, ("main".to_string(), BASE.to_string()));
         }
+    }
+
+    // ── adopt: the primitive's second consumer ──────────────────────────────
+    //
+    // `create` mints members; `adopt` takes rows the user already wrote. These
+    // tests pin the eligibility rules, because each refusal is the difference
+    // between a batch that means what it says and one whose "shared base" is
+    // fiction for some member.
+
+    /// Seed a plain to-do task on `folder_id`, the way the board does.
+    async fn seed_todo(
+        db: &crate::db::AppDatabase,
+        folder_id: i32,
+        title: &str,
+    ) -> i32 {
+        crate::db::service::work_task_service::create(
+            &db.conn,
+            crate::models::WorkTaskDraft {
+                folder_id,
+                title: title.to_string(),
+                config: serde_json::json!({
+                    "display_text": "do the thing",
+                    "prompt_blocks": [{ "type": "text", "text": "do the thing" }],
+                }),
+            },
+        )
+        .await
+        .expect("seed todo")
+        .id
+    }
+
+    #[tokio::test]
+    async fn adopt_groups_existing_todos_under_one_pinned_base() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/batch-adopt").await;
+        let a = seed_todo(&db, folder_id, "first").await;
+        let b = seed_todo(&db, folder_id, "second").await;
+
+        let info = adopt(&db.conn, folder_id, "run these two", &[a, b], base())
+            .await
+            .expect("adopt");
+
+        assert_eq!(info.base_sha, BASE);
+        assert_eq!(info.status, WorkTaskBatchStatus::Created);
+        // No owner: a plain bulk operation, which is precisely what makes this a
+        // second consumer rather than the app in disguise.
+        assert!(info.owner_extension.is_none());
+        // The tasks keep their own titles — nothing was renamed or recreated.
+        assert_eq!(
+            info.members
+                .iter()
+                .map(|m| m.task_title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        // Selection order is the slot order.
+        assert_eq!(
+            info.members.iter().map(|m| m.task_id).collect::<Vec<_>>(),
+            vec![a, b]
+        );
+        // And both now resolve the shared base the engine will branch them from.
+        for id in [a, b] {
+            assert_eq!(
+                pinned_base_of_task(&db.conn, id).await.unwrap(),
+                Some(("main".to_string(), BASE.to_string()))
+            );
+        }
+    }
+
+    /// A task whose worktree exists already started somewhere. A batch claiming
+    /// to pin its base would be recording a commit it does not have.
+    #[tokio::test]
+    async fn adopt_refuses_a_task_that_already_has_a_worktree() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/batch-adopt-wt").await;
+        let a = seed_todo(&db, folder_id, "has a worktree").await;
+        let wt = seed_folder(&db, "/tmp/batch-adopt-wt-task").await;
+        crate::db::service::work_task_service::attach_worktree(
+            &db.conn,
+            a,
+            wt,
+            "main",
+            "deadbeef",
+            "task/1",
+        )
+        .await
+        .expect("attach");
+
+        let err = adopt(&db.conn, folder_id, "t", &[a], base())
+            .await
+            .expect_err("a task with a worktree cannot be pinned");
+        assert!(
+            err.to_string().contains("already has a worktree"),
+            "the refusal must name the real cause, got: {err}"
+        );
+        // And nothing was written.
+        assert!(list(&db.conn, Some(folder_id)).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn adopt_refuses_a_task_that_is_not_todo() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/batch-adopt-status").await;
+        let a = seed_todo(&db, folder_id, "already running").await;
+        set_status(&db, a, WorkTaskStatus::Running).await;
+
+        let err = adopt(&db.conn, folder_id, "t", &[a], base())
+            .await
+            .expect_err("a running task's start is behind it");
+        assert!(err.to_string().contains("running"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn adopt_refuses_a_task_from_another_project() {
+        let db = fresh_in_memory_db().await;
+        let mine = seed_folder(&db, "/tmp/batch-adopt-mine").await;
+        let theirs = seed_folder(&db, "/tmp/batch-adopt-theirs").await;
+        let a = seed_todo(&db, mine, "mine").await;
+        let b = seed_todo(&db, theirs, "theirs").await;
+
+        let err = adopt(&db.conn, mine, "t", &[a, b], base())
+            .await
+            .expect_err("a batch shares one repository's commit");
+        assert!(err.to_string().contains("another project"), "got: {err}");
+        assert!(list(&db.conn, Some(mine)).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn adopt_refuses_a_task_already_in_a_batch() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/batch-adopt-twice").await;
+        let a = seed_todo(&db, folder_id, "first").await;
+        adopt(&db.conn, folder_id, "one", &[a], base())
+            .await
+            .expect("first adopt");
+
+        let err = adopt(&db.conn, folder_id, "two", &[a], base())
+            .await
+            .expect_err("a task belongs to at most one batch");
+        assert!(err.to_string().contains("already belongs"), "got: {err}");
+        // Exactly one batch exists — the refusal wrote nothing.
+        assert_eq!(list(&db.conn, Some(folder_id)).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn adopt_refuses_an_empty_or_duplicated_or_oversized_selection() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/batch-adopt-selection").await;
+        let a = seed_todo(&db, folder_id, "first").await;
+
+        assert!(adopt(&db.conn, folder_id, "t", &[], base()).await.is_err());
+        assert!(adopt(&db.conn, folder_id, "  ", &[a], base()).await.is_err());
+
+        // The same task twice would take two slots for one row and then trip the
+        // unique index mid-transaction; reported as itself instead.
+        let err = adopt(&db.conn, folder_id, "t", &[a, a], base())
+            .await
+            .expect_err("a repeated selection is a mistake, not a two-member batch");
+        assert!(err.to_string().contains("more than once"), "got: {err}");
+
+        let many: Vec<i32> = (0..=MAX_MEMBERS as i32).collect();
+        assert!(adopt(&db.conn, folder_id, "t", &many, base()).await.is_err());
+    }
+
+    /// The adopted task's own timeline records that its start was decided
+    /// elsewhere — the same courtesy `create` extends to its members.
+    #[tokio::test]
+    async fn adopt_records_the_pinned_base_on_each_task_timeline() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/batch-adopt-event").await;
+        let a = seed_todo(&db, folder_id, "first").await;
+        let info = adopt(&db.conn, folder_id, "t", &[a], base())
+            .await
+            .expect("adopt");
+
+        let events =
+            crate::db::service::work_task_service::list_events(&db.conn, a, 50)
+                .await
+                .unwrap();
+        let joined = events
+            .iter()
+            .find(|e| e.kind == "batch_joined")
+            .expect("a batch_joined event");
+        let payload = joined.payload.as_ref().expect("payload");
+        assert_eq!(payload["batch_id"], info.id);
+        assert_eq!(payload["base_sha"], BASE);
+        assert_eq!(payload["base_branch"], "main");
+    }
+
+    /// An adopted batch answers to the same aggregates and the same projection as
+    /// a created one — there is one primitive, not two.
+    #[tokio::test]
+    async fn an_adopted_batch_projects_and_cancels_like_any_other() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/batch-adopt-parity").await;
+        let a = seed_todo(&db, folder_id, "first").await;
+        let b = seed_todo(&db, folder_id, "second").await;
+        let info = adopt(&db.conn, folder_id, "t", &[a, b], base())
+            .await
+            .expect("adopt");
+
+        set_status(&db, a, WorkTaskStatus::Running).await;
+        assert_eq!(
+            recompute_status(&db.conn, info.id).await.unwrap(),
+            WorkTaskBatchStatus::Running
+        );
+
+        mark_canceled(&db.conn, info.id).await.unwrap();
+        set_status(&db, a, WorkTaskStatus::Done).await;
+        set_status(&db, b, WorkTaskStatus::Done).await;
+        assert_eq!(
+            recompute_status(&db.conn, info.id).await.unwrap(),
+            WorkTaskBatchStatus::Canceled,
+            "an adopted batch lost the cancel gate a created one has"
+        );
     }
 
     #[tokio::test]

@@ -1298,6 +1298,10 @@ pub fn build_router(
             post(handlers::work_task_batch::work_task_batch_create),
         )
         .route(
+            "/work_task_batch_adopt",
+            post(handlers::work_task_batch::work_task_batch_adopt),
+        )
+        .route(
             "/work_task_batch_start",
             post(handlers::work_task_batch::work_task_batch_start),
         )

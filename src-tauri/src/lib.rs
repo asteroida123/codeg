@@ -1402,6 +1402,7 @@ mod tauri_app {
                 work_task_commands::work_task_template_save,
                 work_task_commands::work_task_template_delete,
                 work_task_batch_commands::work_task_batch_create,
+                work_task_batch_commands::work_task_batch_adopt,
                 work_task_batch_commands::work_task_batch_list,
                 work_task_batch_commands::work_task_batch_get,
                 work_task_batch_commands::work_task_batch_start,

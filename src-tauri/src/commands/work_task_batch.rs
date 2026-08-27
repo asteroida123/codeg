@@ -119,6 +119,39 @@ pub async fn work_task_batch_create_core(
     Ok(info)
 }
 
+/// Group tasks that already exist into a batch over one pinned base.
+///
+/// Same base resolution as [`work_task_batch_create_core`] — including every
+/// refusal, and including never writing to the repository. The difference is
+/// upstream of it: nothing is created, so this is the path a bulk selection on
+/// the task board takes.
+pub async fn work_task_batch_adopt_core(
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+    folder_id: i32,
+    title: String,
+    task_ids: Vec<i32>,
+    allow_dirty: bool,
+) -> Result<WorkTaskBatchInfo, AppCommandError> {
+    let folder = get_folder_core(db, folder_id).await?;
+    let base = resolve_base(&folder.path, allow_dirty).await?;
+    let info = work_task_batch_service::adopt(&db.conn, folder_id, &title, &task_ids, base)
+        .await
+        .map_err(AppCommandError::from)?;
+    emit_event(
+        emitter,
+        WORK_TASK_BATCH_CHANGED_EVENT,
+        WorkTaskBatchChange::Upsert { id: info.id },
+    );
+    // The members' own rows gained a timeline entry, so the board should refetch.
+    emit_event(
+        emitter,
+        crate::web::event_bridge::WORK_TASK_CHANGED_EVENT,
+        crate::web::event_bridge::WorkTaskChange::Refresh,
+    );
+    Ok(info)
+}
+
 pub async fn work_task_batch_list_core(
     db: &AppDatabase,
     folder_id: Option<i32>,
@@ -187,6 +220,27 @@ pub async fn work_task_batch_create(
     spec: WorkTaskBatchSpec,
 ) -> Result<WorkTaskBatchInfo, AppCommandError> {
     work_task_batch_create_core(&db, &EventEmitter::Tauri(app), spec).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[tauri::command]
+pub async fn work_task_batch_adopt(
+    db: tauri::State<'_, AppDatabase>,
+    app: tauri::AppHandle,
+    folder_id: i32,
+    title: String,
+    task_ids: Vec<i32>,
+    allow_dirty: bool,
+) -> Result<WorkTaskBatchInfo, AppCommandError> {
+    work_task_batch_adopt_core(
+        &db,
+        &EventEmitter::Tauri(app),
+        folder_id,
+        title,
+        task_ids,
+        allow_dirty,
+    )
+    .await
 }
 
 #[cfg(feature = "tauri-runtime")]

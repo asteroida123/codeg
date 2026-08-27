@@ -6,9 +6,18 @@ import type {
 } from "@/lib/types"
 
 /**
- * Pure presentation logic for a comparison round. Kept out of the components so
- * the rules that matter — which controls are offered, and what a cleanup
- * actually achieved — are testable without rendering anything.
+ * Pure presentation logic for a `WorkTaskBatch`, shared by every consumer.
+ *
+ * Lives in `lib/` rather than beside a feature, and that placement is
+ * load-bearing: both the task board's bulk groups and the Arena's comparison
+ * rounds read these rules, so putting them in either feature's directory would
+ * make deleting that feature break the other. Nothing here knows what a batch is
+ * *for* — the vocabulary is `member` and `batch`, and the functions are pure over
+ * Core wire types.
+ *
+ * Kept out of the components so the rules that matter — which controls are
+ * offered, and what a cleanup actually achieved — are testable without rendering
+ * anything.
  */
 
 /** How a member reads on the grid. A presentation grouping over the task
@@ -50,8 +59,8 @@ export function memberPhase(status: WorkTaskStatus | null): MemberPhase {
   }
 }
 
-/** Which aggregate controls a round can be offered, and why not. */
-export interface RoundControls {
+/** Which aggregate controls a batch can be offered, and why not. */
+export interface BatchControls {
   /** At least one member is startable (never launched, or failed and retryable). */
   canStart: boolean
   /** At least one member is still cancelable. */
@@ -66,19 +75,19 @@ export interface RoundControls {
   cleanableCount: number
 }
 
-export function roundControls(round: WorkTaskBatch): RoundControls {
-  const phases = round.members.map((m) => memberPhase(m.task_status))
+export function batchControls(batch: WorkTaskBatch): BatchControls {
+  const phases = batch.members.map((m) => memberPhase(m.task_status))
   const anyLive = phases.some((p) => p === "working" || p === "blocked")
   const canStart =
-    round.status !== "canceled" &&
-    round.members.some((m) => {
+    batch.status !== "canceled" &&
+    batch.members.some((m) => {
       const phase = memberPhase(m.task_status)
       // `waiting` covers never-started; `stopped` covers a failure worth
       // retrying. A canceled member is `stopped` too and the backend will
       // refuse it — reported per member rather than hidden here.
       return phase === "waiting" || phase === "stopped"
     })
-  const cleanableCount = round.members.filter(
+  const cleanableCount = batch.members.filter(
     (m) => m.cleanup_result !== "succeeded"
   ).length
 
@@ -90,16 +99,16 @@ export function roundControls(round: WorkTaskBatch): RoundControls {
   }
 }
 
-/** Total diff size across a round's members — the headline "how much did this
- *  round produce". `null` counts as 0: a member with no worktree produced
+/** Total diff size across a batch's members — the headline "how much did this
+ *  batch produce". `null` counts as 0: a member with no worktree produced
  *  nothing measurable, which is different from producing nothing at all but not
  *  in a way a total can express. */
-export function roundDiffTotals(round: WorkTaskBatch): {
+export function batchDiffTotals(batch: WorkTaskBatch): {
   filesChanged: number
   additions: number
   deletions: number
 } {
-  return round.members.reduce(
+  return batch.members.reduce(
     (acc, m) => ({
       filesChanged: acc.filesChanged + (m.files_changed ?? 0),
       additions: acc.additions + (m.additions ?? 0),

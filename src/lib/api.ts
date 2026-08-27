@@ -3434,6 +3434,34 @@ export async function workTaskBatchCreate(
   })
 }
 
+/**
+ * Group tasks that ALREADY EXIST into a batch over one pinned base.
+ *
+ * The counterpart to {@link workTaskBatchCreate}, which mints its members. This
+ * is what a batch looks like without an app on top: pick several to-dos on the
+ * board, run them from one commit, cancel them together, and get a per-member
+ * answer for each worktree removal — none of which the board could do
+ * task-by-task.
+ *
+ * Only `todo` tasks with no worktree of their own can join: a task that already
+ * has one started somewhere, so a batch claiming to pin its base would be
+ * recording a commit it does not have. The backend refuses and says which task
+ * and why.
+ */
+export async function workTaskBatchAdopt(
+  folderId: number,
+  title: string,
+  taskIds: number[],
+  allowDirty = false
+): Promise<WorkTaskBatch> {
+  return getTransport().call("work_task_batch_adopt", {
+    folderId,
+    title,
+    taskIds,
+    allowDirty,
+  })
+}
+
 /** Start every startable member. Returns one outcome per member: a member that
  *  refuses does not stop the others, so callers must surface the individual
  *  failures rather than reducing the array to a single verdict. */

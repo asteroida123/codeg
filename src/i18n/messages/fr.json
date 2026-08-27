@@ -5292,5 +5292,39 @@
       "cleanupIncomplete": "{succeeded} removed, {failed} failed, {blocked} still running",
       "cleanupFailed": "Could not run the cleanup"
     }
+  },
+  "TaskBatch": {
+    "title": "Exécuter plusieurs tâches ensemble",
+    "description": "They start from the same commit and answer to one cancel and one clean-up, with a separate result for each worktree.",
+    "batchName": "Group name",
+    "batchNamePlaceholder": "e.g. Friday cleanup pass",
+    "pickTasks": "Tasks",
+    "pickTasksHint": "Pick 2 to {max} to-dos from one project. A task that already has a worktree is not offered — its starting commit is already decided.",
+    "otherProject": "another project",
+    "noEligible": "No eligible to-dos. A task can join a group while it is still to-do and has no worktree of its own.",
+    "cancel": "Cancel",
+    "run": "Run {count} together",
+    "memberCount": "{count} tasks",
+    "cancelAll": "Cancel all",
+    "cleanUpAll": "Clean up {count}",
+    "status": {
+      "created": "Not started",
+      "running": "Running",
+      "review": "Ready for review",
+      "settled": "Finished",
+      "canceled": "Canceled"
+    },
+    "toasts": {
+      "started": "{count} tasks started together",
+      "startedPartially": "{started} started, {refused} refused",
+      "failed": "Could not run them as a group",
+      "canceled": "Group canceled",
+      "canceledKeepsWorktrees": "Each task's worktree is kept — remove them with Clean up.",
+      "canceledPartially": "Group canceled, but some tasks could not be stopped",
+      "cancelFailed": "Could not cancel the group",
+      "cleanedUp": "{count} worktrees removed",
+      "cleanupIncomplete": "{succeeded} removed, {failed} failed, {blocked} still running",
+      "cleanupFailed": "Could not run the clean-up"
+    }
   }
 }
