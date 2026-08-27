@@ -5276,7 +5276,8 @@
       "contendersHint": "同一个智能体配不同模型同样成立，而且是控制变量最严格的一轮。",
       "allowDirty": "项目存在未提交改动时仍然开始。选手从最后一个提交拉分支，因此这些改动不会出现在任何选手那里。Codeg 绝不会代你提交。",
       "cancel": "取消",
-      "create": "创建"
+      "create": "创建",
+      "pickFolderFirst": "先选项目——每个智能体可配置哪些选项，是在那个仓库里问它拿到的。"
     },
     "toasts": {
       "created": "已创建，共 {count} 位选手",
@@ -5291,6 +5292,13 @@
       "cleanedUp": "已删除 {count} 个 worktree",
       "cleanupIncomplete": "{succeeded} 个已删除，{failed} 个失败，{blocked} 个仍在运行",
       "cleanupFailed": "清理未能执行"
+    },
+    "requestedLabel": "请求值",
+    "openDiff": "改动",
+    "preflight": {
+      "running": "检查进行中（{command}）",
+      "passed": "检查通过（{command}）",
+      "failed": "检查未通过（{command}）"
     }
   },
   "TaskBatch": {

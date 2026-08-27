@@ -134,7 +134,14 @@ export function TasksPageTitle() {
  */
 export function TasksPage() {
   const t = useTranslations("Tasks")
-  const { tasks, loading, refetch, viewMode } = useTasksView()
+  const {
+    tasks,
+    loading,
+    refetch,
+    viewMode,
+    pendingDetailTaskId,
+    clearPendingDetail,
+  } = useTasksView()
   const folders = useAppWorkspaceStore((s) => s.folders)
   const projectFolders = useMemo(
     () => folders.filter((f) => f.parent_id == null && f.kind === "regular"),
@@ -282,6 +289,15 @@ export function TasksPage() {
   }, [])
   const { batches: plainBatches, refetch: refetchBatches } =
     usePlainTaskBatches()
+
+  // A request from another route is parked on the always-mounted provider (this
+  // page does not exist while another route is showing), so it is consumed on
+  // mount rather than listened for here.
+  useEffect(() => {
+    if (pendingDetailTaskId == null) return
+    setDetailTaskId(pendingDetailTaskId)
+    clearPendingDetail()
+  }, [pendingDetailTaskId, clearPendingDetail])
 
   const visibleTasks = useMemo(
     () =>

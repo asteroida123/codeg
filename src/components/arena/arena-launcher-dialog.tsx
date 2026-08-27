@@ -1,12 +1,13 @@
 "use client"
 
-import { useCallback, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 import { Loader2, Plus, Trash2 } from "lucide-react"
 
-import { workTaskBatchCreate } from "@/lib/api"
+import { workTaskBatchCreate, workTaskBatchStart } from "@/lib/api"
 import { AGENT_LABELS, type WorkTaskBatchSpec } from "@/lib/types"
+import { refusedStarts } from "@/lib/work-task-batch-model"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -26,6 +27,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import {
+  AgentConfigSection,
+  effectiveSelections,
+  snapshotLabels,
+} from "@/components/automations/agent-config-section"
+import { useAgentOptions } from "@/components/automations/use-agent-options"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { ARENA_OWNER_EXTENSION } from "@/contexts/arena-view-context"
 
@@ -41,14 +48,16 @@ const MAX_SLOTS = 4
 interface SlotDraft {
   key: number
   agentType: string
-  /** Blank = the agent's own default. */
-  model: string
-  label: string
+  /** Chosen agent mode, or null to take the agent's own current one. */
+  modeId: string | null
+  /** Option id → value id, exactly as the agent advertised them. `model` and
+   *  `reasoning_effort` are ordinary entries here — there is no special case. */
+  configValues: Record<string, string>
 }
 
 let slotKeySeq = 0
 function newSlot(agentType: string): SlotDraft {
-  return { key: slotKeySeq++, agentType, model: "", label: "" }
+  return { key: slotKeySeq++, agentType, modeId: null, configValues: {} }
 }
 
 const AGENT_OPTIONS = Object.entries(AGENT_LABELS)
@@ -64,13 +73,17 @@ interface ArenaLauncherDialogProps {
  * Sets up a comparison round: one objective, one folder, and two to four
  * contenders.
  *
+ * Each contender's model, mode and reasoning level come from the agent itself —
+ * `useAgentOptions` probes what it advertises and `AgentConfigSection` renders
+ * it, the same pair the task editor uses. This used to be a free-text model box,
+ * which was indefensible on two counts: the user had to already know the exact
+ * model id, and a typo produced a round that silently ran on the default while
+ * claiming to compare something else.
+ *
  * The base commit is deliberately NOT a field. It is resolved server-side from
  * the folder's HEAD at create time, so a client cannot name a commit the
  * repository never had — and cannot race the branch switch the pin exists to
- * survive. If the repository is empty, on a detached HEAD, or has uncommitted
- * tracked changes, the backend refuses and says which; the dirty case can be
- * accepted knowingly, and even then nothing is ever committed on the user's
- * behalf.
+ * survive.
  */
 export function ArenaLauncherDialog({
   open,
@@ -96,6 +109,17 @@ export function ArenaLauncherDialog({
   const [allowDirty, setAllowDirty] = useState(false)
   const [submitting, setSubmitting] = useState(false)
 
+  const folderPath = useMemo(
+    () => projectFolders.find((f) => String(f.id) === folderId)?.path ?? null,
+    [projectFolders, folderId]
+  )
+
+  const patchSlot = useCallback((index: number, patch: Partial<SlotDraft>) => {
+    setSlots((prev) =>
+      prev.map((slot, i) => (i === index ? { ...slot, ...patch } : slot))
+    )
+  }, [])
+
   const reset = useCallback(() => {
     setFolderId("")
     setTitle("")
@@ -103,6 +127,26 @@ export function ArenaLauncherDialog({
     setSlots([newSlot("claude_code"), newSlot("codex")])
     setAllowDirty(false)
   }, [])
+
+  /**
+   * Each slot's probe result, published upward by the slot rows.
+   *
+   * A ref-like Map rather than state: it is read only when the form is submitted,
+   * and making it state would re-render the whole dialog every time one of up to
+   * four probes lands — a flicker per arrival, for a value nothing renders.
+   */
+  const slotSnapshots = useMemo(
+    () => new Map<number, Parameters<typeof effectiveSelections>[0]>(),
+    []
+  )
+  /** Stable across renders, so a row's publish effect fires when its probe lands
+   *  rather than on every keystroke in the objective field. */
+  const publishSnapshot = useCallback(
+    (key: number, snapshot: Parameters<typeof effectiveSelections>[0]) => {
+      slotSnapshots.set(key, snapshot)
+    },
+    [slotSnapshots]
+  )
 
   const canSubmit =
     folderId !== "" &&
@@ -115,25 +159,33 @@ export function ArenaLauncherDialog({
     if (!canSubmit) return
     setSubmitting(true)
     const prompt = objective.trim()
+    const roundTitle = title.trim()
     const spec: WorkTaskBatchSpec = {
       folder_id: Number(folderId),
-      title: title.trim(),
+      title: roundTitle,
       owner_extension: ARENA_OWNER_EXTENSION,
       allow_dirty: allowDirty,
       members: slots.map((slot) => {
         const agentLabel =
           AGENT_LABELS[slot.agentType as keyof typeof AGENT_LABELS] ??
           slot.agentType
-        const model = slot.model.trim()
-        const label =
-          slot.label.trim() || `${agentLabel}${model ? ` · ${model}` : ""}`
-        const configValues: Record<string, string> = {}
-        // Blank means "the agent's own default" — an empty string here would be
-        // recorded as a requested model of "", which the profile snapshot would
-        // then faithfully report.
-        if (model) configValues.model = model
+        // The values the user actually SAW, with each untouched select filled
+        // from the option's own current value — so the round pins concrete
+        // configuration instead of empty overrides that resolve later.
+        const resolved = effectiveSelections(
+          slotSnapshots.get(slot.key) ?? null,
+          slot.modeId,
+          slot.configValues
+        )
+        const labels = snapshotLabels(
+          slotSnapshots.get(slot.key) ?? null,
+          slot.modeId,
+          slot.configValues
+        )
+        const model = resolved.config_values.model
+        const label = `${agentLabel}${model ? ` · ${model}` : ""}`
         return {
-          title: `${title.trim()} — ${label}`,
+          title: `${roundTitle} — ${label}`,
           label,
           config: {
             // Every contender gets the SAME prompt, byte for byte. A round that
@@ -141,8 +193,19 @@ export function ArenaLauncherDialog({
             display_text: prompt,
             prompt_blocks: [{ type: "text", text: prompt }],
             agent_type: slot.agentType as never,
-            config_values: configValues,
-            mode_id: null,
+            mode_id: resolved.mode_id,
+            config_values: resolved.config_values,
+            label_snapshot: labels,
+          },
+          // What was REQUESTED. What actually applied is written by the engine at
+          // launch and read back from the task's `config_effective` event — the
+          // card shows both, because the gap between them is the honest part.
+          profile_snapshot: {
+            requested: {
+              agent_type: slot.agentType,
+              mode_id: resolved.mode_id,
+              config_values: resolved.config_values,
+            },
           },
         }
       }),
@@ -150,8 +213,30 @@ export function ArenaLauncherDialog({
     }
 
     try {
-      await workTaskBatchCreate(spec)
-      toast.success(t("toasts.created", { count: slots.length }))
+      const batch = await workTaskBatchCreate(spec)
+      // Create and start are one action: a round the user just configured has no
+      // meaning as a group that sits still, and the task board's bulk grouping
+      // behaves the same way. They stay separate calls underneath because create
+      // is what pins the base and start is what claims the members — a start that
+      // partly refuses must still leave the round intact.
+      const outcomes = await workTaskBatchStart(batch.id)
+      const refused = refusedStarts(outcomes)
+      if (refused.length === 0) {
+        toast.success(t("toasts.created", { count: slots.length }))
+      } else {
+        toast.warning(
+          t("toasts.startedPartially", {
+            started: outcomes.length - refused.length,
+            refused: refused.length,
+          }),
+          {
+            description: refused
+              .map((r) => r.error)
+              .filter(Boolean)
+              .join("\n"),
+          }
+        )
+      }
       onCreated()
       onOpenChange(false)
       reset()
@@ -172,18 +257,19 @@ export function ArenaLauncherDialog({
     onCreated,
     onOpenChange,
     reset,
+    slotSnapshots,
     t,
   ])
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-lg">
+      <DialogContent className="max-w-xl">
         <DialogHeader>
           <DialogTitle>{t("launcher.title")}</DialogTitle>
           <DialogDescription>{t("launcher.description")}</DialogDescription>
         </DialogHeader>
 
-        <div className="flex flex-col gap-3">
+        <div className="flex max-h-[60vh] flex-col gap-3 overflow-y-auto">
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="arena-folder">{t("launcher.folder")}</Label>
             <Select value={folderId} onValueChange={setFolderId}>
@@ -239,52 +325,16 @@ export function ArenaLauncherDialog({
               </Button>
             </div>
             {slots.map((slot, i) => (
-              <div key={slot.key} className="flex items-center gap-1.5">
-                <Select
-                  value={slot.agentType}
-                  onValueChange={(value) =>
-                    setSlots((s) =>
-                      s.map((x, xi) =>
-                        xi === i ? { ...x, agentType: value } : x
-                      )
-                    )
-                  }
-                >
-                  <SelectTrigger className="w-[11rem] shrink-0">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {AGENT_OPTIONS.map(([value, label]) => (
-                      <SelectItem key={value} value={value}>
-                        {label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <Input
-                  value={slot.model}
-                  onChange={(e) =>
-                    setSlots((s) =>
-                      s.map((x, xi) =>
-                        xi === i ? { ...x, model: e.target.value } : x
-                      )
-                    )
-                  }
-                  placeholder={t("launcher.modelPlaceholder")}
-                  className="min-w-0 flex-1"
-                />
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="shrink-0"
-                  disabled={slots.length <= MIN_SLOTS}
-                  aria-label={t("launcher.removeContender")}
-                  onClick={() => setSlots((s) => s.filter((_, xi) => xi !== i))}
-                >
-                  <Trash2 />
-                </Button>
-              </div>
+              <SlotRow
+                key={slot.key}
+                slot={slot}
+                folderPath={folderPath}
+                canRemove={slots.length > MIN_SLOTS}
+                onPatch={(patch) => patchSlot(i, patch)}
+                onRemove={() => setSlots((s) => s.filter((_, xi) => xi !== i))}
+                slotKey={slot.key}
+                onSnapshot={publishSnapshot}
+              />
             ))}
             {/* The same agent twice with different models is a legitimate — and
                 the most controlled — round, so nothing here deduplicates. */}
@@ -315,5 +365,115 @@ export function ArenaLauncherDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  )
+}
+
+/**
+ * One contender row: the agent, then whatever that agent says it can be
+ * configured with.
+ *
+ * Its own component because each row needs its own `useAgentOptions` call, and
+ * hooks cannot be called in a loop. That also means each row probes
+ * independently — picking Codex for slot 2 does not re-probe slot 1.
+ */
+function SlotRow({
+  slot,
+  slotKey,
+  folderPath,
+  canRemove,
+  onPatch,
+  onRemove,
+  onSnapshot,
+}: {
+  slot: SlotDraft
+  slotKey: number
+  folderPath: string | null
+  canRemove: boolean
+  onPatch: (patch: Partial<SlotDraft>) => void
+  onRemove: () => void
+  onSnapshot: (
+    key: number,
+    snapshot: Parameters<typeof effectiveSelections>[0]
+  ) => void
+}) {
+  const t = useTranslations("Arena")
+  // Held until a project is chosen: the probe runs the agent in a working
+  // directory, and its answer can differ per repository.
+  const { snapshot, loading, error, reload } = useAgentOptions(
+    slot.agentType,
+    folderPath,
+    folderPath != null
+  )
+  // Publish upward for the submit handler. In an effect, not during render:
+  // writing to the parent's Map while rendering is a side effect React is free to
+  // repeat, and "free to repeat" is not a property worth relying on even when the
+  // write happens to be idempotent.
+  useEffect(() => {
+    onSnapshot(slotKey, snapshot)
+  }, [slotKey, snapshot, onSnapshot])
+
+  return (
+    <div className="flex flex-col gap-1.5 rounded-xl border p-2">
+      <div className="flex items-center gap-1.5">
+        <Select
+          value={slot.agentType}
+          onValueChange={(value) =>
+            // A different agent advertises different options, so the old
+            // selections cannot carry over — keeping them would submit values
+            // the new agent never offered.
+            onPatch({ agentType: value, modeId: null, configValues: {} })
+          }
+        >
+          <SelectTrigger className="w-[11rem] shrink-0">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {AGENT_OPTIONS.map(([value, label]) => (
+              <SelectItem key={value} value={value}>
+                {label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <div className="min-w-0 flex-1" />
+        <Button
+          type="button"
+          size="icon"
+          variant="ghost"
+          className="shrink-0"
+          disabled={!canRemove}
+          aria-label={t("launcher.removeContender")}
+          onClick={onRemove}
+        >
+          <Trash2 />
+        </Button>
+      </div>
+
+      {folderPath == null ? (
+        <p className="px-1 text-[0.6875rem] text-muted-foreground">
+          {t("launcher.pickFolderFirst")}
+        </p>
+      ) : (
+        // Model, mode and reasoning level all come from here — they are ordinary
+        // config options the agent advertised. An agent that advertises none
+        // renders nothing rather than an empty control.
+        <AgentConfigSection
+          snapshot={snapshot}
+          loading={loading}
+          error={error}
+          onReload={reload}
+          modeId={slot.modeId}
+          configValues={slot.configValues}
+          onModeChange={(modeId) => onPatch({ modeId })}
+          onConfigChange={(optionId, valueId) => {
+            const next = { ...slot.configValues }
+            if (valueId == null) delete next[optionId]
+            else next[optionId] = valueId
+            onPatch({ configValues: next })
+          }}
+          layout="inline"
+        />
+      )}
+    </div>
   )
 }

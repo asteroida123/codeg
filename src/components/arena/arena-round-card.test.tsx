@@ -85,6 +85,7 @@ function renderCard(over: Partial<WorkTaskBatch> = {}) {
         round={round(over)}
         folderName="my-project"
         onOpenTranscript={() => {}}
+        onOpenDiff={() => {}}
       />
     </NextIntlClientProvider>
   )

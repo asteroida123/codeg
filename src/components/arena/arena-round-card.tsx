@@ -25,6 +25,9 @@ interface ArenaRoundCardProps {
   round: WorkTaskBatch
   folderName: string | null
   onOpenTranscript: (member: WorkTaskBatchMember) => void
+  /** Hand this member to the task board, which already owns the diff, the
+   *  changed-file list, and every action a result can be taken through. */
+  onOpenDiff: (member: WorkTaskBatchMember) => void
 }
 
 type Busy = "start" | "cancel" | "cleanup" | null
@@ -43,6 +46,7 @@ export function ArenaRoundCard({
   round,
   folderName,
   onOpenTranscript,
+  onOpenDiff,
 }: ArenaRoundCardProps) {
   const t = useTranslations("Arena")
   const [busy, setBusy] = useState<Busy>(null)
@@ -188,6 +192,7 @@ export function ArenaRoundCard({
             key={member.id}
             member={member}
             onOpenTranscript={onOpenTranscript}
+            onOpenDiff={onOpenDiff}
           />
         ))}
       </div>

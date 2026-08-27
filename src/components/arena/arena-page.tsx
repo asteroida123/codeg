@@ -11,6 +11,8 @@ import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { workTaskGet } from "@/lib/api"
 import type { WorkTask, WorkTaskBatchMember } from "@/lib/types"
 import { TaskTranscriptDialog } from "@/components/tasks/task-transcript-dialog"
+import { requestOpenTaskDetail } from "@/components/tasks/tasks-chrome-actions"
+import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import { ArenaLauncherDialog } from "./arena-launcher-dialog"
 import { ArenaRoundCard } from "./arena-round-card"
 
@@ -38,6 +40,7 @@ export function ArenaPageTitle() {
 export function ArenaPage() {
   const t = useTranslations("Arena")
   const { rounds, loading, refetch } = useArenaView()
+  const { setRoute } = useWorkbenchRoute()
   const folders = useAppWorkspaceStore((s) => s.folders)
   const [launcherOpen, setLauncherOpen] = useState(false)
   const [transcriptTask, setTranscriptTask] = useState<WorkTask | null>(null)
@@ -67,6 +70,23 @@ export function ArenaPage() {
     []
   )
 
+  /**
+   * Show a contender's changes.
+   *
+   * Hands the member's task to the board rather than rendering a diff here. The
+   * board already owns the diff, the changed-file list, the preflight output, and
+   * every action a result can be taken through — merge it, send it back, deliver a
+   * pull request. Re-implementing any of that inside the Arena would be a second
+   * copy of the product's review surface, and the worse one.
+   */
+  const handleOpenDiff = useCallback(
+    (member: WorkTaskBatchMember) => {
+      requestOpenTaskDetail(member.task_id)
+      setRoute("tasks")
+    },
+    [setRoute]
+  )
+
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex shrink-0 items-center gap-2 px-4 py-2">
@@ -87,6 +107,7 @@ export function ArenaPage() {
                 round={round}
                 folderName={folderName(round.folder_id)}
                 onOpenTranscript={(m) => void handleOpenTranscript(m)}
+                onOpenDiff={handleOpenDiff}
               />
             ))}
           </div>

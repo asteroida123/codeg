@@ -1770,9 +1770,20 @@ export interface WorkTaskBatchMember {
   slot_index: number
   label?: string | null
   /** `ResolvedLaunchProfile` snapshot captured when the member was added:
-   *  requested vs. applied configuration and every gap between them. What lets
-   *  a comparison state the real configuration instead of the intended one. */
+   *  what the caller REQUESTED. */
   profile_snapshot?: Record<string, unknown> | null
+  /**
+   * The profile the ENGINE resolved when it actually launched this member.
+   *
+   * Separate from `profile_snapshot`, and the distinction is the point: the
+   * snapshot is what was asked for, this is what the adapter did with it once a
+   * process existed. Only the engine can know the second — an effort level the
+   * model turns out not to have, a session setting the agent could not honour.
+   * `null` until the member launches.
+   */
+  applied_profile?: Record<string, unknown> | null
+  /** `WorkTaskPreflight` — this member's acceptance red/green light. */
+  preflight?: WorkTaskPreflight | null
   /** Absent = cleanup never attempted for this member. */
   cleanup_result?: MemberCleanupResult | null
   cleanup_error?: string | null

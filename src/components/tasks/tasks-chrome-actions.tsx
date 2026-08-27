@@ -17,6 +17,26 @@ export const OPEN_TASK_SETTINGS_EVENT = "codeg:open-task-settings"
 export const OPEN_TASK_BATCH_EVENT = "codeg:open-task-batch"
 
 /**
+ * Open one task's detail drawer from anywhere — carrying the id in
+ * `CustomEvent.detail`.
+ *
+ * The same window-event idiom as its siblings, for the same reason: the sender
+ * (another workbench route) and the receiver (the task board, which owns the
+ * drawer and every dialog it can reach) must not import each other. A feature
+ * that wants to show a task's diff, merge it, or send it back does not
+ * re-implement any of that — it hands the id over and lets the board do what it
+ * already does.
+ */
+export const OPEN_TASK_DETAIL_EVENT = "codeg:open-task-detail"
+
+/** Ask the task board to open a task, switching to it if necessary. */
+export function requestOpenTaskDetail(taskId: number): void {
+  window.dispatchEvent(
+    new CustomEvent(OPEN_TASK_DETAIL_EVENT, { detail: { taskId } })
+  )
+}
+
+/**
  * The Tasks route's own entries in the window's top-right chrome cluster,
  * rendered immediately left of the (window-level) settings gear — see
  * `WorkbenchRouteChromeActions`.

@@ -92,6 +92,23 @@ pub struct WorkTaskBatchMemberInfo {
     pub label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_snapshot: Option<serde_json::Value>,
+    /// The profile the ENGINE resolved when it actually launched this member,
+    /// read from the task's latest `config_effective` event.
+    ///
+    /// Separate from `profile_snapshot`, and the distinction is the whole point:
+    /// the snapshot is what the caller asked for at creation time, while this is
+    /// what the adapter did with it once a process existed. Only the engine can
+    /// know the second — an effort level the model turns out not to have, a
+    /// session setting the agent could not honour, are facts about a running
+    /// agent. A comparison that showed only the request would be describing an
+    /// experiment nobody ran. `None` until the member launches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_profile: Option<serde_json::Value>,
+    /// `WorkTaskPreflight` snapshot — this member's acceptance red/green light,
+    /// when the folder has a preflight command. Deterministic evidence, which is
+    /// the only kind a comparison gets in V1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preflight: Option<serde_json::Value>,
     /// `None` = cleanup never attempted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cleanup_result: Option<MemberCleanupResult>,

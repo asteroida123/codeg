@@ -526,6 +526,10 @@ async fn load_members(
         // Read the task live rather than mirroring its status into the member
         // row: one truth cannot disagree with itself.
         let task = work_task::Entity::find_by_id(m.task_id).one(conn).await?;
+        // What the ENGINE actually resolved at launch, from the task's own audit
+        // trail. The member row cannot hold this: it is written at creation, and
+        // the applied values do not exist until an agent process does.
+        let applied_profile = latest_applied_profile(conn, m.task_id).await?;
         out.push(WorkTaskBatchMemberInfo {
             id: m.id,
             batch_id: m.batch_id,
@@ -535,6 +539,11 @@ async fn load_members(
             profile_snapshot: m
                 .profile_snapshot
                 .as_deref()
+                .and_then(|p| serde_json::from_str(p).ok()),
+            applied_profile,
+            preflight: task
+                .as_ref()
+                .and_then(|t| t.preflight.as_deref())
                 .and_then(|p| serde_json::from_str(p).ok()),
             cleanup_result: m.cleanup_result,
             cleanup_error: m.cleanup_error,
@@ -551,6 +560,33 @@ async fn load_members(
         });
     }
     Ok(out)
+}
+
+/// The `profile` field of a task's most recent `config_effective` event.
+///
+/// That event is written by the engine on every launch (see
+/// `work_task::engine`), so the newest one describes the generation the member is
+/// on now — a retry with a different model must not keep reporting the old one.
+/// Absent field, undecodable payload, or no event at all all read as "not
+/// launched yet" rather than as an error: this is evidence for a comparison, and
+/// a batch view must render without it.
+async fn latest_applied_profile(
+    conn: &DatabaseConnection,
+    task_id: i32,
+) -> Result<Option<serde_json::Value>, DbError> {
+    let events = crate::db::service::work_task_service::recent_events_of_kinds(
+        conn,
+        task_id,
+        &["config_effective"],
+        1,
+    )
+    .await?;
+    Ok(events
+        .into_iter()
+        .next()
+        .and_then(|e| e.payload)
+        .and_then(|p| p.get("profile").cloned())
+        .filter(|p| !p.is_null()))
 }
 
 fn to_info(
@@ -1086,6 +1122,120 @@ mod tests {
             WorkTaskBatchStatus::Canceled,
             "an adopted batch lost the cancel gate a created one has"
         );
+    }
+
+    /// The applied profile is READ FROM THE ENGINE'S AUDIT TRAIL, not from the
+    /// member row.
+    ///
+    /// This test exists because the first cut of the member card read
+    /// `profile_snapshot` for the applied values — a field written at creation
+    /// time, when no agent process exists and therefore no applied value does
+    /// either. The card's "actually in effect" section was silently always empty.
+    /// The applied values can only come from the engine, after a launch.
+    #[tokio::test]
+    async fn the_applied_profile_comes_from_the_engines_own_audit_event() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/batch-applied").await;
+        let info = create(&db.conn, &spec(folder_id, &["a"]), base())
+            .await
+            .unwrap();
+        let task_id = info.members[0].task_id;
+
+        // Before any launch there is no such event, and the field is absent
+        // rather than an empty object the UI would render as "no gaps".
+        assert!(
+            get(&db.conn, info.id).await.unwrap().members[0]
+                .applied_profile
+                .is_none(),
+            "an unlaunched member reported an applied profile"
+        );
+
+        // The engine writes this on every launch.
+        crate::db::service::work_task_service::record_event(
+            &db.conn,
+            task_id,
+            "config_effective",
+            "engine",
+            Some(serde_json::json!({
+                "agent": "codex",
+                "profile": {
+                    "agent_id": "Codex",
+                    "applied": { "effort": "medium" },
+                    "warnings": ["effort 'high' is not in the known vocabulary"],
+                },
+            })),
+        )
+        .await
+        .unwrap();
+
+        let member = &get(&db.conn, info.id).await.unwrap().members[0];
+        let applied = member.applied_profile.as_ref().expect("applied profile");
+        assert_eq!(applied["applied"]["effort"], "medium");
+        assert_eq!(
+            applied["warnings"][0],
+            "effort 'high' is not in the known vocabulary",
+            "the gap between requested and applied was lost"
+        );
+    }
+
+    /// A retry launches a new generation with possibly different values; the card
+    /// must report the current one, not the first.
+    #[tokio::test]
+    async fn the_applied_profile_follows_the_newest_launch() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/batch-applied-retry").await;
+        let info = create(&db.conn, &spec(folder_id, &["a"]), base())
+            .await
+            .unwrap();
+        let task_id = info.members[0].task_id;
+
+        for model in ["gpt-5", "gpt-5-codex"] {
+            crate::db::service::work_task_service::record_event(
+                &db.conn,
+                task_id,
+                "config_effective",
+                "engine",
+                Some(serde_json::json!({
+                    "profile": { "applied": { "model": model } },
+                })),
+            )
+            .await
+            .unwrap();
+        }
+
+        let member = &get(&db.conn, info.id).await.unwrap().members[0];
+        assert_eq!(
+            member.applied_profile.as_ref().unwrap()["applied"]["model"],
+            "gpt-5-codex",
+            "a stale generation's profile outlived the retry"
+        );
+    }
+
+    /// A payload without a usable profile reads as "not launched yet". Evidence
+    /// for a comparison must never be the reason the view fails to render.
+    #[tokio::test]
+    async fn a_profileless_config_event_reads_as_no_applied_profile() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/batch-applied-empty").await;
+        let info = create(&db.conn, &spec(folder_id, &["a"]), base())
+            .await
+            .unwrap();
+        let task_id = info.members[0].task_id;
+
+        // An older build wrote this event without a `profile` field.
+        crate::db::service::work_task_service::record_event(
+            &db.conn,
+            task_id,
+            "config_effective",
+            "engine",
+            Some(serde_json::json!({ "agent": "codex", "mode": null })),
+        )
+        .await
+        .unwrap();
+
+        assert!(get(&db.conn, info.id).await.unwrap().members[0]
+            .applied_profile
+            .is_none());
     }
 
     #[tokio::test]

@@ -21,6 +21,7 @@ import {
 } from "@/lib/tasks-board-filter-storage"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import type { WorkTask } from "@/lib/types"
+import { OPEN_TASK_DETAIL_EVENT } from "@/components/tasks/tasks-chrome-actions"
 
 const WORK_TASK_CHANGED_EVENT = "task://changed"
 
@@ -42,6 +43,16 @@ interface TasksViewContextValue {
    *  branch of the tree — while the layout it drives renders in the page. */
   viewMode: TasksViewMode
   setViewMode: (mode: TasksViewMode) => void
+  /**
+   * A task another route asked to open, parked until the board mounts.
+   *
+   * It lives here rather than on the page because the page does not exist while
+   * a different route is showing — a window event delivered then would land on
+   * nothing. This provider is always mounted, so it can hold the request across
+   * the route switch that follows it.
+   */
+  pendingDetailTaskId: number | null
+  clearPendingDetail: () => void
 }
 
 const TasksViewContext = createContext<TasksViewContextValue | null>(null)
@@ -81,6 +92,21 @@ export function TasksViewProvider({ children }: { children: ReactNode }) {
     saveTasksViewMode(viewMode)
   }, [viewMode])
   const reqRef = useRef(0)
+  const [pendingDetailTaskId, setPendingDetailTaskId] = useState<number | null>(
+    null
+  )
+  const clearPendingDetail = useCallback(() => setPendingDetailTaskId(null), [])
+
+  // Parked, not acted on: switching the route is the sender's business (it knows
+  // whether it wants to leave), and consuming the id is the board's.
+  useEffect(() => {
+    const onOpen = (event: Event) => {
+      const taskId = (event as CustomEvent<{ taskId?: number }>).detail?.taskId
+      if (typeof taskId === "number") setPendingDetailTaskId(taskId)
+    }
+    window.addEventListener(OPEN_TASK_DETAIL_EVENT, onOpen)
+    return () => window.removeEventListener(OPEN_TASK_DETAIL_EVENT, onOpen)
+  }, [])
   // Statuses as of the last successful fetch; null until then, so the first
   // load (pure history) never notifies.
   const prevStatusRef = useRef<Map<number, WorkTask["status"]> | null>(null)
@@ -142,8 +168,25 @@ export function TasksViewProvider({ children }: { children: ReactNode }) {
   )
 
   const value = useMemo<TasksViewContextValue>(
-    () => ({ tasks, attentionCount, loading, refetch, viewMode, setViewMode }),
-    [tasks, attentionCount, loading, refetch, viewMode]
+    () => ({
+      tasks,
+      attentionCount,
+      loading,
+      refetch,
+      viewMode,
+      setViewMode,
+      pendingDetailTaskId,
+      clearPendingDetail,
+    }),
+    [
+      tasks,
+      attentionCount,
+      loading,
+      refetch,
+      viewMode,
+      pendingDetailTaskId,
+      clearPendingDetail,
+    ]
   )
 
   return (

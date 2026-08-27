@@ -5276,7 +5276,8 @@
       "contendersHint": "The same agent twice with different models is a valid — and the most controlled — round.",
       "allowDirty": "Start even though the project has uncommitted changes. Contenders branch from the last commit, so those changes will be absent from all of them. Nothing is ever committed for you.",
       "cancel": "Cancel",
-      "create": "Create round"
+      "create": "Create round",
+      "pickFolderFirst": "Choose a project first — each agent is asked what it can be configured with in that repository."
     },
     "toasts": {
       "created": "Round created with {count} contenders",
@@ -5291,6 +5292,13 @@
       "cleanedUp": "{count} worktrees removed",
       "cleanupIncomplete": "{succeeded} removed, {failed} failed, {blocked} still running",
       "cleanupFailed": "Could not run the cleanup"
+    },
+    "requestedLabel": "requested",
+    "openDiff": "Changes",
+    "preflight": {
+      "running": "Checks running ({command})",
+      "passed": "Checks passed ({command})",
+      "failed": "Checks failed ({command})"
     }
   },
   "TaskBatch": {
