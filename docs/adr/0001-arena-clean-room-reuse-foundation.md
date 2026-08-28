@@ -57,8 +57,10 @@ App** built on generic seams — no Arena entity ever enters Core.
 3. **Generic seams, second consumer required.** New Core primitives are only
    added when existing capabilities cannot cover the gap and at least two
    consumers exist. The first candidates are:
-   - `ResolvedLaunchProfile` — requested vs. applied capability snapshot
-     (model/effort/permission/skills/mcp), per-session isolation.
+   - `ResolvedLaunchProfile` — requested vs. applied configuration snapshot
+     (model/effort/skills/mcp), written into the task's `config_effective`
+     audit event at every launch. It deliberately claims no session-level
+     isolation and no capability judgments — see the 2026-08-27 addendum below.
    - `WorkTaskBatch` — shared immutable `base_sha`, members as existing
      WorkTasks, aggregate start/cancel/cleanup, per-member results.
    - Workbench **Contribution Registry** — route/navigation/view registration,
@@ -86,7 +88,7 @@ The mapping below is the "blocker backlog" of the rework.
 
 | Finding | Generic invariant | Regression test |
 |---|---|---|
-| 1. unborn-HEAD seed commit | `git_worktree_add` never commits; unborn HEAD fails cleanly with the index untouched; an explicit base works without consuming staged changes | `worktree_add_on_unborn_head_refuses_without_seeding_a_commit`, `worktree_add_with_explicit_base_leaves_user_index_untouched` (folders.rs tests) |
+| 1. unborn-HEAD seed commit | `git_worktree_add` never commits; on an unborn HEAD git may refuse or create an empty worktree (version-dependent), but either way no seed commit is made and the user's index is untouched; an explicit base works without consuming staged changes | `worktree_add_on_unborn_head_neither_seeds_a_commit_nor_touches_the_index`, `worktree_add_with_explicit_base_leaves_user_index_untouched` (folders.rs tests) |
 | 2. cleanup swallowing | Worktree removal returns explicit errors; using the worktree itself as `repo_path` is refused by the `canonical == canonical_repo` guard and leaves tree + branch intact; callers must surface per-member results | `remove_worktree_with_the_worktree_itself_as_repo_path_refuses_and_leaves_it_intact` (folders.rs tests) |
 | 3. repo pollution | Contest/derived state never creates directories inside the user's repository; ignore entries only cover Codeg's own concerns | ADR §Decision 5 + review gate hygiene rules (`.zcode`, workspace-local dirs stay out of the repo's `.gitignore`) |
 | 4. report XSS / sandbox | All dynamic fields escaped; previews default to `sandbox=""` (no scripts); trust is explicit per file and limited (`allow-scripts allow-popups allow-forms allow-modals`, no `allow-same-origin`, no `allow-top-navigation`); CSP injected via `withSandboxCsp` | `html-preview.test.tsx` (this PR); `html-preview-inline.test.ts` (existing) |
@@ -99,8 +101,10 @@ The mapping below is the "blocker backlog" of the rework.
 
 - The frozen branch stays local-only; it is no longer pushed to any public
   remote and never becomes a merge base.
-- Arena V1 scope is: 2–4 slots, same agent with different `ResolvedLaunchProfile`
-  under real capability isolation, shared base SHA via `WorkTaskBatch`,
+- Arena V1 scope is: 2–4 slots, same agent with different launch configurations
+  (`model` / `effort`, snapshotted via `ResolvedLaunchProfile` with the
+  requested-vs-applied gap visible on every member card), shared base SHA via
+  `WorkTaskBatch`,
   live transcript/diff/preflight/metrics, batch cancel with per-member cleanup
   results, and a static escaped report. No LLM judge, no runnable embedded
   preview, no elimination tournaments.
@@ -112,7 +116,7 @@ The mapping below is the "blocker backlog" of the rework.
 Evaluated three ways to give tasks/sessions control over which skills an agent
 sees, and rejected all of them for now:
 
-1. **Session-level Skill Policy (**#541**, inherit/none/selected).** Agent
+1. **Session-level Skill Policy** (issue 541: inherit/none/selected). Agent
    support is uneven (native flags/envs differ per agent); a first version
    would serve 1–2 agents only, which is a narrow slice of users for a new
    per-connection mechanism.
@@ -136,6 +140,13 @@ consumer (e.g. `WorkTaskBatch` configuration experiments comparing
 with/without skills) is being built. The `SkillPolicy` value type lives on in
 `launch_profile.rs` as part of the launch-profile snapshot; execution stays
 out.
+
+The `permission` dimension was cut from the snapshot for the same reason as
+the capability judgments above: no producer writes a per-task permission value
+(grok's permission lives in its global `config.toml`, other agents deliver it
+via ACP modes), so a permission vocabulary had a source for its words but no
+source for its values — validation that can never fire is a claim, not a
+check. It can return with its producer.
 
 ## `WorkTaskBatch` — the composition primitive (2026-08-26)
 
@@ -195,11 +206,13 @@ members with slots and labels — what a slot *means* is the caller's business.
 Grepping the new Core files for the forbidden vocabulary returns nothing,
 comments included.
 
-Coverage: 35 tests — 18 on the service (projection walk, the cancel gate on
+Coverage: 38 tests — 18 on the service (projection walk, the cancel gate on
 both read and write, atomic create, deleted members, the cleanup ledger), 6 on
 the git base resolution (unborn HEAD leaves the staged index intact, dirty tree
 refused and never tidied, detached HEAD, exact-commit pinning, untracked files
-allowed), and 11 driving the engine's aggregates against a real database
+allowed), and 14 driving the engine's aggregates against a real database
 (cancel-before-touch ordering, per-member start answers, no re-claim of working
 members, retry of failed ones, `blocked` persistence, keep-list, `fail_fast`
-sparing in-flight work, `best_effort` continuing).
+sparing in-flight work, `best_effort` continuing, git-layer cleanup failures on
+the member ledger, crash recovery recomputing the projection, and the canceled
+aggregate-start gate).

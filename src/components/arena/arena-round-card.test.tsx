@@ -66,7 +66,6 @@ function round(over: Partial<WorkTaskBatch> = {}): WorkTaskBatch {
     base_branch: "main",
     status: "review",
     failure_policy: "best_effort",
-    max_concurrent: null,
     members: [
       member({ id: 1, task_id: 11, label: "Claude Code" }),
       member({ id: 2, task_id: 12, slot_index: 1, label: "Codex" }),

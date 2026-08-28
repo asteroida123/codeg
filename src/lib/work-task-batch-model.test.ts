@@ -41,7 +41,6 @@ function batch(members: WorkTaskBatchMember[]): WorkTaskBatch {
     base_branch: "main",
     status: "created",
     failure_policy: "best_effort",
-    max_concurrent: null,
     members,
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-01T00:00:00Z",
@@ -178,6 +177,51 @@ describe("batchControls", () => {
     )
     expect(c.canCleanup).toBe(true)
     expect(c.cleanableCount).toBe(1)
+  })
+
+  /** Dismissal is the exit for a finished group — without it, the strip keeps
+   *  the row forever, because nothing else ever removes it. Offered only once
+   *  the batch is over AND fully cleaned: the soft delete drops the grouping
+   *  row alone, so removing the one row that still explains a worktree or a
+   *  pending decision must not be invited. */
+  it("offers dismissal only for an over batch with nothing left to clean", () => {
+    const over = batch([
+      member({ task_id: 11, task_status: "done", cleanup_result: "succeeded" }),
+    ])
+    over.status = "settled"
+    expect(batchControls(over).canDismiss).toBe(true)
+    const canceled = batch([
+      member({
+        task_id: 11,
+        task_status: "canceled",
+        cleanup_result: "succeeded",
+      }),
+    ])
+    canceled.status = "canceled"
+    expect(batchControls(canceled).canDismiss).toBe(true)
+  })
+
+  it("withholds dismissal while anything is cleanable or still pending", () => {
+    const stillCleanable = batch([
+      member({ task_id: 11, task_status: "done", cleanup_result: "succeeded" }),
+      member({ task_id: 12, task_status: "done" }),
+    ])
+    stillCleanable.status = "settled"
+    expect(batchControls(stillCleanable).canDismiss).toBe(false)
+
+    const inReview = batch([
+      member({
+        task_id: 11,
+        task_status: "review",
+        cleanup_result: "succeeded",
+      }),
+    ])
+    inReview.status = "review"
+    expect(batchControls(inReview).canDismiss).toBe(false)
+
+    const running = batch([member({ task_id: 11, task_status: "running" })])
+    running.status = "running"
+    expect(batchControls(running).canDismiss).toBe(false)
   })
 })
 

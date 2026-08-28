@@ -141,7 +141,6 @@ pub async fn create(
         failure_policy: Set(spec
             .failure_policy
             .unwrap_or(WorkTaskBatchFailurePolicy::BestEffort)),
-        max_concurrent: Set(spec.max_concurrent.filter(|n| *n > 0)),
         owner_extension: Set(spec.owner_extension.clone()),
         metadata: Set(metadata),
         created_at: Set(now),
@@ -347,7 +346,6 @@ pub async fn adopt(
         base_branch: Set(base.branch.clone()),
         status: Set(WorkTaskBatchStatus::Created),
         failure_policy: Set(WorkTaskBatchFailurePolicy::BestEffort),
-        max_concurrent: Set(None),
         // No owner: a plain bulk operation, not an app's round. Which is exactly
         // what makes this the primitive's second consumer.
         owner_extension: Set(None),
@@ -601,7 +599,6 @@ fn to_info(
         base_branch: b.base_branch,
         status: b.status,
         failure_policy: b.failure_policy,
-        max_concurrent: b.max_concurrent,
         owner_extension: b.owner_extension,
         metadata: b
             .metadata
@@ -681,22 +678,31 @@ pub async fn recompute_status(
         return Ok(next);
     }
 
+    apply_projection(conn, batch_id, next).await
+}
+
+/// The write half of [`recompute_status`]'s CAS — guarded on
+/// `status != canceled` because the read and the write are different moments.
+///
+/// The interleaving this closes: a member settles, a recompute pass reads a
+/// `running` batch and computes `settled`; the user cancels the batch; then
+/// the pass writes. Without the condition the write lands last and the
+/// cancellation the user asked for is gone from the row — the batch reports a
+/// normal completion, which is exactly the class of defect the batch-level
+/// cancel gate exists to prevent. The read-side check cannot cover it: it ran
+/// before the cancel.
+///
+/// Losing the CAS is not an error. It means the row now says something this
+/// pass has no authority to change, so the pass reports what is actually
+/// there. Split out as its own function so a test can drive exactly this
+/// half — [`recompute_status`] alone always re-reads first, and a
+/// read-after-cancel can never reach this write.
+async fn apply_projection(
+    conn: &DatabaseConnection,
+    batch_id: i32,
+    next: WorkTaskBatchStatus,
+) -> Result<WorkTaskBatchStatus, DbError> {
     let now = Utc::now();
-    // CAS, not a plain update — and the guard is the same one the early return
-    // above makes, repeated at write time because the two are not the same
-    // moment.
-    //
-    // The interleaving this closes: a member settles, this function reads a
-    // `running` batch and computes `settled`; the user cancels the batch; then
-    // this function writes. Without the condition the write lands last and the
-    // cancellation the user asked for is gone from the row — the batch reports a
-    // normal completion, which is exactly the class of defect the batch-level
-    // cancel gate exists to prevent. The read-side check cannot cover it: it ran
-    // before the cancel.
-    //
-    // Losing the CAS is not an error. It means the row now says something this
-    // pass has no authority to change, so the pass reports what is actually
-    // there.
     let updated = work_task_batch::Entity::update_many()
         .col_expr(
             work_task_batch::Column::Status,
@@ -746,6 +752,10 @@ pub async fn mark_canceled(conn: &DatabaseConnection, batch_id: i32) -> Result<(
     }
     let mut active: work_task_batch::ActiveModel = batch.into();
     active.status = Set(WorkTaskBatchStatus::Canceled);
+    // A canceled batch carries no finish line: without this, a batch that had
+    // settled before being canceled would keep its completion timestamp under
+    // a canceled status — two verdicts on one row.
+    active.settled_at = Set(None);
     active.updated_at = Set(Utc::now());
     active.update(conn).await?;
     Ok(())
@@ -856,7 +866,6 @@ mod tests {
             title: "compare three agents".to_string(),
             members: titles.iter().map(|t| member(t)).collect(),
             failure_policy: None,
-            max_concurrent: None,
             owner_extension: None,
             metadata: None,
             allow_dirty: false,
@@ -1399,9 +1408,11 @@ mod tests {
     /// batch would report a normal completion after the user canceled it. The
     /// UPDATE therefore carries the condition too.
     ///
-    /// This test reproduces that interleaving deterministically by driving the
-    /// two halves by hand: compute the projection against a live batch, cancel,
-    /// then let the stale projection try to land.
+    /// The interleave cannot be produced through `recompute_status` alone (it
+    /// would re-read and see the cancel), so this drives the two halves by
+    /// hand: stage the members as a recompute pass would have read them, cancel
+    /// the batch, then land the stale projection with [`apply_projection`] —
+    /// the exact write that pass was about to make.
     #[tokio::test]
     async fn a_cancel_landing_mid_recompute_still_wins() {
         let db = fresh_in_memory_db().await;
@@ -1425,8 +1436,10 @@ mod tests {
         set_status(&db, b, WorkTaskStatus::Done).await;
         // 2. The user cancels before that pass writes.
         mark_canceled(&db.conn, info.id).await.unwrap();
-        // 3. The pass writes. Its condition must refuse.
-        let reported = recompute_status(&db.conn, info.id).await.unwrap();
+        // 3. The pass writes — its condition must refuse.
+        let reported = apply_projection(&db.conn, info.id, WorkTaskBatchStatus::Settled)
+            .await
+            .unwrap();
 
         assert_eq!(
             reported,
@@ -1441,6 +1454,32 @@ mod tests {
         assert!(
             get(&db.conn, info.id).await.unwrap().settled_at.is_none(),
             "a canceled batch was stamped with a completion time"
+        );
+    }
+
+    /// The other order around: a batch that genuinely settled, then got
+    /// canceled. Cancellation is the newer verdict and must not inherit the
+    /// finish line — otherwise the row claims both "finished" and "canceled".
+    #[tokio::test]
+    async fn canceling_a_settled_batch_clears_its_finish_line() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/batch-cancel-settled").await;
+        let info = create(&db.conn, &spec(folder_id, &["a"]), base())
+            .await
+            .unwrap();
+        set_status(&db, info.members[0].task_id, WorkTaskStatus::Done).await;
+        recompute_status(&db.conn, info.id).await.unwrap();
+        let before = get(&db.conn, info.id).await.unwrap();
+        assert_eq!(before.status, WorkTaskBatchStatus::Settled);
+        assert!(before.settled_at.is_some(), "fixture sanity: settled first");
+
+        mark_canceled(&db.conn, info.id).await.unwrap();
+
+        let after = get(&db.conn, info.id).await.unwrap();
+        assert_eq!(after.status, WorkTaskBatchStatus::Canceled);
+        assert!(
+            after.settled_at.is_none(),
+            "cancellation kept the earlier completion timestamp"
         );
     }
 
@@ -1621,7 +1660,6 @@ mod tests {
         let mut s = spec(folder_id, &["a"]);
         s.owner_extension = Some("example.owner".into());
         s.metadata = Some(serde_json::json!({ "layout": "grid", "slots": 4 }));
-        s.max_concurrent = Some(2);
         s.failure_policy = Some(WorkTaskBatchFailurePolicy::FailFast);
         s.members[0].label = Some("slot A".into());
         s.members[0].profile_snapshot = Some(serde_json::json!({
@@ -1635,7 +1673,6 @@ mod tests {
         // Core carries the owner's vocabulary without interpreting it.
         assert_eq!(read.owner_extension.as_deref(), Some("example.owner"));
         assert_eq!(read.metadata.as_ref().unwrap()["layout"], "grid");
-        assert_eq!(read.max_concurrent, Some(2));
         assert_eq!(read.failure_policy, WorkTaskBatchFailurePolicy::FailFast);
         assert_eq!(read.members[0].label.as_deref(), Some("slot A"));
         assert_eq!(
@@ -1643,18 +1680,6 @@ mod tests {
             "high",
             "the launch snapshot that makes a comparison honest was lost"
         );
-    }
-
-    /// `max_concurrent: 0` means "no cap" everywhere else in this codebase; it
-    /// must not become a batch that can never launch anything.
-    #[tokio::test]
-    async fn a_zero_concurrency_cap_reads_as_no_cap() {
-        let db = fresh_in_memory_db().await;
-        let folder_id = seed_folder(&db, "/tmp/batch-zero").await;
-        let mut s = spec(folder_id, &["a"]);
-        s.max_concurrent = Some(0);
-        let info = create(&db.conn, &s, base()).await.unwrap();
-        assert_eq!(info.max_concurrent, None);
     }
 
     /// The engine's lookup is by task id and must stay unambiguous: one task

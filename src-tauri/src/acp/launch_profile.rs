@@ -7,8 +7,9 @@
 //!    固化为快照，进入 WorkTask 的 `config_effective` 审计事件，任务详情
 //!    页可查。这与竞技场无关，是所有任务的基础能力。
 //! 2. **配置健康**——只对**有真实数据来源**的维度做校验：effort 词表跟随
-//!    模型（codex 的 bundled catalog 自带 per-model 档位）；permission
-//!    词表只有 grok 有（launch flag / `config.toml` 的真实机制）。
+//!    模型（codex 的 bundled catalog 自带 per-model 档位）。permission 不在
+//!    此列：per-task 的 permission 从不进入 `config_values`（grok 的权限走
+//!    全局 `config.toml` / launch flag），一个无取值来源的维度不该有词表。
 //!
 //! 明确不做：为能力等级发明静态判断（如「某 agent 支持/不支持 mcp」）。
 //! ACP 协议没有 mcp/skills 隔离的声明渠道，静态拍脑袋的判断没有权威
@@ -21,7 +22,6 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::acp::registry::get_agent_meta;
-use crate::commands::acp::GROK_PERMISSION_MODES;
 use crate::models::agent::AgentType;
 
 /// 会话级选择策略：`inherit` 跟随全局，`none` 禁用，`selected` 白名单。
@@ -63,8 +63,6 @@ pub struct LaunchProfileRequest {
     /// 数据来源的 agent 校验提示。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub permission: Option<String>,
     #[serde(default)]
     pub skills: SkillPolicy,
     #[serde(default)]
@@ -95,16 +93,6 @@ pub fn effort_levels_for(agent: AgentType, model: Option<&str>) -> Option<Vec<St
     }
 }
 
-/// Grok 的 permission 词表（`commands/acp.rs::GROK_PERMISSION_MODES` 的
-/// launch flag / `config.toml` 机制，全模型共享）；其余 agent 的 permission
-/// 走 ACP modes 事件，无静态词表 → `None`，值透传不校验。
-pub fn permission_modes_for(agent: AgentType) -> Option<&'static [&'static str]> {
-    match agent {
-        AgentType::Grok => Some(GROK_PERMISSION_MODES),
-        _ => None,
-    }
-}
-
 /// 解析后的启动配置快照。`applied` 是实际生效值；`warnings` 解释请求与
 /// 生效之间的任何落差。序列化后可直接进入审计事件。
 #[derive(Debug, Clone, Serialize)]
@@ -113,7 +101,7 @@ pub struct ResolvedLaunchProfile {
     /// Adapter（ACP registry）版本；未注册自定义 agent 为占位版本。
     pub adapter_version: Option<String>,
     pub requested: LaunchProfileRequest,
-    /// 键：`model` / `effort` / `permission` / `skills.mode` / `mcp.mode`；
+    /// 键：`model` / `effort` / `skills.mode` / `mcp.mode`；
     /// 值：生效值（无法送达的会话级请求回落为 `inherit`）。
     pub applied: BTreeMap<String, serde_json::Value>,
     pub warnings: Vec<String>,
@@ -140,21 +128,6 @@ pub fn resolve_launch_profile(
                     "effort '{}' is not in the known vocabulary for {} model {:?} ({:?}); \
                      delivered verbatim to the adapter",
                     effort, meta.name, request.model, levels
-                ));
-            }
-        }
-    }
-    if let Some(permission) = &request.permission {
-        applied.insert(
-            "permission".into(),
-            serde_json::Value::String(permission.clone()),
-        );
-        if let Some(modes) = permission_modes_for(agent) {
-            if !modes.contains(&permission.as_str()) {
-                warnings.push(format!(
-                    "permission '{}' is not in the known vocabulary for {} ({:?}); \
-                     delivered verbatim to the adapter",
-                    permission, meta.name, modes
                 ));
             }
         }
@@ -274,13 +247,11 @@ mod tests {
             AgentType::Grok,
             &LaunchProfileRequest {
                 effort: Some("high".into()),
-                permission: Some("plan".into()),
                 ..Default::default()
             },
         );
         assert!(p.warnings.is_empty(), "{:?}", p.warnings);
         assert_eq!(p.applied["effort"].as_str(), Some("high"));
-        assert_eq!(p.applied["permission"].as_str(), Some("plan"));
     }
 
     #[test]
@@ -298,42 +269,6 @@ mod tests {
             "{:?}",
             p.warnings
         );
-    }
-
-    #[test]
-    fn permission_vocabulary_warns_outside_grok_launch_flag_mechanism() {
-        // grok 六档（launch flag 机制）：plan 静默，词表外值告警。
-        let ok = profile(
-            AgentType::Grok,
-            &LaunchProfileRequest {
-                permission: Some("acceptEdits".into()),
-                ..Default::default()
-            },
-        );
-        assert!(ok.warnings.is_empty(), "{:?}", ok.warnings);
-
-        let bad = profile(
-            AgentType::Grok,
-            &LaunchProfileRequest {
-                permission: Some("sneaky".into()),
-                ..Default::default()
-            },
-        );
-        assert!(
-            bad.warnings.iter().any(|w| w.contains("sneaky")),
-            "{:?}",
-            bad.warnings
-        );
-
-        // 无公开词表的 agent 透传不校验。
-        let pass = profile(
-            AgentType::ClaudeCode,
-            &LaunchProfileRequest {
-                permission: Some("whatever".into()),
-                ..Default::default()
-            },
-        );
-        assert!(pass.warnings.is_empty(), "{:?}", pass.warnings);
     }
 
     #[test]

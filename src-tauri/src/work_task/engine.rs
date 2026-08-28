@@ -770,10 +770,25 @@ impl TaskEngine {
     /// the batch — the others still run, and the caller can say which refused
     /// and why. `fail_fast` governs what a member's *failure while running*
     /// means for the rest, not what a refusal at the gate means.
+    ///
+    /// A canceled batch refuses the aggregate outright. Individual members may
+    /// still be retried on their own, but an aggregate start on a canceled
+    /// batch would put members to work under a row that can never report them:
+    /// `recompute_status` refuses to move a canceled batch, so the batch would
+    /// claim `canceled` while its members ran.
     pub async fn batch_start(
         self: &Arc<Self>,
         batch_id: i32,
     ) -> Result<Vec<crate::models::BatchMemberOutcome>, String> {
+        let batch = work_task_batch_service::get_model(&self.db.conn, batch_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if batch.status == crate::models::WorkTaskBatchStatus::Canceled {
+            return Err(
+                "a canceled batch never reopens — retry members individually or start a new batch"
+                    .to_string(),
+            );
+        }
         let members = work_task_batch_service::member_models(&self.db.conn, batch_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -917,7 +932,30 @@ impl TaskEngine {
                 continue;
             }
             let (result, error) = match self.cleanup_task(m.task_id).await {
-                Ok(()) => (crate::models::MemberCleanupResult::Succeeded, None),
+                // `cleanup_task` answers "the member was removable and the
+                // removal pass ran" — the git verdict lives on the task row,
+                // where `remove_worktree_inner` flags `cleanup_state='failed'`
+                // and keeps the worktree. Reading it back is what keeps this
+                // ledger honest: an `Ok` trusted blindly would record
+                // `succeeded` for a worktree still on disk, with no retry
+                // offered — the exact false success the ledger exists to
+                // rule out.
+                Ok(()) => {
+                    let git_failed = work_task_service::get_model(&self.db.conn, m.task_id)
+                        .await
+                        .map(|t| t.cleanup_state.as_deref() == Some("failed"))
+                        // A row that cannot be re-read gets the safe verdict:
+                        // `failed` offers a retry, and a retry converges.
+                        .unwrap_or(true);
+                    if git_failed {
+                        (
+                            crate::models::MemberCleanupResult::Failed,
+                            Some(self.latest_cleanup_error(m.task_id).await),
+                        )
+                    } else {
+                        (crate::models::MemberCleanupResult::Succeeded, None)
+                    }
+                }
                 Err(e) => {
                     // `cleanup_task` refuses a live task by design. That is a
                     // "not yet", not a "failed" — the difference decides whether
@@ -1392,16 +1430,16 @@ impl TaskEngine {
             wt
         };
 
-        // ResolvedLaunchProfile: requested vs applied capability snapshot in
-        // the audit trail (ADR 0001 decision 3). Effort aliases cover the keys
-        // the adapters actually use; skills/mcp inherit by contract until a
-        // session-level policy exists (launch_profile PR-02 → skill policy).
+        // ResolvedLaunchProfile: requested vs applied snapshot in the audit
+        // trail (ADR 0001 decision 3). The effort aliases are exactly the keys
+        // the adapters declare in `config_values` (grok `reasoning_effort`,
+        // claude `effortLevel`); skills/mcp inherit by contract until a
+        // session-level policy exists.
         let profile_request = crate::acp::launch_profile::LaunchProfileRequest {
             model: config_values.get("model").cloned(),
-            effort: ["effort", "reasoning_effort", "effortLevel"]
+            effort: ["reasoning_effort", "effortLevel"]
                 .into_iter()
                 .find_map(|key| config_values.get(key).cloned()),
-            permission: config_values.get("permission_mode").cloned(),
             skills: Default::default(),
             mcp: Default::default(),
         };
@@ -4981,6 +5019,29 @@ impl TaskEngine {
         Ok(())
     }
 
+    /// The error text of a task's most recent failed worktree removal, for the
+    /// batch member ledger. The task row keeps only the `failed` flag; the
+    /// sentence lives in the `cleanup_failed` event's payload.
+    async fn latest_cleanup_error(&self, task_id: i32) -> String {
+        match work_task_service::recent_events_of_kinds(
+            &self.db.conn,
+            task_id,
+            &["cleanup_failed"],
+            1,
+        )
+        .await
+        {
+            Ok(events) => events
+                .into_iter()
+                .next()
+                .and_then(|e| e.payload)
+                .and_then(|p| p.get("error").cloned())
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "worktree removal failed".to_string()),
+            Err(_) => "worktree removal failed".to_string(),
+        }
+    }
+
     /// Git-first-then-DB worktree removal, and the `task://changed` that tells
     /// clients about it. Caller holds the folder git lock.
     ///
@@ -5181,6 +5242,11 @@ impl TaskEngine {
             };
             if changed {
                 self.emit_upsert(task.id);
+                // This settle happened outside the live event flow, so nothing
+                // downstream will refresh the member's batch — do it here, or
+                // a batch whose members all died with the process stays
+                // `running` on its row until some unrelated action rescans it.
+                self.refresh_batch_of_task(task.id).await;
             }
         }
 
@@ -10933,7 +10999,6 @@ mod tests {
                 title: "compare".into(),
                 members,
                 failure_policy: None,
-                max_concurrent: None,
                 owner_extension: Some("codeg.test".into()),
                 metadata: None,
                 allow_dirty: false,
@@ -11046,6 +11111,64 @@ mod tests {
             batch_status(&engine, batch_id).await,
             crate::models::WorkTaskBatchStatus::Canceled,
             "a late member settle repainted a canceled batch"
+        );
+    }
+
+    /// Crash recovery settles members outside the live event flow; the batch
+    /// row must follow them. A member that died mid-run is failed by
+    /// `reconcile_once`, and without the recompute there is no later event to
+    /// fix the row — the batch reads `running` forever, telling every client a
+    /// round is in progress that nothing can start, cancel, or settle.
+    #[tokio::test]
+    async fn recovery_recomputes_the_batch_of_a_member_it_settles() {
+        let (engine, batch_id, tasks) = batch_fixture(2).await;
+
+        // Both members mid-run on connections that died with the process: the
+        // rows say `running` + a connection the manager no longer holds.
+        for (i, &t) in tasks.iter().enumerate() {
+            let seq = work_task_service::claim_for_run(
+                &engine.db.conn,
+                t,
+                WorkTaskStatus::Todo,
+                "test",
+            )
+            .await
+            .expect("claim")
+            .expect("claimed");
+            assert!(work_task_service::begin_setup(&engine.db.conn, t, seq)
+                .await
+                .expect("begin_setup"));
+            let row = crate::db::entities::work_task::Entity::find_by_id(t)
+                .one(&engine.db.conn)
+                .await
+                .expect("query")
+                .expect("row");
+            let mut active = row.into_active_model();
+            active.status = Set(WorkTaskStatus::Running);
+            active.connection_id = Set(Some(format!("conn-ghost-{i}")));
+            active.update(&engine.db.conn).await.expect("force running");
+        }
+
+        engine.refresh_batch(batch_id).await;
+        assert_eq!(
+            batch_status(&engine, batch_id).await,
+            crate::models::WorkTaskBatchStatus::Running,
+            "fixture sanity: the batch is live before the crash recovery"
+        );
+
+        engine.reconcile_once().await;
+
+        for &t in &tasks {
+            assert_eq!(
+                status_of(&engine, t).await,
+                WorkTaskStatus::Failed,
+                "member {t} was not settled by crash recovery"
+            );
+        }
+        assert_eq!(
+            batch_status(&engine, batch_id).await,
+            crate::models::WorkTaskBatchStatus::Settled,
+            "recovery settled every member but the batch row never followed"
         );
     }
 
@@ -11194,6 +11317,74 @@ mod tests {
         );
     }
 
+    /// An aggregate start on a canceled batch is refused outright — including
+    /// its failed members, which a fresh aggregate would otherwise "helpfully"
+    /// retry. Running them would put work under a row the projection can never
+    /// repaint (`recompute_status` refuses to move a canceled batch), so the
+    /// batch would claim `canceled` while its members ran. Retrying a member
+    /// stays possible on the member's own retry, outside the aggregate.
+    #[tokio::test]
+    async fn an_aggregate_start_refuses_a_canceled_batch() {
+        let (engine, batch_id, tasks) = batch_fixture(2).await;
+
+        // One member failed before the cancel: terminal, so the aggregate
+        // cancel leaves it `failed` — exactly the member an aggregate start
+        // would reclaim.
+        let seq = work_task_service::claim_for_run(
+            &engine.db.conn,
+            tasks[0],
+            WorkTaskStatus::Todo,
+            "test",
+        )
+        .await
+        .expect("claim")
+        .expect("claimed");
+        assert!(work_task_service::begin_setup(&engine.db.conn, tasks[0], seq)
+            .await
+            .expect("begin_setup"));
+        assert!(work_task_service::fail(
+            &engine.db.conn,
+            tasks[0],
+            &[WorkTaskStatus::Preparing],
+            Some(seq),
+            "setup_error",
+            Some("boom".into()),
+        )
+        .await
+        .expect("fail"));
+
+        engine.batch_cancel(batch_id).await.expect("batch cancel");
+        assert_eq!(
+            batch_status(&engine, batch_id).await,
+            crate::models::WorkTaskBatchStatus::Canceled
+        );
+
+        let err = engine
+            .batch_start(batch_id)
+            .await
+            .expect_err("an aggregate start must refuse a canceled batch");
+        assert!(err.contains("canceled"), "the refusal must say why: {err}");
+
+        // Nothing was reclaimed under the canceled round.
+        assert_eq!(
+            status_of(&engine, tasks[0]).await,
+            WorkTaskStatus::Failed,
+            "the failed member was relaunched under a canceled batch"
+        );
+        assert_eq!(
+            work_task_service::get_model(&engine.db.conn, tasks[0])
+                .await
+                .expect("row")
+                .run_seq,
+            seq,
+            "the refusal still claimed a fresh generation"
+        );
+        assert_eq!(
+            status_of(&engine, tasks[1]).await,
+            WorkTaskStatus::Canceled
+        );
+    }
+
     /// A live member's cleanup is reported `blocked`, not `failed`, and never
     /// force-removed. The two words tell the user different things to do: stop
     /// the member first, versus retry.
@@ -11274,6 +11465,79 @@ mod tests {
         );
     }
 
+    /// A member whose worktree removal fails at the git layer is `failed` on
+    /// the ledger — never `succeeded`. The refusal lands on the task row as
+    /// `cleanup_state='failed'` while `cleanup_task` still returns `Ok`, so the
+    /// ledger must read the row back: recording success here would strand the
+    /// checkout on disk with no retry offered, the false success this ledger
+    /// was built to rule out.
+    #[tokio::test]
+    async fn cleanup_reports_a_git_layer_failure_on_the_member_ledger() {
+        let (engine, batch_id, tasks) = batch_fixture(2).await;
+
+        // Give one member a worktree the git layer cannot remove: the folder
+        // row exists but its path is not a repository, so `git worktree remove`
+        // refuses and `remove_worktree_inner` flags the task row instead of
+        // erroring — exactly the shape `cleanup_task`'s `Ok` cannot carry.
+        let wt_id =
+            crate::db::test_helpers::seed_folder(&engine.db, "/tmp/engine-batch-wt").await;
+        let row = crate::db::entities::work_task::Entity::find_by_id(tasks[0])
+            .one(&engine.db.conn)
+            .await
+            .expect("query")
+            .expect("row");
+        let mut active = row.into_active_model();
+        active.worktree_folder_id = Set(Some(wt_id));
+        active.update(&engine.db.conn).await.expect("attach worktree");
+
+        let outcomes = engine
+            .batch_cleanup(batch_id, &[])
+            .await
+            .expect("batch cleanup");
+
+        let failed = outcomes
+            .iter()
+            .find(|o| o.task_id == tasks[0])
+            .expect("an answer for the failing member");
+        assert_eq!(
+            failed.result,
+            crate::models::MemberCleanupResult::Failed,
+            "a git-layer removal failure was reported as succeeded"
+        );
+        assert!(
+            failed.error.as_deref().is_some_and(|e| !e.is_empty()),
+            "the ledger entry carries no error text"
+        );
+        let clean = outcomes
+            .iter()
+            .find(|o| o.task_id == tasks[1])
+            .expect("an answer for the member with nothing to remove");
+        assert_eq!(
+            clean.result,
+            crate::models::MemberCleanupResult::Succeeded,
+            "a member with no worktree must still read as a genuine success"
+        );
+
+        // Persisted, so a second window reads the same verdict and the retry
+        // the `failed` verdict exists to offer.
+        let persisted = work_task_batch_service::get(&engine.db.conn, batch_id)
+            .await
+            .expect("batch")
+            .members
+            .into_iter()
+            .find(|m| m.task_id == tasks[0])
+            .expect("member");
+        assert_eq!(
+            persisted.cleanup_result,
+            Some(crate::models::MemberCleanupResult::Failed),
+            "the git-layer failure was returned but never persisted"
+        );
+        assert!(
+            persisted.cleanup_error.is_some(),
+            "the persisted verdict carries no reason to show the user"
+        );
+    }
+
     /// Under `fail_fast`, a member's failure cancels the members still waiting
     /// for a slot — and leaves the ones already working alone, because their
     /// partial output is what explains why the batch stopped.
@@ -11301,7 +11565,6 @@ mod tests {
                 title: "fail fast".into(),
                 members,
                 failure_policy: Some(crate::models::WorkTaskBatchFailurePolicy::FailFast),
-                max_concurrent: None,
                 owner_extension: None,
                 metadata: None,
                 allow_dirty: false,
@@ -11447,7 +11710,6 @@ mod tests {
                     profile_snapshot: None,
                 }],
                 failure_policy: None,
-                max_concurrent: None,
                 owner_extension: None,
                 metadata: None,
                 allow_dirty: false,

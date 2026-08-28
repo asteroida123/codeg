@@ -53,7 +53,7 @@ pub enum WorkTaskBatchFailurePolicy {
 /// A group of existing work tasks sharing one immutable starting commit.
 ///
 /// What a batch owns: the common base (`base_sha` / `base_branch`), the launch
-/// order and concurrency cap, the failure policy, and the aggregate projection
+/// order, the failure policy, and the aggregate projection
 /// above. What it explicitly does NOT own: member status, worktrees,
 /// connections, cancellation, or cleanup — all of that stays with the task
 /// engine, which remains the single execution authority. A batch never writes
@@ -75,9 +75,6 @@ pub struct Model {
     pub base_branch: String,
     pub status: WorkTaskBatchStatus,
     pub failure_policy: WorkTaskBatchFailurePolicy,
-    /// Members launched at once; `None` = defer to the folder's own
-    /// `max_concurrent`.
-    pub max_concurrent: Option<i32>,
     /// Reverse-DNS id of the module that created the batch (`vendor.module`), or
     /// `None` for a plain bulk operation. Opaque to Core — carried and
     /// returned, never branched on. This is the seam that keeps business nouns

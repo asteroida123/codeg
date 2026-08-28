@@ -5315,6 +5315,7 @@
     "memberCount": "{count} tasks",
     "cancelAll": "Cancel all",
     "cleanUpAll": "Clean up {count}",
+    "dismiss": "Remove from list",
     "status": {
       "created": "Not started",
       "running": "Running",

@@ -1828,10 +1828,6 @@ function timelineDetail(event: WorkTaskEvent): string | null {
       const applied = profile?.applied ?? null
       const effort =
         applied && typeof applied.effort === "string" ? applied.effort : null
-      const permission =
-        applied && typeof applied.permission === "string"
-          ? applied.permission
-          : null
       const warnings = Array.isArray(profile?.warnings)
         ? (profile.warnings as unknown[]).filter(
             (w): w is string => typeof w === "string"
@@ -1842,7 +1838,6 @@ function timelineDetail(event: WorkTaskEvent): string | null {
           agent,
           model,
           effort && `effort ${effort}`,
-          permission && `permission ${permission}`,
           ...warnings,
         ]
           .filter(Boolean)

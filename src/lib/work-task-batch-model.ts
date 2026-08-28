@@ -71,6 +71,15 @@ export interface BatchControls {
    * that is guaranteed to be partly refused.
    */
   canCleanup: boolean
+  /**
+   * The grouping row may be dropped from the list. Only for a batch that is
+   * over (`settled` / `canceled`) AND has nothing left to clean — deleting
+   * soft-removes the grouping only (member tasks and worktrees are untouched),
+   * so offering it while a worktree or a pending decision remains would invite
+   * removing the one row that still explains them. Without this flag a finished
+   * group stays in the strip forever: nothing else ever removes it.
+   */
+  canDismiss: boolean
   /** Members that still hold a worktree the user may want removed. */
   cleanableCount: number
 }
@@ -90,11 +99,13 @@ export function batchControls(batch: WorkTaskBatch): BatchControls {
   const cleanableCount = batch.members.filter(
     (m) => m.cleanup_result !== "succeeded"
   ).length
+  const over = batch.status === "settled" || batch.status === "canceled"
 
   return {
     canStart,
     canCancel: anyLive || phases.some((p) => p === "waiting"),
     canCleanup: !anyLive && cleanableCount > 0,
+    canDismiss: over && cleanableCount === 0,
     cleanableCount,
   }
 }

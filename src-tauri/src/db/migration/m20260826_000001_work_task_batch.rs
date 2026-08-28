@@ -45,9 +45,9 @@ impl MigrationTrait for Migration {
                             .text()
                             .not_null(),
                     )
-                    // created | running | settled | canceled. A projection of
-                    // the members, written by the aggregation pass — never a
-                    // second state machine.
+                    // created | running | review | settled | canceled. A
+                    // projection of the members, written by the aggregation
+                    // pass — never a second state machine.
                     .col(
                         ColumnDef::new(WorkTaskBatch::Status)
                             .text()
@@ -62,9 +62,6 @@ impl MigrationTrait for Migration {
                             .not_null()
                             .default("best_effort"),
                     )
-                    // Members launched at once; NULL = defer to the folder's
-                    // own `max_concurrent`.
-                    .col(ColumnDef::new(WorkTaskBatch::MaxConcurrent).integer())
                     // Reverse-DNS id of the module that created this batch
                     // ('vendor.module'), or NULL for a plain bulk operation.
                     // Opaque to Core: never branched on, only carried.
@@ -211,7 +208,6 @@ enum WorkTaskBatch {
     BaseBranch,
     Status,
     FailurePolicy,
-    MaxConcurrent,
     OwnerExtension,
     Metadata,
     CreatedAt,

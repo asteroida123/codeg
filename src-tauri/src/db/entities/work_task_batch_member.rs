@@ -47,10 +47,11 @@ pub struct Model {
     /// the order.
     pub slot_index: i32,
     pub label: Option<String>,
-    /// JSON `ResolvedLaunchProfile` captured when the member was added: what
-    /// was requested, what applied, and every gap between the two. What makes a
-    /// comparison honest — the report states the real configuration rather than
-    /// the one the user hoped for.
+    /// Caller-defined JSON snapshot of what it REQUESTED for this member at
+    /// creation (the Arena stores `{ requested: { agent_type, mode_id,
+    /// config_values } }`). Not the engine's `ResolvedLaunchProfile`: what
+    /// actually applied is derived at read time from the task's
+    /// `config_effective` events, which only exist once a process has launched.
     #[sea_orm(column_type = "Text")]
     pub profile_snapshot: Option<String>,
     /// `None` = cleanup never attempted for this member.

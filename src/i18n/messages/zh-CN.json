@@ -5315,6 +5315,7 @@
     "memberCount": "{count} 个任务",
     "cancelAll": "全部取消",
     "cleanUpAll": "清理 {count} 个",
+    "dismiss": "从列表移除",
     "status": {
       "created": "未开始",
       "running": "进行中",

@@ -1750,8 +1750,6 @@ export interface WorkTaskBatch {
   base_branch: string
   status: WorkTaskBatchStatus
   failure_policy: WorkTaskBatchFailurePolicy
-  /** null = defer to the folder's own max_concurrent. */
-  max_concurrent: number | null
   /** Reverse-DNS id of the module that created the batch; opaque to Core. */
   owner_extension?: string | null
   metadata?: Record<string, unknown> | null
@@ -1769,8 +1767,10 @@ export interface WorkTaskBatchMember {
   task_id: number
   slot_index: number
   label?: string | null
-  /** `ResolvedLaunchProfile` snapshot captured when the member was added:
-   *  what the caller REQUESTED. */
+  /** Caller-defined snapshot of what it REQUESTED for this member at creation
+   *  (the Arena stores `{ requested: { agent_type, mode_id, config_values } }`).
+   *  Not the engine's `ResolvedLaunchProfile` — what actually applied comes
+   *  back via `applied_profile`. */
   profile_snapshot?: Record<string, unknown> | null
   /**
    * The profile the ENGINE resolved when it actually launched this member.
@@ -1805,7 +1805,6 @@ export interface WorkTaskBatchSpec {
   title: string
   members: WorkTaskBatchMemberSpec[]
   failure_policy?: WorkTaskBatchFailurePolicy | null
-  max_concurrent?: number | null
   owner_extension?: string | null
   metadata?: Record<string, unknown> | null
   /** Create even though the project folder has modified tracked files.

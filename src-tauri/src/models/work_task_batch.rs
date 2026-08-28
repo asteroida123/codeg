@@ -25,9 +25,6 @@ pub struct WorkTaskBatchSpec {
     pub members: Vec<WorkTaskBatchMemberSpec>,
     #[serde(default)]
     pub failure_policy: Option<WorkTaskBatchFailurePolicy>,
-    /// `None` = defer to the folder's own `max_concurrent`.
-    #[serde(default)]
-    pub max_concurrent: Option<i32>,
     /// Reverse-DNS id of the calling module (`vendor.module`). Opaque to Core.
     #[serde(default)]
     pub owner_extension: Option<String>,
@@ -52,7 +49,10 @@ pub struct WorkTaskBatchMemberSpec {
     pub config: serde_json::Value,
     #[serde(default)]
     pub label: Option<String>,
-    /// JSON `ResolvedLaunchProfile` captured by the caller before creating.
+    /// Caller-defined snapshot of what it REQUESTED for this member at creation
+    /// (the Arena stores `{ requested: { agent_type, mode_id, config_values } }`).
+    /// Not the engine's `ResolvedLaunchProfile`: what actually applied is read
+    /// back from the task's `config_effective` events into `applied_profile`.
     #[serde(default)]
     pub profile_snapshot: Option<serde_json::Value>,
 }
@@ -68,7 +68,6 @@ pub struct WorkTaskBatchInfo {
     pub base_branch: String,
     pub status: WorkTaskBatchStatus,
     pub failure_policy: WorkTaskBatchFailurePolicy,
-    pub max_concurrent: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_extension: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

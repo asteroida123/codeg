@@ -3,9 +3,13 @@
 import { useCallback, useState } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
-import { GitCommitHorizontal, Loader2, Trash2, X } from "lucide-react"
+import { GitCommitHorizontal, ListX, Loader2, Trash2, X } from "lucide-react"
 
-import { workTaskBatchCancel, workTaskBatchCleanup } from "@/lib/api"
+import {
+  workTaskBatchCancel,
+  workTaskBatchCleanup,
+  workTaskBatchDelete,
+} from "@/lib/api"
 import {
   batchControls,
   refusedStarts,
@@ -56,7 +60,9 @@ function BatchRow({
   folderName: string | null
 }) {
   const t = useTranslations("TaskBatch")
-  const [busy, setBusy] = useState<"cancel" | "cleanup" | null>(null)
+  const [busy, setBusy] = useState<"cancel" | "cleanup" | "dismiss" | null>(
+    null
+  )
   const controls = batchControls(batch)
 
   const handleCancel = useCallback(async () => {
@@ -116,6 +122,24 @@ function BatchRow({
       setBusy(null)
     }
   }, [batch.id, t])
+
+  // Dropping the grouping row — the exit for a batch that is over and fully
+  // cleaned. Without it a finished group would sit in the strip forever:
+  // nothing else ever removes it. Soft-delete only; the member tasks and
+  // anything still on disk are not touched (the model only offers this once
+  // `cleanableCount` reaches zero), and the backend's `Deleted` event makes
+  // every listener refetch.
+  const handleDismiss = useCallback(async () => {
+    setBusy("dismiss")
+    try {
+      await workTaskBatchDelete(batch.id)
+    } catch (e) {
+      toast.error(String(e))
+      setBusy(null)
+    }
+    // No success toast and no setBusy(null) on purpose: the row is about to
+    // unmount with the refetch the backend event triggers.
+  }, [batch.id])
 
   return (
     <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 rounded-xl border bg-muted/30 px-3 py-1.5">
@@ -180,6 +204,22 @@ function BatchRow({
               <Trash2 />
             )}
             {t("cleanUpAll", { count: controls.cleanableCount })}
+          </Button>
+        ) : null}
+        {controls.canDismiss ? (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-6 px-2 text-[0.6875rem] text-muted-foreground"
+            disabled={busy != null}
+            onClick={handleDismiss}
+          >
+            {busy === "dismiss" ? (
+              <Loader2 className="animate-spin" />
+            ) : (
+              <ListX />
+            )}
+            {t("dismiss")}
           </Button>
         ) : null}
       </div>
