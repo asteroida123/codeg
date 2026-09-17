@@ -53,12 +53,12 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-} from "@/components/ui/sheet"
+  Drawer,
+  DrawerContent,
+  DrawerDescription,
+  DrawerHeader,
+  DrawerTitle,
+} from "@/components/ui/drawer"
 import { cn } from "@/lib/utils"
 import { toErrorMessage } from "@/lib/app-error"
 import type {
@@ -570,7 +570,7 @@ export function SkillAgentMatrix({
               <thead className="sticky top-0 z-20 bg-card">
                 <tr>
                   {/* Corner: select-all + everything menu. */}
-                  <th className="sticky left-0 z-10 bg-card border-b border-r px-2 py-2 text-left align-middle min-w-[260px]">
+                  <th className="sticky left-0 z-10 bg-card border-b border-r px-2 py-2 text-left align-middle min-w-[16.25rem]">
                     <div className="flex items-center gap-2">
                       <Checkbox
                         checked={
@@ -584,7 +584,7 @@ export function SkillAgentMatrix({
                         disabled={!interactive}
                         aria-label={t("selectAll")}
                       />
-                      <span className="text-[11px] uppercase tracking-wide font-semibold text-muted-foreground">
+                      <span className="text-2xs uppercase tracking-wide font-semibold text-muted-foreground">
                         {t("skillColumn")}
                       </span>
                     </div>
@@ -593,7 +593,7 @@ export function SkillAgentMatrix({
                     <th
                       key={agent.agent_type}
                       scope="col"
-                      className="border-b px-1 py-2 align-middle min-w-[48px]"
+                      className="border-b px-1 py-2 align-middle min-w-[3rem]"
                     >
                       <DropdownMenu>
                         <Tooltip>
@@ -609,7 +609,7 @@ export function SkillAgentMatrix({
                                   agentType={agent.agent_type}
                                   className="h-4 w-4"
                                 />
-                                <span className="text-[10px] text-muted-foreground tabular-nums">
+                                <span className="text-3xs text-muted-foreground tabular-nums">
                                   {enabledCountForAgent(agent.agent_type)}
                                 </span>
                               </button>
@@ -653,7 +653,7 @@ export function SkillAgentMatrix({
                         {/* Sticky row header. */}
                         <th
                           scope="row"
-                          className="sticky left-0 z-10 bg-card border-r px-2 py-1.5 text-left font-normal min-w-[260px]"
+                          className="sticky left-0 z-10 bg-card border-r px-2 py-1.5 text-left font-normal min-w-[16.25rem]"
                         >
                           <div className="flex items-center gap-2 min-w-0">
                             <Checkbox
@@ -678,7 +678,7 @@ export function SkillAgentMatrix({
                               <Badge
                                 variant="outline"
                                 className={cn(
-                                  "h-5 px-1.5 text-[10px] shrink-0",
+                                  "h-5 px-1.5 text-3xs shrink-0",
                                   skill.badge.tone === "amber"
                                     ? "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400"
                                     : "text-muted-foreground"
@@ -689,7 +689,7 @@ export function SkillAgentMatrix({
                             )}
                             <Badge
                               variant="outline"
-                              className="h-5 px-1.5 text-[10px] shrink-0 tabular-nums text-muted-foreground"
+                              className="h-5 px-1.5 text-3xs shrink-0 tabular-nums text-muted-foreground"
                             >
                               {enabledCountForSkill(skill.id)}/{agents.length}
                             </Badge>
@@ -856,25 +856,28 @@ export function SkillAgentMatrix({
       </AlertDialog>
 
       {/* Detail drawer: preview + per-agent toggles. */}
-      <Sheet
+      <Drawer
         open={detailSkill !== null}
         onOpenChange={(open) => {
           if (!open) setDetailSkillId(null)
         }}
+        swipeDirection="right"
       >
-        <SheetContent className="w-[min(680px,100vw)] sm:max-w-[680px] flex flex-col">
+        <DrawerContent className="w-[min(42.5rem,calc(100vw-1rem))] sm:max-w-[42.5rem] flex flex-col">
           {detailSkill && (
             <>
-              <SheetHeader>
-                <SheetTitle className="flex items-center gap-2">
+              {/* `pr-12` clears the close button (`right-4` + `size-8`), which
+                  the header's own `p-4` no longer does on its own. */}
+              <DrawerHeader className="pr-12">
+                <DrawerTitle className="flex items-center gap-2">
                   <detailSkill.icon className="h-5 w-5 text-primary/80" />
                   {detailSkill.displayName}
-                </SheetTitle>
-                <SheetDescription>{detailSkill.description}</SheetDescription>
-              </SheetHeader>
+                </DrawerTitle>
+                <DrawerDescription>{detailSkill.description}</DrawerDescription>
+              </DrawerHeader>
               <div className="flex-1 min-h-0 overflow-y-auto px-4 pb-4 space-y-4">
                 <div className="rounded-md border p-3">
-                  <div className="text-[11px] text-muted-foreground mb-2">
+                  <div className="text-2xs text-muted-foreground mb-2">
                     {t("detail.enableForAgents")}
                   </div>
                   <div className="space-y-1.5">
@@ -901,7 +904,7 @@ export function SkillAgentMatrix({
                             <div className="text-sm font-medium truncate">
                               {agent.name}
                             </div>
-                            <div className="text-[11px] text-muted-foreground truncate">
+                            <div className="text-2xs text-muted-foreground truncate">
                               {status ? translateState(status.state) : "—"}
                             </div>
                           </div>
@@ -924,7 +927,7 @@ export function SkillAgentMatrix({
                 </div>
 
                 <div className="rounded-md border p-3">
-                  <div className="text-[11px] text-muted-foreground mb-2">
+                  <div className="text-2xs text-muted-foreground mb-2">
                     {t("detail.preview")}
                   </div>
                   {detailLoading ? (
@@ -935,7 +938,7 @@ export function SkillAgentMatrix({
                   ) : (
                     <div
                       className={cn(
-                        "text-sm leading-6 rounded-md bg-muted/10 p-3 overflow-auto max-h-[480px]",
+                        "text-sm leading-6 rounded-md bg-muted/10 p-3 overflow-auto max-h-[30rem]",
                         "[&_h1]:text-xl [&_h1]:font-semibold [&_h1]:mb-3",
                         "[&_h2]:text-lg [&_h2]:font-semibold [&_h2]:mt-5 [&_h2]:mb-2",
                         "[&_h3]:text-base [&_h3]:font-semibold [&_h3]:mt-4 [&_h3]:mb-2",
@@ -954,8 +957,8 @@ export function SkillAgentMatrix({
               </div>
             </>
           )}
-        </SheetContent>
-      </Sheet>
+        </DrawerContent>
+      </Drawer>
     </TooltipProvider>
   )
 }
@@ -976,7 +979,7 @@ function CategoryGroup({
       <tr>
         <td
           colSpan={colSpan}
-          className="sticky left-0 bg-muted/30 border-y px-2 py-1 text-[11px] uppercase tracking-wide font-semibold text-muted-foreground"
+          className="sticky left-0 bg-muted/30 border-y px-2 py-1 text-2xs uppercase tracking-wide font-semibold text-muted-foreground"
         >
           {label}
         </td>

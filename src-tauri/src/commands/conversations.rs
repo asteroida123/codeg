@@ -10,24 +10,13 @@ use crate::db::service::{conversation_service, folder_service, import_service, t
 #[cfg(feature = "tauri-runtime")]
 use crate::db::AppDatabase;
 use crate::models::*;
-use crate::parsers::acp_native::AcpNativeParser;
-use crate::parsers::claude::ClaudeParser;
-use crate::parsers::cline::ClineParser;
-use crate::parsers::codebuddy::CodeBuddyParser;
+// Concrete parser type only for `load_thread_name_index`, which is codex's own
+// index reader and not part of the `AgentParser` trait. Every history read goes
+// through `build_agent_parser`.
 use crate::parsers::codex::CodexParser;
-use crate::parsers::deepseek::DeepSeekParser;
-use crate::parsers::qoder::QoderParser;
-use crate::parsers::gemini::GeminiParser;
-use crate::parsers::cursor::CursorParser;
-use crate::parsers::grok::GrokParser;
-use crate::parsers::hermes::HermesParser;
-use crate::parsers::kimi_code::KimiCodeParser;
-use crate::parsers::pi::PiParser;
-use crate::parsers::openclaw::OpenClawParser;
-use crate::parsers::opencode::OpenCodeParser;
 use crate::parsers::{
-    folder_name_from_path, normalize_path_for_matching, path_eq_for_matching, AgentParser,
-    ParseError,
+    build_agent_parser, folder_name_from_path, normalize_path_for_matching, path_eq_for_matching,
+    AgentParser, ParseError,
 };
 use crate::web::event_bridge::{
     emit_event, ConversationChange, ConversationsBulkChanged, EventEmitter, ImportScanProgress,
@@ -235,26 +224,18 @@ fn list_conversations_sync(
     let mut all_conversations = Vec::new();
     let mut seen_keys = HashSet::new();
 
-    let mut parsers: Vec<(AgentType, Box<dyn AgentParser>)> = vec![
-        (AgentType::ClaudeCode, Box::new(ClaudeParser::new())),
-        (AgentType::Codex, Box::new(CodexParser::new())),
-        (AgentType::OpenCode, Box::new(OpenCodeParser::new())),
-        (AgentType::Gemini, Box::new(GeminiParser::new())),
-        (AgentType::OpenClaw, Box::new(OpenClawParser::new())),
-        (AgentType::Cline, Box::new(ClineParser::new())),
-        (AgentType::Hermes, Box::new(HermesParser::new())),
-        (AgentType::CodeBuddy, Box::new(CodeBuddyParser::new())),
-        (AgentType::KimiCode, Box::new(KimiCodeParser::new())),
-        (AgentType::Pi, Box::new(PiParser::new())),
-        (AgentType::Grok, Box::new(GrokParser::new())),
-        (AgentType::Cursor, Box::new(CursorParser::new())),
-        (AgentType::DeepSeek, Box::new(DeepSeekParser::new())),
-        (AgentType::Qoder, Box::new(QoderParser::new())),
-    ];
+    // BUILTIN_AGENT_TYPES, not `registry::builtin_acp_agents()`: the two differ
+    // in ORDER, and this list's order is the sidebar's tie-break for two
+    // conversations that compare equal on the active sort.
+    let mut parsers: Vec<(AgentType, Box<dyn AgentParser>)> =
+        crate::models::agent::BUILTIN_AGENT_TYPES
+            .iter()
+            .map(|&at| (at, build_agent_parser(at)))
+            .collect();
     // Registered custom agents read back from codeg's own ACP transcripts, so
     // their sessions participate in folder grouping and stats like any other.
     for custom in crate::acp::custom_registry::all() {
-        parsers.push((custom, Box::new(AcpNativeParser::new(custom))));
+        parsers.push((custom, build_agent_parser(custom)));
     }
 
     for (at, parser) in &parsers {
@@ -351,27 +332,7 @@ pub async fn get_conversation(
     conversation_id: String,
 ) -> Result<ConversationDetail, AppCommandError> {
     tokio::task::spawn_blocking(move || -> Result<ConversationDetail, AppCommandError> {
-        let parser: Box<dyn AgentParser> = match agent_type {
-            AgentType::ClaudeCode => Box::new(ClaudeParser::new()),
-            AgentType::Codex => Box::new(CodexParser::new()),
-            AgentType::OpenCode => Box::new(OpenCodeParser::new()),
-            AgentType::Gemini => Box::new(GeminiParser::new()),
-            AgentType::OpenClaw => Box::new(OpenClawParser::new()),
-            AgentType::Cline => Box::new(ClineParser::new()),
-            AgentType::Hermes => Box::new(HermesParser::new()),
-            AgentType::CodeBuddy => Box::new(CodeBuddyParser::new()),
-            AgentType::KimiCode => Box::new(KimiCodeParser::new()),
-            AgentType::Pi => Box::new(PiParser::new()),
-            AgentType::Grok => Box::new(GrokParser::new()),
-            AgentType::Cursor => Box::new(CursorParser::new()),
-            AgentType::DeepSeek => Box::new(DeepSeekParser::new()),
-            AgentType::Qoder => Box::new(QoderParser::new()),
-            // Custom ACP agents have no native store to reverse-engineer;
-            // their history is codeg's own ACP transcript.
-            AgentType::Custom(_) => Box::new(AcpNativeParser::new(agent_type)),
-        };
-
-        parser
+        build_agent_parser(agent_type)
             .get_conversation(&conversation_id)
             .map_err(parse_error_to_app_error)
     })
@@ -535,6 +496,10 @@ struct ScanFolderRow {
     path: String,
     name: String,
     deleted: bool,
+    /// The root folder this row was registered under, when it is a worktree
+    /// child. Import reconciliation uses it to flatten and validate new parent
+    /// relationships.
+    parent_id: Option<i32>,
 }
 
 async fn load_folder_rows(
@@ -553,6 +518,7 @@ async fn load_folder_rows(
             path: f.path,
             name: f.name,
             deleted: f.deleted_at.is_some(),
+            parent_id: f.parent_id,
         })
         .collect())
 }
@@ -569,6 +535,47 @@ fn index_folder_rows(rows: &[ScanFolderRow]) -> HashMap<String, &ScanFolderRow> 
         }
     }
     index
+}
+
+/// The main working tree an imported session's cwd belongs to, as a
+/// [`normalize_path_for_matching`] key — `None` when the cwd is not a linked git
+/// worktree (a plain repo, a submodule, a directory that is gone), which is
+/// top-level by definition.
+///
+/// Resolving the ROOT rather than a folder id keeps the "is this a worktree"
+/// question separate from "is that repo a folder codeg has", which the importer
+/// answers later and against folders it may not have created yet.
+fn worktree_root_key(path: &str) -> Option<String> {
+    let root = crate::git_repo::main_worktree_root(std::path::Path::new(path))?;
+    let key = normalize_path_for_matching(&root.to_string_lossy());
+    // Nothing may be its own parent: the sidebar drops a self-parented folder
+    // from the top level and then renders it under itself, i.e. nowhere. Only a
+    // corrupt `commondir` can land here, and the guard costs one compare.
+    (key != normalize_path_for_matching(path)).then_some(key)
+}
+
+/// Normalized path → the candidate root folder id a linked worktree of that
+/// path should hang off. Seeded from the folder rows on disk; the importer adds
+/// the folders it creates as it goes. The write side separately verifies that
+/// the candidate is still a live top-level row.
+///
+/// The id is FLATTENED the way `open_worktree_folder_core` flattens: a repo
+/// folder that is itself recorded as somebody's worktree child hands down its
+/// own root. A two-level chain would be worse than no grouping at all — the
+/// sidebar's worktree merge is single-level, so a grandchild's conversations
+/// bucket under a folder that is itself merged away and stop rendering.
+///
+/// Soft-deleted rows are left out: a deleted repo renders nowhere, and a child
+/// of it would render nowhere either, which is worse than the top-level folder
+/// the user gets today.
+fn worktree_parent_folder_ids(
+    folder_index: &HashMap<String, &ScanFolderRow>,
+) -> HashMap<String, i32> {
+    folder_index
+        .iter()
+        .filter(|(_, row)| !row.deleted)
+        .map(|(key, row)| (key.clone(), row.parent_id.unwrap_or(row.id)))
+        .collect()
 }
 
 /// Pure grouping/reconciliation for the import-picker scan.
@@ -827,6 +834,7 @@ pub(crate) async fn import_selected_from_summaries(
         imported: 0,
         updated: 0,
         skipped: 0,
+        restored: 0,
         not_found,
         failed: 0,
         created_folders: 0,
@@ -835,42 +843,174 @@ pub(crate) async fn import_selected_from_summaries(
     };
     let mut touched_folder_ids: Vec<i32> = Vec::new();
 
-    // Deterministic folder order (normalized path) so results and tests are
-    // stable regardless of HashMap iteration.
-    let mut ordered: Vec<(String, Vec<(AgentType, ConversationSummary)>)> =
-        groups.into_iter().collect();
-    ordered.sort_by(|a, b| a.0.cmp(&b.0));
+    // Resolve every group's target path and worktree root BEFORE importing any
+    // of them, so the order they are imported in can depend on it.
+    struct PendingImport {
+        norm_key: String,
+        target_path: String,
+        created: bool,
+        /// The main working tree of this cwd, when it is a linked worktree —
+        /// a normalized path, not yet a folder id (see [`worktree_root_key`]).
+        root_key: Option<String>,
+        items: Vec<(AgentType, ConversationSummary)>,
+    }
 
-    for (norm_key, items) in ordered {
-        let row = folder_index.get(&norm_key).copied();
-        // Import into the stored row's exact path when one normalize-matches
-        // (see build_scan_result); otherwise the parser cwd creates the folder.
-        let target_path = row.map(|r| r.path.clone()).unwrap_or_else(|| {
-            items[0]
-                .1
-                .folder_path
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or_default()
-                .to_string()
-        });
-        let created = row.map(|r| r.deleted).unwrap_or(true);
+    let mut ordered: Vec<PendingImport> = groups
+        .into_iter()
+        .map(|(norm_key, items)| {
+            let row = folder_index.get(&norm_key).copied();
+            // Import into the stored row's exact path when one normalize-matches
+            // (see build_scan_result); otherwise the parser cwd creates the folder.
+            let target_path = row.map(|r| r.path.clone()).unwrap_or_else(|| {
+                items[0]
+                    .1
+                    .folder_path
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .to_string()
+            });
+            PendingImport {
+                created: row.map(|r| r.deleted).unwrap_or(true),
+                root_key: worktree_root_key(&target_path),
+                norm_key,
+                target_path,
+                items,
+            }
+        })
+        .collect();
+
+    // Deterministic folder order (normalized path) so results and tests are
+    // stable regardless of HashMap iteration — but every plain folder is
+    // imported BEFORE any linked worktree, so a repo and a worktree of it
+    // selected in the same run still group. One pass suffices, no topological
+    // sort: a main working tree is never itself a linked worktree, so a repo can
+    // never be waiting on another group. Without the split, whether the two end
+    // up grouped would come down to which of their paths sorts first.
+    ordered.sort_by(|a, b| {
+        a.root_key
+            .is_some()
+            .cmp(&b.root_key.is_some())
+            .then_with(|| a.norm_key.cmp(&b.norm_key))
+    });
+    let mut worktree_parents = worktree_parent_folder_ids(&folder_index);
+    // Parent ids are not protected by a foreign key. Restrict new writes to
+    // live top-level rows so a stale/dangling id or a pre-existing parent chain
+    // cannot turn this import into a chain or cycle of its own. Plain folders
+    // selected in this batch join the set after `add_folder` revives them.
+    let mut top_level_parent_ids: HashSet<i32> = folder_rows
+        .iter()
+        .filter(|row| !row.deleted && row.parent_id.is_none())
+        .map(|row| row.id)
+        .collect();
+    // Reparenting a folder that already owns children would make those rows
+    // grandchildren. Track counts through this batch so that operation falls
+    // back to Preserve as well.
+    let mut folder_child_counts: HashMap<i32, usize> = HashMap::new();
+    for row in &folder_rows {
+        if let Some(parent_id) = row.parent_id {
+            *folder_child_counts.entry(parent_id).or_default() += 1;
+        }
+    }
+
+    for pending in ordered {
+        let PendingImport {
+            norm_key,
+            target_path,
+            created,
+            root_key,
+            items,
+        } = pending;
 
         // `add_folder` is the only fallible step here — `import_summaries` is
         // resilient (per-row failures are counted, never aborting the group), so
         // a partial failure still commits and reports its good rows and still
         // broadcasts the folder it created.
-        match folder_service::add_folder(conn, &target_path)
-            .await
-            .map_err(AppCommandError::from)
-        {
+        //
+        // A cwd that is a linked worktree of a repo codeg has goes in as a CHILD
+        // of that repo, the way `open_worktree_folder_core` records one. Plain
+        // `add_folder` leaves `parent_id` NULL, which is exactly the sidebar's
+        // test for "top-level folder", so the same worktree lands beside its
+        // repo instead of under it (and the branch-label backfill, which selects
+        // on `parent_id IS NOT NULL`, never reaches it). Falling back to
+        // `add_folder` when nothing resolves keeps `ParentWrite::Preserve` for
+        // every other case, so a reopen can never demote a folder that a
+        // worktree open already parented. See issue #552.
+        let target_row = folder_index.get(&norm_key).copied();
+        let target_folder_id = target_row.map(|row| row.id);
+        let existing_parent_id = target_row.and_then(|row| row.parent_id);
+        let target_has_children = target_folder_id.is_some_and(|folder_id| {
+            folder_child_counts.get(&folder_id).copied().unwrap_or(0) > 0
+        });
+        let parent_id = root_key
+            .as_ref()
+            .and_then(|key| worktree_parents.get(key).copied())
+            // A historical top-level worktree can have its main-tree row
+            // recorded underneath it. Flattening through that row points back
+            // at the worktree's own folder id even though their PATHS differ,
+            // so the path-level guard in `worktree_root_key` cannot catch it.
+            .filter(|parent_id| Some(*parent_id) != target_folder_id)
+            .filter(|parent_id| top_level_parent_ids.contains(parent_id))
+            // Moving an existing parent under the repo would strand its current
+            // children one level deeper. Rewriting the same established edge is
+            // harmless; any new edge requires a childless target.
+            .filter(|parent_id| existing_parent_id == Some(*parent_id) || !target_has_children);
+        let add = match parent_id {
+            Some(parent_id) => {
+                folder_service::add_folder_with_parent(conn, &target_path, Some(parent_id)).await
+            }
+            None => folder_service::add_folder(conn, &target_path).await,
+        };
+        match add.map_err(AppCommandError::from) {
             Ok(entry) => {
                 let folder_id = entry.id;
+                // `add_folder_with_parent` sets the resolved parent; the
+                // fallback `add_folder` preserves an existing row's parent and
+                // inserts a new row at the top level. Keep the safety set in
+                // step with that exact persisted state.
+                let persisted_parent_id = parent_id.or(existing_parent_id);
+                if persisted_parent_id != existing_parent_id {
+                    if let Some(old_parent_id) = existing_parent_id {
+                        if let Some(count) = folder_child_counts.get_mut(&old_parent_id) {
+                            *count = count.saturating_sub(1);
+                        }
+                    }
+                    if let Some(new_parent_id) = persisted_parent_id {
+                        *folder_child_counts.entry(new_parent_id).or_default() += 1;
+                    }
+                }
+                if persisted_parent_id.is_none() {
+                    top_level_parent_ids.insert(folder_id);
+                } else {
+                    top_level_parent_ids.remove(&folder_id);
+                }
+                // This folder can now be the repo a LATER group's worktree hangs
+                // off — the sort above put every plain folder ahead of every
+                // worktree precisely so this lands in time. Only plain folders
+                // are recorded: a linked worktree is never anyone's main working
+                // tree. The candidate is flattened by the seed's rule, off the
+                // parent this row actually ended up with.
+                if root_key.is_none() {
+                    let root = persisted_parent_id.unwrap_or(folder_id);
+                    worktree_parents.insert(norm_key, root);
+                }
+                // `DeletedPolicy::Restore`: every item here is a session the
+                // user explicitly checked in the picker, which badges a
+                // soft-deleted row as such — so a deleted one in this list is a
+                // deliberate "bring it back", not a sweep. (The whole-folder
+                // import and the scan's drive-by refresh both stay on `Skip`.)
                 let (tally, _updated_ids, failed_in_group) =
-                    import_service::import_summaries_resilient(conn, folder_id, &items).await;
+                    import_service::import_summaries_resilient(
+                        conn,
+                        folder_id,
+                        &items,
+                        import_service::DeletedPolicy::Restore,
+                    )
+                    .await;
                 result.imported += tally.imported;
                 result.updated += tally.updated;
                 result.skipped += tally.skipped;
+                result.restored += tally.restored;
                 result.failed += failed_in_group;
                 if created {
                     result.created_folders += 1;
@@ -883,6 +1023,7 @@ pub(crate) async fn import_selected_from_summaries(
                     imported: tally.imported,
                     updated: tally.updated,
                     skipped: tally.skipped,
+                    restored: tally.restored,
                 });
                 if failed_in_group > 0 && result.errors.len() < MAX_ERRORS {
                     result
@@ -909,8 +1050,12 @@ pub(crate) async fn import_selected_from_summaries(
     }
 
     // One nudge instead of per-row upserts: clients answer with a single full
-    // refetch, which also covers refreshed titles (see the event's doc).
-    if result.imported > 0 || result.updated > 0 {
+    // refetch, which also covers refreshed titles (see the event's doc) and the
+    // rows this run brought back from a soft delete — a restore adds a row to
+    // every open sidebar just like a fresh import does, so it must fire the
+    // event too. (The counts stay faithful to their own tallies; subscribers
+    // read only the channel and answer with a full refetch.)
+    if result.imported > 0 || result.updated > 0 || result.restored > 0 {
         emit_event(
             emitter,
             CONVERSATIONS_BULK_CHANGED_EVENT,
@@ -958,9 +1103,17 @@ pub async fn import_selected_sessions(
 /// Build the `meta["codeg.delegation"]` value for a delegation child loaded
 /// from the DB. Mirrors the shape produced at runtime by
 /// `acp::delegation::meta_writer::build_delegation_meta`, but only includes
-/// the fields the DB can vouch for: `status` and `child_conversation_id`.
-/// `child_connection_id` is omitted (no live connection for a historical
-/// view; the frontend's parser treats it as optional).
+/// the fields the DB can vouch for: `status`, `child_conversation_id`,
+/// `task_id`, `task_preview` and `agent_type`. `child_connection_id` is
+/// omitted (no live connection for a historical view; the frontend's parser
+/// treats it as optional).
+///
+/// The last three are pure FALLBACKS on the frontend
+/// (`use-delegation-card-model.ts` prefers the parsed `raw_input` and the live
+/// binding), so supplying them can't override a better source. They exist for
+/// the cards that have no better source: a `resume_delegation` call — whose
+/// arguments are only `{task_id, reason}` — and a `delegate_to_agent` call on a
+/// host whose announcements never carry arguments (Cursor).
 ///
 /// Status mapping:
 ///  - `in_progress` → `running` (still streaming or about to)
@@ -990,6 +1143,21 @@ fn build_historical_delegation_meta(child: &DbConversationSummary) -> serde_json
         "child_conversation_id".into(),
         serde_json::Value::Number(child.id.into()),
     );
+    obj.insert(
+        "agent_type".into(),
+        serde_json::Value::String(child.agent_type.as_wire().into_owned()),
+    );
+    if let Some(task_id) = child.delegation_call_id.as_deref() {
+        obj.insert("task_id".into(), serde_json::Value::String(task_id.into()));
+    }
+    // The child row's title was seeded from the original task text — the same
+    // substitute the broker uses for `task_preview` when it resumes a task.
+    if let Some(title) = child.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        obj.insert(
+            "task_preview".into(),
+            serde_json::Value::String(title.into()),
+        );
+    }
     serde_json::Value::Object(obj)
 }
 
@@ -1016,20 +1184,91 @@ fn parse_delegate_task_id(output: &str) -> Option<String> {
     }
 }
 
-/// Walk every `delegate_to_agent` ToolUse block in `turns` and, when it can be
-/// matched to a child conversation in `children`, set `meta["codeg.delegation"]`
-/// to the DB-derived snapshot. Skips blocks whose meta is already populated so
-/// the live-broker write (when present) always wins. Tool-name match is by
-/// substring to cover the MCP-prefixed (`mcp__codeg-mcp__delegate_to_agent`)
-/// and bare forms the host may have emitted.
+/// Descend through wrapper envelopes looking for a `task_id` string. A wrapper
+/// value may itself be a JSON *string* (hosts that stringify nested arguments),
+/// so re-parse those. Depth-capped like the frontend walker.
 ///
-/// Matching is by `parent_tool_use_id` first, then by the broker's task id.
-/// The fallback is what covers codex: its rollout names the call `call_<id>`,
-/// while the broker — which sees the call over the ACP wire, where code mode
-/// renames every inner call — recorded `exec-<uuid>`. The two never meet, so
-/// every codex delegation card lost its `child_conversation_id` and with it the
-/// "查看会话" affordance. The task id round-trips: the broker mirrors it into
-/// `delegation_call_id`, and the ack the model received carries it verbatim.
+/// Shares `acp::lifecycle`'s key list rather than restating it: that list, its
+/// frontend twins in `delegation-card.ts` / `codeg-mcp-tool.ts`, and this
+/// walker must peel the same envelopes, or a card and the meta injected beneath
+/// it disagree about which task a call names.
+fn find_task_id_in_value(value: &serde_json::Value, depth: u8) -> Option<String> {
+    use crate::acp::lifecycle::ARGS_WRAPPER_KEYS;
+
+    if depth > 4 {
+        return None;
+    }
+    if let Some(s) = value.as_str() {
+        let nested: serde_json::Value = serde_json::from_str(s).ok()?;
+        return find_task_id_in_value(&nested, depth + 1);
+    }
+    let obj = value.as_object()?;
+    for key in ARGS_WRAPPER_KEYS {
+        if let Some(inner) = obj.get(key) {
+            if let Some(found) = find_task_id_in_value(inner, depth + 1) {
+                return Some(found);
+            }
+        }
+    }
+    let id = obj.get("task_id")?.as_str()?.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// The `task_id` argument of a `resume_delegation` call, read off the tool
+/// use's serialized arguments (`{"task_id": "...", "reason": "..."}`). Unlike
+/// `delegate_to_agent` — whose id only exists on the RESULT — resume names its
+/// task in the request, so this needs no cross-block correlation.
+///
+/// Two host realities stop a plain `from_str(input)["task_id"]` from finding
+/// it, and both end the same way: no binding, so the reloaded card is stuck on
+/// the `running` its own ack froze and shows no task text — the exact history
+/// gap the resume card exists to close.
+///   * NESTING. CodeBuddy routes MCP calls through `DeferExecuteTool` and
+///     persists `{"toolName": …, "params": {…}}`, deliberately leaving the
+///     wrapper on `input_preview` for readers to peel (see
+///     `parsers::codebuddy::deferred_tool_name`); Antigravity wraps in
+///     `{"arguments": {…}}`.
+///   * TRUNCATION. `input_preview` is a *preview*: parsers cap it (500 chars
+///     for OpenClaw, 2000 for Cline), so a long `reason` leaves the JSON
+///     unparseable even though `task_id` — written first in practice — is
+///     intact in what survived.
+///
+/// So: peel wrappers off well-formed JSON, else fall back to the same tolerant
+/// scan `parse_delegate_task_id` already uses on this file's sibling path. A
+/// scan that guesses wrong is harmless — the id simply matches no child in
+/// `by_task_id` and nothing is injected.
+fn parse_resume_task_id(input: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(input) {
+        if let Some(id) = find_task_id_in_value(&value, 0) {
+            return Some(id);
+        }
+    }
+    parse_delegate_task_id(input)
+}
+
+/// Walk every `delegate_to_agent` / `resume_delegation` ToolUse block in
+/// `turns` and, when it can be matched to a child conversation in `children`,
+/// set `meta["codeg.delegation"]` to the DB-derived snapshot. Skips blocks
+/// whose meta is already populated so the live-broker write (when present)
+/// always wins. Tool-name match is by substring to cover the MCP-prefixed
+/// (`mcp__codeg-mcp__delegate_to_agent`) and bare forms the host may have
+/// emitted.
+///
+/// For `delegate_to_agent`, matching is by `parent_tool_use_id` first, then by
+/// the broker's task id. The fallback is what covers codex: its rollout names
+/// the call `call_<id>`, while the broker — which sees the call over the ACP
+/// wire, where code mode renames every inner call — recorded `exec-<uuid>`. The
+/// two never meet, so every codex delegation card lost its
+/// `child_conversation_id` and with it the "查看会话" affordance. The task id
+/// round-trips: the broker mirrors it into `delegation_call_id`, and the ack the
+/// model received carries it verbatim.
+///
+/// For `resume_delegation` the ONLY key is the task id, taken from the call's
+/// own arguments: a resume never owns a `parent_tool_use_id` (it re-binds to the
+/// ORIGINAL delegate call's id, which belongs to a different block, usually in
+/// an earlier turn). Without this the resumed card would be frozen at the
+/// `running` its ack reported, forever — the child's real outcome landed on the
+/// DB row, not on the resume result.
 fn inject_delegation_meta(turns: &mut [MessageTurn], children: &[DbConversationSummary]) {
     if children.is_empty() {
         return;
@@ -1065,29 +1304,43 @@ fn inject_delegation_meta(turns: &mut [MessageTurn], children: &[DbConversationS
 
     for turn in turns.iter_mut() {
         for block in turn.blocks.iter_mut() {
-            if let ContentBlock::ToolUse {
-                tool_use_id: Some(tu),
+            let ContentBlock::ToolUse {
+                tool_use_id,
                 tool_name,
+                input_preview,
                 meta,
                 ..
             } = block
-            {
-                if meta.is_some() {
+            else {
+                continue;
+            };
+            if meta.is_some() {
+                continue;
+            }
+            let child: Option<&DbConversationSummary> =
+                if tool_name.contains("delegate_to_agent") {
+                    tool_use_id.as_deref().and_then(|tu| {
+                        by_parent_tool_use_id
+                            .get(tu)
+                            .or_else(|| {
+                                task_id_by_call
+                                    .get(tu)
+                                    .and_then(|task_id| by_task_id.get(task_id.as_str()))
+                            })
+                            .copied()
+                    })
+                } else if tool_name.contains("resume_delegation") {
+                    input_preview
+                        .as_deref()
+                        .and_then(parse_resume_task_id)
+                        .and_then(|task_id| by_task_id.get(task_id.as_str()).copied())
+                } else {
                     continue;
-                }
-                if !tool_name.contains("delegate_to_agent") {
-                    continue;
-                }
-                let child = by_parent_tool_use_id.get(tu.as_str()).or_else(|| {
-                    task_id_by_call
-                        .get(tu.as_str())
-                        .and_then(|task_id| by_task_id.get(task_id.as_str()))
-                });
-                if let Some(child) = child {
-                    *meta = Some(serde_json::json!({
-                        "codeg.delegation": build_historical_delegation_meta(child),
-                    }));
-                }
+                };
+            if let Some(child) = child {
+                *meta = Some(serde_json::json!({
+                    "codeg.delegation": build_historical_delegation_meta(child),
+                }));
             }
         }
     }
@@ -1126,23 +1379,7 @@ pub async fn get_folder_conversation_core(
                 .map(|f| f.path),
         };
         tokio::task::spawn_blocking(move || -> Result<_, AppCommandError> {
-            let parser: Box<dyn AgentParser> = match at {
-                AgentType::ClaudeCode => Box::new(ClaudeParser::new()),
-                AgentType::Codex => Box::new(CodexParser::new()),
-                AgentType::OpenCode => Box::new(OpenCodeParser::new()),
-                AgentType::Gemini => Box::new(GeminiParser::new()),
-                AgentType::OpenClaw => Box::new(OpenClawParser::new()),
-                AgentType::Cline => Box::new(ClineParser::new()),
-                AgentType::Hermes => Box::new(HermesParser::new()),
-                AgentType::CodeBuddy => Box::new(CodeBuddyParser::new()),
-                AgentType::KimiCode => Box::new(KimiCodeParser::new()),
-                AgentType::Pi => Box::new(PiParser::new()),
-                AgentType::Grok => Box::new(GrokParser::new()),
-                AgentType::Cursor => Box::new(CursorParser::new()),
-                AgentType::DeepSeek => Box::new(DeepSeekParser::new()),
-                AgentType::Qoder => Box::new(QoderParser::new()),
-                AgentType::Custom(_) => Box::new(AcpNativeParser::new(at)),
-            };
+            let parser = build_agent_parser(at);
             match parser.get_conversation(&eid) {
                 Ok(d) => Ok((
                     d.turns,
@@ -1236,11 +1473,17 @@ pub async fn get_folder_conversation_core(
     // The transcript is the richer source for the session's model. Codex is
     // the concrete case: an ACP-driven row is created before any
     // `turn_context` names a model, so the DB column can stay NULL forever
-    // while the rollout file knows the answer. Fill the *returned* summary
-    // only — the row itself is left alone — so the usage sync's
-    // session-model fallback and the detail view both see it.
-    if summary.model.is_none() {
-        summary.model = parsed_model;
+    // while the rollout file knows the answer.
+    //
+    // The parse WINS over the column rather than merely filling a hole in it.
+    // `seed_model_if_empty` now persists the first model a session is seen
+    // using, so "fill only when NULL" would pin this summary — and with it the
+    // details dialog, which reads `summary.model` ahead of the turns — to that
+    // first value for the life of the conversation, and a mid-session `/model`
+    // switch would never show. The stored value stays as the fallback for a
+    // transcript that names no model at all.
+    if let Some(parsed) = parsed_model.filter(|m| !m.trim().is_empty()) {
+        summary.model = Some(parsed);
     }
 
     // Historical recovery for the read-only sub-agent viewer: JSONL parsers
@@ -1486,6 +1729,11 @@ pub async fn get_folder_conversation_with_live_core(
     // hand. `refresh_auto_title` re-checks the lock and equality, so once the
     // title converges this becomes a cheap no-op on every later turn. The
     // pre-check here just avoids the extra DB round-trip in the common case.
+    //
+    // One upsert for the whole fetch: the title and the model can both land on
+    // the same open, and the sidebar has no use for two broadcasts of the same
+    // row a microsecond apart.
+    let mut upserted = false;
     if !detail.summary.title_locked {
         if let Some(parsed) = parsed_title.as_deref().map(str::trim) {
             if !parsed.is_empty() && detail.summary.title.as_deref() != Some(parsed) {
@@ -1498,7 +1746,7 @@ pub async fn get_folder_conversation_with_live_core(
                 {
                     Ok(true) => {
                         detail.summary.title = Some(parsed.to_string());
-                        emit_conversation_upsert(emitter, conn, conversation_id).await;
+                        upserted = true;
                         chat_channel_manager
                             .sync_conversation_title(conn, conversation_id, parsed)
                             .await;
@@ -1510,6 +1758,25 @@ pub async fn get_folder_conversation_with_live_core(
                 }
             }
         }
+    }
+
+    // Session-model backfill, the sibling of the auto-title above and for the
+    // same reason: the row was inserted before any model was named, and the
+    // sidebar reads the row rather than the transcript this parse just walked.
+    // `seed_model_if_empty` re-checks emptiness in SQL, so once a session has a
+    // model this is a no-op that writes nothing.
+    if let Some(model) = detail.summary.model.clone() {
+        match conversation_service::seed_model_if_empty(conn, conversation_id, &model).await {
+            Ok(true) => upserted = true,
+            Ok(false) => {}
+            Err(e) => tracing::error!(
+                "[conversations] session-model backfill failed for {conversation_id}: {e}"
+            ),
+        }
+    }
+
+    if upserted {
+        emit_conversation_upsert(emitter, conn, conversation_id).await;
     }
 
     if let Some((pending, started_at)) = manager
@@ -1705,6 +1972,20 @@ async fn sync_conversation_title_until_current(
             .await;
         sent = Some(title);
     }
+}
+
+/// Detach a chat-channel title sync so a live title write cannot sit on
+/// Telegram's 60s `editForumTopic` timeout. Callers that already upserted
+/// the sidebar should use this rather than awaiting `sync_conversation_title`.
+pub(crate) fn spawn_sync_conversation_title_until_current(
+    conn: sea_orm::DatabaseConnection,
+    chat_channel_manager: crate::chat_channel::manager::ChatChannelManager,
+    conversation_id: i32,
+) {
+    tokio::spawn(async move {
+        sync_conversation_title_until_current(&conn, &chat_channel_manager, conversation_id)
+            .await;
+    });
 }
 
 /// Broadcast and propagate title changes discovered outside codeg (for
@@ -2316,6 +2597,11 @@ pub async fn delete_conversation_with_cleanup_core(
         emit_conversation_upsert(emitter, conn, parent_id).await;
     }
     cleanup_tabs_for_deleted_conversation(emitter, conn, conversation_id).await;
+    // Canvas references (pinned cards, custom-region memberships) survive the
+    // soft delete for the same reason tabs do — no FK cascade ever fires — so
+    // they get the same explicit scrub, at the same funnel.
+    crate::commands::canvas::cleanup_canvas_for_deleted_conversation(emitter, conn, conversation_id)
+        .await;
     if let Some(folder_id) = folder_id {
         cleanup_chat_folder_for_deleted_conversation(conn, folder_id).await;
     }
@@ -2427,13 +2713,21 @@ mod tests {
     }
 
     fn tool_use_turn(tool_use_id: Option<&str>, tool_name: &str) -> MessageTurn {
+        tool_use_turn_with_input(tool_use_id, tool_name, None)
+    }
+
+    fn tool_use_turn_with_input(
+        tool_use_id: Option<&str>,
+        tool_name: &str,
+        input_preview: Option<&str>,
+    ) -> MessageTurn {
         MessageTurn {
             id: "t1".into(),
             role: TurnRole::Assistant,
             blocks: vec![ContentBlock::ToolUse {
                 tool_use_id: tool_use_id.map(String::from),
                 tool_name: tool_name.into(),
-                input_preview: None,
+                input_preview: input_preview.map(String::from),
                 status: None,
                 meta: None,
             }],
@@ -2442,6 +2736,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
+        agent_message_id: None,
         }
     }
 
@@ -2480,6 +2775,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
+        agent_message_id: None,
         }
     }
 
@@ -2498,6 +2794,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: completed.then_some(ts),
+        agent_message_id: None,
         }
     }
 
@@ -2626,6 +2923,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
+        agent_message_id: None,
         };
         let pending_image = |message_id: &str, data: &str| {
             crate::acp::session_state::PendingUserMessage {
@@ -2755,6 +3053,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
+        agent_message_id: None,
         }
     }
 
@@ -2797,6 +3096,111 @@ mod tests {
         assert!(
             first_block_meta(&turns[0]).is_none(),
             "a different task's child must not be bound"
+        );
+    }
+
+    /// `resume_delegation` names its task in its own ARGUMENTS, and owns no
+    /// `parent_tool_use_id` (it re-binds to the original delegate call's id,
+    /// which lives in an earlier block). Without this injection the resumed
+    /// card would be stuck on the `running` its ack reported, because the
+    /// child's real outcome only ever landed on the DB row.
+    #[test]
+    fn inject_delegation_meta_binds_a_resume_call_by_its_task_id_argument() {
+        let mut turns = vec![tool_use_turn_with_input(
+            Some("tu-resume"),
+            "mcp__codeg-mcp__resume_delegation",
+            Some(r#"{"task_id":"b0858712-9257","reason":"the app was killed"}"#),
+        )];
+        let mut child = summary_child(9, "tu-original-delegate", "completed");
+        child.delegation_call_id = Some("b0858712-9257".into());
+        child.title = Some("Build the /test4 sandbox page".into());
+
+        inject_delegation_meta(&mut turns, &[child]);
+
+        let inner = first_block_meta(&turns[0])
+            .and_then(|m| m.get("codeg.delegation").cloned())
+            .expect("meta should be set");
+        // The CHILD's real status, not the `running` the resume ack froze.
+        assert_eq!(inner["status"], "completed");
+        assert_eq!(inner["child_conversation_id"], 9);
+        assert_eq!(inner["task_id"], "b0858712-9257");
+        assert_eq!(inner["agent_type"], "codex");
+        assert_eq!(inner["task_preview"], "Build the /test4 sandbox page");
+    }
+
+    #[test]
+    fn inject_delegation_meta_does_not_bind_a_resume_call_to_a_foreign_task() {
+        let mut turns = vec![tool_use_turn_with_input(
+            Some("tu-resume"),
+            "resume_delegation",
+            Some(r#"{"task_id":"aaaa"}"#),
+        )];
+        let mut child = summary_child(9, "tu-x", "completed");
+        child.delegation_call_id = Some("bbbb".into());
+
+        inject_delegation_meta(&mut turns, &[child]);
+
+        assert!(
+            first_block_meta(&turns[0]).is_none(),
+            "a different task's child must not be bound to this resume"
+        );
+    }
+
+    #[test]
+    fn parse_resume_task_id_reads_the_argument_object() {
+        assert_eq!(
+            parse_resume_task_id(r#"{"task_id":"abc-123","reason":"crashed"}"#).as_deref(),
+            Some("abc-123")
+        );
+        assert_eq!(parse_resume_task_id(r#"{"task_id":"  "}"#), None);
+        assert_eq!(parse_resume_task_id(r#"{"reason":"crashed"}"#), None);
+        assert_eq!(parse_resume_task_id("not json"), None);
+    }
+
+    /// Hosts don't all persist the bare argument object, and a preview is
+    /// allowed to be cut off. Every shape here reaches `inject_delegation_meta`
+    /// in practice, and each one that fails to yield an id leaves the reloaded
+    /// resume card frozen on its own ack with no task text.
+    #[test]
+    fn parse_resume_task_id_peels_host_wrappers_and_survives_truncation() {
+        // CodeBuddy's DeferExecuteTool wrapper — `parsers::codebuddy` leaves
+        // `params` on `input_preview` on purpose, for readers to peel.
+        assert_eq!(
+            parse_resume_task_id(
+                r#"{"toolName":"mcp__codeg-mcp__resume_delegation","params":{"task_id":"abc-123"}}"#
+            )
+            .as_deref(),
+            Some("abc-123")
+        );
+        // Antigravity's `{"arguments": {...}}`.
+        assert_eq!(
+            parse_resume_task_id(r#"{"arguments":{"task_id":"abc-123","reason":"x"}}"#).as_deref(),
+            Some("abc-123")
+        );
+        // Cursor's `{providerIdentifier, toolName, args}`.
+        assert_eq!(
+            parse_resume_task_id(
+                r#"{"providerIdentifier":"codeg-mcp","toolName":"resume_delegation","args":{"task_id":"abc-123"}}"#
+            )
+            .as_deref(),
+            Some("abc-123")
+        );
+        // …and the same wrapper with the arguments stringified.
+        assert_eq!(
+            parse_resume_task_id(r#"{"arguments":"{\"task_id\":\"abc-123\"}"}"#).as_deref(),
+            Some("abc-123")
+        );
+        // A long `reason` pushes past the parsers' preview cap, so the JSON
+        // never closes — but the id, written first, survived.
+        assert_eq!(
+            parse_resume_task_id(r#"{"task_id":"abc-123","reason":"the app was ki"#).as_deref(),
+            Some("abc-123")
+        );
+        // A wrapper key present but carrying something unreadable must not
+        // shadow a usable top-level id.
+        assert_eq!(
+            parse_resume_task_id(r#"{"params":"not json","task_id":"abc-123"}"#).as_deref(),
+            Some("abc-123")
         );
     }
 
@@ -2908,6 +3312,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
+        agent_message_id: None,
         }];
         let children = vec![summary_child(42, "tu-1", "completed")];
         inject_delegation_meta(&mut turns, &children);
@@ -4958,12 +5363,14 @@ mod tests {
                 path: "/tmp/proj/".into(),
                 name: "proj-deleted".into(),
                 deleted: true,
+                parent_id: None,
             },
             ScanFolderRow {
                 id: 2,
                 path: "/tmp/proj".into(),
                 name: "proj".into(),
                 deleted: false,
+                parent_id: None,
             },
         ];
         let summaries = vec![scan_summary(
@@ -4988,6 +5395,7 @@ mod tests {
             path: "/tmp/gone".into(),
             name: "gone".into(),
             deleted: true,
+            parent_id: None,
         }];
         let summaries = vec![scan_summary(
             "s1",
@@ -5058,6 +5466,444 @@ mod tests {
         let convs = conversation::Entity::find().all(&db.conn).await.unwrap();
         assert_eq!(convs.len(), 2);
         assert!(convs.iter().all(|c| c.folder_id == folder_rows[0].id));
+    }
+
+    // A session whose cwd is a linked git worktree of an open repo belongs
+    // UNDER that repo. `parent_id` is exactly the sidebar's test for "worktree
+    // of" versus "one more top-level folder", and the branch-label backfill
+    // selects on it too, so leaving it NULL strands the folder twice. #552.
+    #[tokio::test]
+    async fn batch_import_nests_a_worktree_cwd_under_its_repo() {
+        use sea_orm::EntityTrait;
+        let db = fresh_in_memory_db().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonicalize root");
+        let (repo, worktree) = crate::git_repo::fixture_linked_worktree(&root);
+        let repo_id = seed_folder(&db, &repo.to_string_lossy()).await;
+
+        let summaries = vec![scan_summary(
+            "s1",
+            AgentType::Codex,
+            Some(&worktree.to_string_lossy()),
+            at(0),
+        )];
+        let result = import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            summaries,
+            vec![key_of(AgentType::Codex, "s1")],
+        )
+        .await
+        .expect("batch import");
+
+        assert_eq!(result.imported, 1);
+        let rows = crate::db::entities::folder::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        let worktree_row = rows
+            .iter()
+            .find(|r| r.id != repo_id)
+            .expect("worktree folder row");
+        assert_eq!(
+            worktree_row.parent_id,
+            Some(repo_id),
+            "imported worktree must group under the repo it belongs to"
+        );
+    }
+
+    // Selecting a repo's sessions and one of its worktrees' in the SAME import
+    // is the first-time-import shape, and the repo folder it needs exists by the
+    // time the worktree is written — as long as the two are not imported in
+    // whatever order their paths happen to sort in.
+    #[tokio::test]
+    async fn batch_import_nests_a_worktree_under_a_repo_created_in_the_same_run() {
+        use sea_orm::EntityTrait;
+        let db = fresh_in_memory_db().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonicalize root");
+        let (repo, worktree) = crate::git_repo::fixture_linked_worktree(&root);
+
+        let summaries = vec![
+            scan_summary("s0", AgentType::Codex, Some(&repo.to_string_lossy()), at(0)),
+            scan_summary(
+                "s1",
+                AgentType::Codex,
+                Some(&worktree.to_string_lossy()),
+                at(1),
+            ),
+        ];
+        import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            summaries,
+            vec![
+                key_of(AgentType::Codex, "s0"),
+                key_of(AgentType::Codex, "s1"),
+            ],
+        )
+        .await
+        .expect("batch import");
+
+        let rows = crate::db::entities::folder::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        let repo_row = rows
+            .iter()
+            .find(|r| path_eq_for_matching(&r.path, &repo.to_string_lossy()))
+            .expect("repo folder row");
+        let worktree_row = rows
+            .iter()
+            .find(|r| path_eq_for_matching(&r.path, &worktree.to_string_lossy()))
+            .expect("worktree folder row");
+        assert_eq!(repo_row.parent_id, None);
+        assert_eq!(
+            worktree_row.parent_id,
+            Some(repo_row.id),
+            "a repo created earlier in the same run is still the worktree's repo"
+        );
+    }
+
+    // The repo folder a worktree resolves to can itself be recorded as somebody
+    // else's worktree child (`open_worktree_folder_core` writes that whenever the
+    // branch switcher adopts an unregistered checkout). Hanging off it directly
+    // would build a two-level chain, and the sidebar's merge is single-level: the
+    // grandchild's conversations would bucket under a folder that is itself
+    // merged away, and render nowhere. Flatten, exactly as the worktree open does.
+    #[tokio::test]
+    async fn batch_import_flattens_onto_the_repos_own_root() {
+        use sea_orm::EntityTrait;
+        let db = fresh_in_memory_db().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonicalize root");
+        let (repo, worktree) = crate::git_repo::fixture_linked_worktree(&root);
+        let outer_id = seed_folder(&db, "/tmp/outer-root").await;
+        let repo_id = folder_service::add_folder_with_parent(
+            &db.conn,
+            &repo.to_string_lossy(),
+            Some(outer_id),
+        )
+        .await
+        .expect("seed repo folder")
+        .id;
+
+        let summaries = vec![scan_summary(
+            "s1",
+            AgentType::Codex,
+            Some(&worktree.to_string_lossy()),
+            at(0),
+        )];
+        import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            summaries,
+            vec![key_of(AgentType::Codex, "s1")],
+        )
+        .await
+        .expect("batch import");
+
+        let rows = crate::db::entities::folder::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        let worktree_row = rows
+            .iter()
+            .find(|r| r.id != outer_id && r.id != repo_id)
+            .expect("worktree folder row");
+        assert_eq!(worktree_row.parent_id, Some(outer_id));
+    }
+
+    // Before imported worktrees were grouped, one could exist as a top-level
+    // folder while its main working tree was still unregistered. Navigating
+    // from that worktree to a branch checked out in the main tree then recorded
+    // the main-tree row under the worktree. Flattening through that row points
+    // straight back at the import target's own id; refuse it or the sidebar
+    // filters the self-parented folder out completely.
+    #[tokio::test]
+    async fn batch_import_refuses_a_parent_that_flattens_to_the_target() {
+        use sea_orm::EntityTrait;
+        let db = fresh_in_memory_db().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonicalize root");
+        let (repo, worktree) = crate::git_repo::fixture_linked_worktree(&root);
+        let worktree_id = seed_folder(&db, &worktree.to_string_lossy()).await;
+        let repo_id = folder_service::add_folder_with_parent(
+            &db.conn,
+            &repo.to_string_lossy(),
+            Some(worktree_id),
+        )
+        .await
+        .expect("seed inverted main-tree folder")
+        .id;
+
+        let summaries = vec![scan_summary(
+            "s1",
+            AgentType::Codex,
+            Some(&worktree.to_string_lossy()),
+            at(0),
+        )];
+        let result = import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            summaries,
+            vec![key_of(AgentType::Codex, "s1")],
+        )
+        .await
+        .expect("batch import");
+
+        assert_eq!(result.imported, 1);
+        let worktree_row = crate::db::entities::folder::Entity::find_by_id(worktree_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(worktree_row.parent_id, None);
+        let repo_row = crate::db::entities::folder::Entity::find_by_id(repo_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repo_row.parent_id, Some(worktree_id));
+    }
+
+    // Historical top-level worktrees can also leave a longer inverted chain.
+    // If the main-tree row points at a folder whose own parent is the import
+    // target, using that one-hop "root" would create a two-node cycle. Only an
+    // actual live top-level row is safe to write as a new parent.
+    #[tokio::test]
+    async fn batch_import_refuses_a_flattened_parent_that_is_itself_a_child() {
+        use sea_orm::EntityTrait;
+        let db = fresh_in_memory_db().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonicalize root");
+        let (repo, worktree) = crate::git_repo::fixture_linked_worktree(&root);
+        let worktree_id = seed_folder(&db, &worktree.to_string_lossy()).await;
+        let middle_id = folder_service::add_folder_with_parent(
+            &db.conn,
+            &root.join("middle").to_string_lossy(),
+            Some(worktree_id),
+        )
+        .await
+        .expect("seed middle folder")
+        .id;
+        let repo_id = folder_service::add_folder_with_parent(
+            &db.conn,
+            &repo.to_string_lossy(),
+            Some(middle_id),
+        )
+        .await
+        .expect("seed chained main-tree folder")
+        .id;
+
+        let summaries = vec![scan_summary(
+            "s1",
+            AgentType::Codex,
+            Some(&worktree.to_string_lossy()),
+            at(0),
+        )];
+        import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            summaries,
+            vec![key_of(AgentType::Codex, "s1")],
+        )
+        .await
+        .expect("batch import");
+
+        let worktree_row = crate::db::entities::folder::Entity::find_by_id(worktree_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(worktree_row.parent_id, None);
+        let middle_row = crate::db::entities::folder::Entity::find_by_id(middle_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(middle_row.parent_id, Some(worktree_id));
+        let repo_row = crate::db::entities::folder::Entity::find_by_id(repo_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repo_row.parent_id, Some(middle_id));
+    }
+
+    // A worktree imported before grouping existed may already be acting as the
+    // root for worktrees created from it. Moving that row under the real repo
+    // without moving its children would create a two-level chain and hide the
+    // children's conversations in the single-level sidebar merge.
+    #[tokio::test]
+    async fn batch_import_does_not_reparent_a_folder_that_already_has_children() {
+        use sea_orm::EntityTrait;
+        let db = fresh_in_memory_db().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonicalize root");
+        let (repo, worktree) = crate::git_repo::fixture_linked_worktree(&root);
+        let repo_id = seed_folder(&db, &repo.to_string_lossy()).await;
+        let worktree_id = seed_folder(&db, &worktree.to_string_lossy()).await;
+        let child_id = folder_service::add_folder_with_parent(
+            &db.conn,
+            &root.join("child").to_string_lossy(),
+            Some(worktree_id),
+        )
+        .await
+        .expect("seed existing child")
+        .id;
+
+        let summaries = vec![scan_summary(
+            "s1",
+            AgentType::Codex,
+            Some(&worktree.to_string_lossy()),
+            at(0),
+        )];
+        import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            summaries,
+            vec![key_of(AgentType::Codex, "s1")],
+        )
+        .await
+        .expect("batch import");
+
+        let worktree_row = crate::db::entities::folder::Entity::find_by_id(worktree_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(worktree_row.parent_id, None);
+        let child_row = crate::db::entities::folder::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child_row.parent_id, Some(worktree_id));
+        let repo_row = crate::db::entities::folder::Entity::find_by_id(repo_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repo_row.parent_id, None);
+    }
+
+    // Grouping under a repo codeg has never opened would invent a workspace row
+    // the user did not ask for, so an unknown repo leaves the folder top-level.
+    #[tokio::test]
+    async fn batch_import_leaves_a_worktree_top_level_when_its_repo_is_unopened() {
+        use sea_orm::EntityTrait;
+        let db = fresh_in_memory_db().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonicalize root");
+        let (_repo, worktree) = crate::git_repo::fixture_linked_worktree(&root);
+
+        let summaries = vec![scan_summary(
+            "s1",
+            AgentType::Codex,
+            Some(&worktree.to_string_lossy()),
+            at(0),
+        )];
+        import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            summaries,
+            vec![key_of(AgentType::Codex, "s1")],
+        )
+        .await
+        .expect("batch import");
+
+        let rows = crate::db::entities::folder::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].parent_id, None);
+    }
+
+    // A soft-deleted repo renders nowhere, so a child of it would render
+    // nowhere either. Top-level is the better of the two.
+    #[tokio::test]
+    async fn batch_import_leaves_a_worktree_top_level_when_its_repo_is_deleted() {
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+        let db = fresh_in_memory_db().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonicalize root");
+        let (repo, worktree) = crate::git_repo::fixture_linked_worktree(&root);
+        let repo_id = seed_folder(&db, &repo.to_string_lossy()).await;
+
+        let row = crate::db::entities::folder::Entity::find_by_id(repo_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active = row.into_active_model();
+        active.deleted_at = Set(Some(chrono::Utc::now()));
+        active.is_open = Set(false);
+        active.update(&db.conn).await.unwrap();
+
+        let summaries = vec![scan_summary(
+            "s1",
+            AgentType::Codex,
+            Some(&worktree.to_string_lossy()),
+            at(0),
+        )];
+        import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            summaries,
+            vec![key_of(AgentType::Codex, "s1")],
+        )
+        .await
+        .expect("batch import");
+
+        let rows = crate::db::entities::folder::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        let worktree_row = rows
+            .iter()
+            .find(|r| r.id != repo_id)
+            .expect("worktree folder row");
+        assert_eq!(worktree_row.parent_id, None);
+    }
+
+    // The fallback stays on `add_folder`'s Preserve semantics, so re-importing
+    // into a folder a worktree open already parented cannot demote it, not even
+    // when the directory is gone from disk and resolves to nothing.
+    #[tokio::test]
+    async fn batch_import_preserves_a_recorded_worktree_parent() {
+        use sea_orm::EntityTrait;
+        let db = fresh_in_memory_db().await;
+        let repo_id = seed_folder(&db, "/tmp/proj-repo").await;
+        folder_service::add_folder_with_parent(&db.conn, "/tmp/proj-wt", Some(repo_id))
+            .await
+            .expect("seed worktree folder");
+
+        let summaries = vec![scan_summary(
+            "s1",
+            AgentType::Codex,
+            Some("/tmp/proj-wt"),
+            at(0),
+        )];
+        import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            summaries,
+            vec![key_of(AgentType::Codex, "s1")],
+        )
+        .await
+        .expect("batch import");
+
+        let rows = crate::db::entities::folder::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        let worktree_row = rows
+            .iter()
+            .find(|r| r.path == "/tmp/proj-wt")
+            .expect("worktree folder row");
+        assert_eq!(worktree_row.parent_id, Some(repo_id));
     }
 
     #[tokio::test]
@@ -5182,7 +6028,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_import_never_resurrects_a_deleted_conversation() {
+    async fn batch_import_restores_a_deleted_conversation_in_place() {
         use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter,
             Set};
         let db = fresh_in_memory_db().await;
@@ -5210,10 +6056,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let original_id = row.id;
         let mut active = row.into_active_model();
         active.deleted_at = Set(Some(chrono::Utc::now()));
         active.update(&db.conn).await.unwrap();
 
+        // Deleting a conversation is a soft delete, so re-picking the session
+        // in the import window brings the ORIGINAL row back rather than
+        // inserting a second one — every selection here is a session the user
+        // checked while it was badged "deleted".
         let again = import_selected_from_summaries(
             &db.conn,
             &EventEmitter::Noop,
@@ -5222,15 +6073,64 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(again.imported, 0);
-        assert_eq!(again.skipped, 1);
+        assert_eq!(again.imported, 0, "restored, not re-imported");
+        assert_eq!(again.restored, 1);
+        assert_eq!(again.skipped, 0);
+        assert_eq!(again.folders[0].restored, 1);
 
         let rows = conversation::Entity::find().all(&db.conn).await.unwrap();
+        assert_eq!(rows.len(), 1, "no duplicate row");
+        assert_eq!(rows[0].id, original_id);
+        assert!(rows[0].deleted_at.is_none(), "back in the sidebar");
+    }
+
+    #[tokio::test]
+    async fn whole_folder_import_still_never_resurrects_a_deleted_conversation() {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter,
+            Set};
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/proj-sweep").await;
+        let items = vec![scan_summary(
+            "s1",
+            AgentType::ClaudeCode,
+            Some("/tmp/proj-sweep"),
+            at(0),
+        )];
+
+        import_service::import_summaries(
+            &db.conn,
+            folder_id,
+            &items,
+            import_service::DeletedPolicy::Skip,
+        )
+        .await
+        .unwrap();
+        let row = conversation::Entity::find()
+            .filter(conversation::Column::ExternalId.eq("s1"))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active = row.into_active_model();
+        active.deleted_at = Set(Some(chrono::Utc::now()));
+        active.update(&db.conn).await.unwrap();
+
+        // The legacy sweep imports a whole FOLDER, not sessions the user picked
+        // one by one, so it must not bring back everything they ever deleted
+        // under it.
+        let (tally, _ids) = import_service::import_summaries(
+            &db.conn,
+            folder_id,
+            &items,
+            import_service::DeletedPolicy::Skip,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tally.restored, 0);
+        assert_eq!(tally.skipped, 1);
+        let rows = conversation::Entity::find().all(&db.conn).await.unwrap();
         assert_eq!(rows.len(), 1);
-        assert!(
-            rows[0].deleted_at.is_some(),
-            "a deleted conversation stays deleted"
-        );
+        assert!(rows[0].deleted_at.is_some(), "stays deleted");
     }
 
     #[tokio::test]
@@ -5368,7 +6268,13 @@ mod tests {
         ];
 
         let (tally, updated_ids, failed) =
-            import_service::import_summaries_resilient(&db.conn, 999_999, &items).await;
+            import_service::import_summaries_resilient(
+                &db.conn,
+                999_999,
+                &items,
+                import_service::DeletedPolicy::Skip,
+            )
+            .await;
         assert_eq!(failed, 2, "both rows fail the folder FK and are counted");
         assert_eq!(tally.imported, 0);
         assert_eq!(tally.updated, 0);
@@ -5378,7 +6284,13 @@ mod tests {
         // not corrupt state or leave a half-open transaction.
         let folder_id = seed_folder(&db, "/tmp/x").await;
         let (tally2, _ids, failed2) =
-            import_service::import_summaries_resilient(&db.conn, folder_id, &items).await;
+            import_service::import_summaries_resilient(
+                &db.conn,
+                folder_id,
+                &items,
+                import_service::DeletedPolicy::Skip,
+            )
+            .await;
         assert_eq!(failed2, 0);
         assert_eq!(tally2.imported, 2);
     }
@@ -5397,9 +6309,14 @@ mod tests {
             at(0),
         )];
         assert!(
-            import_service::import_summaries(&db.conn, 999_999, &items)
-                .await
-                .is_err(),
+            import_service::import_summaries(
+                &db.conn,
+                999_999,
+                &items,
+                import_service::DeletedPolicy::Skip
+            )
+            .await
+            .is_err(),
             "a row FK violation must propagate through the strict importer"
         );
     }

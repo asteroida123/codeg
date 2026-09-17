@@ -12,6 +12,7 @@ pub mod acp_transcript;
 pub use acp::{
     idle_sweep_task, idle_timeout_from_env, lifecycle_subscriber_task, SWEEP_INTERVAL_SECS,
 };
+pub use acp::scratch_dir::scratch_sweep_task;
 pub use network::proxy::init_proxy_from_db;
 mod app_error;
 pub mod app_state;
@@ -20,7 +21,9 @@ pub mod backgrounds;
 pub mod chat_channel;
 pub mod commands;
 pub mod db;
+pub mod deep_link;
 pub mod folder_links;
+pub mod forge;
 pub mod git_credential;
 pub mod git_repo;
 pub mod intern;
@@ -54,6 +57,20 @@ pub fn sweep_acp_binary_trash() {
     crate::acp::binary_cache::sweep_trash();
 }
 
+/// Reclaim per-launch ACP scratch directories left by a previous run — the
+/// crash/force-quit backstop for the in-session sweep. Same contract as
+/// [`sweep_acp_binary_trash`]: safe any time, intended for a detached startup
+/// thread, never panics.
+///
+/// Deletes only directories whose recorded owner is positively confirmed dead
+/// (or is this process and not live — see `acp::scratch_dir`), and never leaves
+/// codeg's own `codeg-acp/` subtree, so a peer codeg instance's work and any
+/// other application's temp files are both out of reach by construction.
+pub fn sweep_acp_scratch_dirs() {
+    crate::acp::scratch_dir::sweep_foreign_orphans();
+    crate::acp::scratch_dir::sweep_own_orphans();
+}
+
 #[cfg(feature = "tauri-runtime")]
 mod tauri_app {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,11 +80,13 @@ mod tauri_app {
     use crate::commands::{
         acp as acp_commands, app_update as app_update_commands,
         automation as automation_commands, background as background_commands, backup,
+        canvas as canvas_commands,
         chat_authoring as chat_authoring_commands, chat_channel as chat_channel_commands,
         conversations,
-        custom_skills as custom_skills_commands, delegation as delegation_commands,
+        custom_skills as custom_skills_commands,
+        deepseek_settings as deepseek_settings_commands, delegation as delegation_commands,
         experts as experts_commands, feedback as feedback_commands, file_io, folder_commands,
-        folder_links, office_tools as office_tools_commands,
+        folder_links, office_tools as office_tools_commands, open_in,
         folders, logging as logging_commands, mcp as mcp_commands,
         model_provider as model_provider_commands, notification, pet as pet_commands, project_boot,
         question as question_commands, quick_messages as quick_messages_commands,
@@ -76,7 +95,7 @@ mod tauri_app {
         session_info as session_info_commands,
         system_settings, terminal as terminal_commands,
         token_usage as token_usage_commands,
-        version_control, windows, work_task as work_task_commands,
+        forge as forge_commands, version_control, windows, work_task as work_task_commands,
         workspace_state as workspace_state_commands,
     };
     use crate::terminal::manager::TerminalManager;
@@ -84,6 +103,110 @@ mod tauri_app {
     use tauri::Manager;
 
     static APP_QUITTING: AtomicBool = AtomicBool::new(false);
+
+    /// Routes one close-button press to hide, exit, or a prompt.
+    ///
+    /// Called with the close already prevented; every branch is responsible
+    /// for what happens instead. The prompt branches must never be able to
+    /// swallow the press: if no dialog can answer it, each falls back to
+    /// acting on its own.
+    ///
+    /// Two things stand behind that, because nothing here can observe whether a
+    /// dialog actually appeared. `main` is built visible and the dialog only
+    /// starts listening once React has mounted in it, so
+    /// [`system_settings::close_prompt_listener_ready`] holds the press back
+    /// until there is something to answer it; and
+    /// [`system_settings::ClosePromptClaim::Expired`] hands the press back if a
+    /// prompt that WAS sent goes unanswered, which is the only defence against
+    /// everything readiness cannot see.
+    fn handle_main_close_request(window: &tauri::Window, label: &str) {
+        use crate::commands::system_settings;
+        use crate::models::CloseWindowBehavior;
+        use tauri::Emitter;
+
+        let app = window.app_handle().clone();
+        let behavior = if windows::can_hide_to_tray() {
+            system_settings::cached_close_behavior()
+        } else {
+            CloseWindowBehavior::Exit
+        };
+
+        // Only asked for once a prompt is actually going to be shown — it
+        // reaps exited children, and the hide path has no business doing that.
+        let running_terminals = |app: &tauri::AppHandle| {
+            app.try_state::<TerminalManager>()
+                .map(|tm| {
+                    let emitter = web::event_bridge::EventEmitter::Tauri(app.clone());
+                    tm.count_live_by_owner_window(label, Some(&emitter))
+                })
+                .unwrap_or(0)
+        };
+
+        let prompt = |mode: &'static str, count: usize| -> bool {
+            if !system_settings::close_prompt_listener_ready() {
+                // Nothing in the main webview is listening yet — it is still
+                // booting, or its JS never came up at all. Emitting anyway
+                // would claim the prompt flag, show no dialog, and leave the
+                // press unanswered: the window would simply not react, and
+                // every later press would be suppressed as a duplicate until
+                // the dialog mounts and clears the flag. Report "could not
+                // prompt" so the caller acts on the preference instead.
+                return false;
+            }
+            match system_settings::try_open_close_prompt() {
+                // A dialog is already up; this press is a duplicate.
+                system_settings::ClosePromptClaim::AlreadyOpen => return true,
+                // The last prompt was never answered, so it never arrived —
+                // readiness said a listener existed and it turned out not to
+                // reach one. Act on the preference instead of sending a second
+                // prompt down the same silent path.
+                system_settings::ClosePromptClaim::Expired => return false,
+                system_settings::ClosePromptClaim::Granted => {}
+            }
+            let payload = system_settings::CloseRequestPayload {
+                mode,
+                running_terminals: count,
+            };
+            // Addressed to `main`, which is where the only listener lives.
+            // Note this is intent, not enforcement: `TauriTransport.subscribe`
+            // registers with `EventTarget::Any`, and Tauri delivers to those
+            // listeners whatever the emit targets. What actually keeps the
+            // prompt out of the pet / settings / pet-panel webviews — which
+            // share the root layout the dialog is mounted in — is the window
+            // label gate inside `CloseRequestDialog`.
+            match window.emit_to(label, system_settings::CLOSE_REQUEST_EVENT, payload) {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!("[close] failed to deliver close prompt: {err}");
+                    system_settings::release_close_prompt();
+                    false
+                }
+            }
+        };
+
+        match behavior {
+            CloseWindowBehavior::Minimize => {
+                let _ = window.hide();
+            }
+            CloseWindowBehavior::Exit => {
+                let count = running_terminals(&app);
+                // Nothing to lose, or the confirmation could not be shown —
+                // either way the pinned choice stands.
+                if count == 0 || !prompt("confirm_terminals", count) {
+                    app.exit(0);
+                }
+            }
+            CloseWindowBehavior::Ask => {
+                let count = running_terminals(&app);
+                if !prompt("ask", count) {
+                    // Fall back to the behavior codeg has always had. Exiting
+                    // on a press the user never got to answer would discard
+                    // work; hiding discards nothing.
+                    let _ = window.hide();
+                }
+            }
+        }
+    }
 
     fn summarize_web_auto_start_error(err: &crate::app_error::AppCommandError) -> String {
         match err
@@ -115,54 +238,201 @@ mod tauri_app {
         });
     }
 
-    /// On Windows, opt-out users can disable WebView2 hardware acceleration to
-    /// work around AMD/Intel GPU driver bugs that produce a black-screen
-    /// webview. The flag is stored in a tiny sidecar file at
-    /// `~/.codeg/preferences.json` so it can be read **before** the Tauri
-    /// builder, plugins, or tokio runtime start — once a tokio worker is alive,
-    /// `std::env::set_var` would race with concurrent `getenv` calls from
-    /// libraries like reqwest/rustls that read `HTTP_PROXY` etc.
+    /// Chromium command line WebView2 appends to its own when launching.
     #[cfg(target_os = "windows")]
-    fn apply_webview2_rendering_override() {
-        // Matches the dominant pattern across the Tauri 2 ecosystem (Dorion,
-        // Seelen-UI, and most production Tauri 2 apps that ship a "disable
-        // hardware acceleration" toggle all use `--disable-gpu`).
-        const DISABLE_GPU_ARGS: [&str; 1] = ["--disable-gpu"];
-        const ENV_KEY: &str = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
+    const WEBVIEW2_ARGS_ENV: &str = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
 
-        let prefs = crate::preferences::load();
-        if !prefs.disable_hardware_acceleration {
+    /// Matches the dominant pattern across the Tauri 2 ecosystem (Dorion,
+    /// Seelen-UI, and most production Tauri 2 apps that ship a "disable
+    /// hardware acceleration" toggle all use `--disable-gpu`).
+    #[cfg(target_os = "windows")]
+    const WEBVIEW2_DISABLE_GPU_ARGS: [&str; 1] = ["--disable-gpu"];
+
+    /// WebKitGTK has no command line — it reads one boolean env var per
+    /// rendering path, and the two that matter fail independently:
+    ///
+    /// - `WEBKIT_DISABLE_DMABUF_RENDERER` drops the DMA-BUF buffer sharing
+    ///   between the web and UI processes (the default since WebKitGTK 2.42).
+    ///   This is the fix for the blank/black window under the proprietary
+    ///   NVIDIA driver.
+    /// - `WEBKIT_DISABLE_COMPOSITING_MODE` turns off accelerated compositing
+    ///   outright, which is what breaks under software GL (llvmpipe) and inside
+    ///   VMs / remote desktops.
+    ///
+    /// Both are set: the user reaching for this toggle has a black screen and
+    /// no way to tell which path is at fault. An unknown variable is inert on
+    /// WebKitGTK builds that no longer read it.
+    #[cfg(target_os = "linux")]
+    const WEBKITGTK_DISABLE_ENVS: [&str; 2] = [
+        "WEBKIT_DISABLE_DMABUF_RENDERER",
+        "WEBKIT_DISABLE_COMPOSITING_MODE",
+    ];
+
+    /// Comma-separated list of the env vars *this* process injected below.
+    ///
+    /// "Restart now" in the settings UI goes through `tauri::process::restart`,
+    /// which spawns the replacement with `Command::new(exe).spawn()` — no
+    /// `env_clear`, so the child inherits everything we set. Without this
+    /// marker an injected override is indistinguishable from one the user
+    /// exported in their shell, and turning the toggle back **off** would never
+    /// take effect: the next launch would read `false`, do nothing, and still
+    /// hand WebKitGTK/WebView2 the inherited flags.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    const RENDERING_OVERRIDE_OWNED_ENV: &str = "CODEG_WEBVIEW_RENDERING_OVERRIDE";
+
+    /// Opt-out users can disable webview hardware acceleration to work around
+    /// GPU driver bugs that produce a black-screen or glitching webview. The
+    /// flag is stored in a tiny sidecar file at `~/.codeg/preferences.json` so
+    /// it can be read **before** anything else in `run()` — `set_var` is only
+    /// sound while the process is single-threaded, and the logging init alone
+    /// spawns a `tracing_appender` worker.
+    ///
+    /// Each webview has its own knob: Windows/WebView2 takes a Chromium command
+    /// line, Linux/WebKitGTK reads boolean env vars. macOS/WKWebView exposes
+    /// neither, so the toggle is hidden there and this function is not compiled.
+    ///
+    /// # Safety
+    ///
+    /// Must be called before any thread is spawned — see
+    /// [`RENDERING_OVERRIDE_OWNED_ENV`] for why it also runs when the toggle is
+    /// off.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    unsafe fn apply_webview_rendering_override() {
+        let owned_raw = std::env::var(RENDERING_OVERRIDE_OWNED_ENV).unwrap_or_default();
+        // What a previous launch of *ours* injected. Anything not listed here
+        // that is already set came from the user and stays untouched.
+        let inherited: Vec<&str> = owned_raw.split(',').filter(|s| !s.is_empty()).collect();
+
+        if !crate::preferences::load().disable_hardware_acceleration {
+            // SAFETY: forwarded from this function's own contract.
+            unsafe { withdraw_webview_rendering_override(&inherited) };
             return;
         }
 
-        let mut tokens: Vec<String> = match std::env::var(ENV_KEY) {
-            Ok(prev) => prev.split_whitespace().map(str::to_string).collect(),
-            Err(_) => Vec::new(),
-        };
-        for arg in DISABLE_GPU_ARGS {
-            if !tokens.iter().any(|t| t == arg) {
-                tokens.push(arg.to_string());
+        // Keys this process now owns: the ones inherited from our own previous
+        // launch plus the ones we set here. Re-published so ownership survives
+        // an arbitrary number of restarts with the toggle left on.
+        let mut owned: Vec<&str> = Vec::new();
+
+        #[cfg(target_os = "windows")]
+        {
+            let ours = inherited.contains(&WEBVIEW2_ARGS_ENV);
+            // Append rather than replace: the variable is a whole command line
+            // the user may already have exported for unrelated reasons.
+            let mut tokens: Vec<String> = match std::env::var(WEBVIEW2_ARGS_ENV) {
+                Ok(prev) => prev.split_whitespace().map(str::to_string).collect(),
+                Err(_) => Vec::new(),
+            };
+            let mut added = false;
+            for arg in WEBVIEW2_DISABLE_GPU_ARGS {
+                if !tokens.iter().any(|t| t == arg) {
+                    tokens.push(arg.to_string());
+                    added = true;
+                }
+            }
+            if added {
+                // SAFETY: forwarded from this function's own contract.
+                unsafe { std::env::set_var(WEBVIEW2_ARGS_ENV, tokens.join(" ")) };
+            }
+            // Claim the variable only if the flag is there because of us. A
+            // user who put `--disable-gpu` in their own command line keeps it
+            // when the toggle goes off.
+            if added || ours {
+                owned.push(WEBVIEW2_ARGS_ENV);
             }
         }
-        // SAFETY: called before any tokio worker or plugin thread spawns, so
-        // no concurrent `getenv` can race. `set_var` is `unsafe` since Rust 1.82.
-        unsafe {
-            std::env::set_var(ENV_KEY, tokens.join(" "));
+
+        #[cfg(target_os = "linux")]
+        {
+            for key in WEBKITGTK_DISABLE_ENVS {
+                // A value the user exported themselves wins — they may have set
+                // it to `0` deliberately on a build where the fallback is worse.
+                if !inherited.contains(&key) && std::env::var_os(key).is_some() {
+                    continue;
+                }
+                // SAFETY: forwarded from this function's own contract.
+                unsafe { std::env::set_var(key, "1") };
+                owned.push(key);
+            }
         }
+
+        // SAFETY: forwarded from this function's own contract.
+        unsafe {
+            if owned.is_empty() {
+                std::env::remove_var(RENDERING_OVERRIDE_OWNED_ENV);
+            } else {
+                std::env::set_var(RENDERING_OVERRIDE_OWNED_ENV, owned.join(","));
+            }
+        }
+    }
+
+    /// Undo the overrides listed in `inherited` — the ones a previous launch of
+    /// ours injected and this process inherited across a restart. Variables the
+    /// user exported are not listed and so are left alone.
+    ///
+    /// # Safety
+    ///
+    /// Same as [`apply_webview_rendering_override`]: single-threaded only.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    unsafe fn withdraw_webview_rendering_override(inherited: &[&str]) {
+        if inherited.is_empty() {
+            return;
+        }
+
+        #[cfg(target_os = "windows")]
+        if inherited.contains(&WEBVIEW2_ARGS_ENV) {
+            // Drop only our own flags; the rest of the command line is the
+            // user's and must survive.
+            let remaining: Vec<String> = std::env::var(WEBVIEW2_ARGS_ENV)
+                .unwrap_or_default()
+                .split_whitespace()
+                .filter(|t| !WEBVIEW2_DISABLE_GPU_ARGS.contains(t))
+                .map(str::to_string)
+                .collect();
+            // SAFETY: forwarded from this function's own contract.
+            unsafe {
+                if remaining.is_empty() {
+                    std::env::remove_var(WEBVIEW2_ARGS_ENV);
+                } else {
+                    std::env::set_var(WEBVIEW2_ARGS_ENV, remaining.join(" "));
+                }
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        for key in WEBKITGTK_DISABLE_ENVS {
+            if inherited.contains(&key) {
+                // SAFETY: forwarded from this function's own contract.
+                unsafe { std::env::remove_var(key) };
+            }
+        }
+
+        // SAFETY: forwarded from this function's own contract.
+        unsafe { std::env::remove_var(RENDERING_OVERRIDE_OWNED_ENV) };
     }
 
     #[cfg_attr(mobile, tauri::mobile_entry_point)]
     pub fn run() {
-        // Install the logging subscriber first so it captures everything from
+        // Ahead of the logging init, which is otherwise the first statement
+        // here: `init_desktop` builds a `tracing_appender::non_blocking` file
+        // writer, and that spawns a worker thread. `set_var` is UB once any
+        // other thread exists, so the rendering override has to run while the
+        // process is still single-threaded — `main()` calls straight into
+        // `run()`, making this the first thing the GUI path does. The cost is
+        // that a `preferences.json` read error here has no subscriber to log
+        // to; it degrades to defaults either way.
+        //
+        // SAFETY: single-threaded as argued above.
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        unsafe {
+            apply_webview_rendering_override()
+        };
+
+        // Install the logging subscriber next so it captures everything from
         // here on. The file appender's logs dir is resolved from env (no DB
         // needed); hold the guard for the whole process so buffered file lines
         // flush on a graceful exit.
         let _log_guard = crate::logging::init::init_desktop();
-
-        // Apply the WebView2 rendering override before *any* tokio worker
-        // exists or any plugin reads the env. See doc comment above.
-        #[cfg(target_os = "windows")]
-        apply_webview2_rendering_override();
 
         if let Err(err) = fix_path_env::fix() {
             tracing::error!("[PATH] fix_path_env failed: {err}");
@@ -181,8 +451,10 @@ mod tauri_app {
         // development. Debug desktop builds use an isolated SQLite file, but
         // they still share other `app.codeg` data-dir artifacts with release.
         #[cfg(not(debug_assertions))]
-        let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            windows::show_main_window(app);
+        let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // Second launches on Windows/Linux carry `codeg://…` on argv.
+            // macOS delivers the same URL via the deep-link plugin instead.
+            crate::deep_link::handle_argv(app, &argv);
         }));
 
         builder
@@ -201,17 +473,53 @@ mod tauri_app {
                     )
                     .build(),
             )
+            .plugin(tauri_plugin_deep_link::init())
             .plugin(tauri_plugin_opener::init())
             .plugin(tauri_plugin_dialog::init())
             .plugin(tauri_plugin_updater::Builder::new().build())
             .plugin(tauri_plugin_process::init())
             .plugin(tauri_plugin_notification::init())
+            // "Launch at login". LaunchAgent rather than AppleScript on macOS:
+            // writing `~/Library/LaunchAgents/codeg.plist` needs no Automation
+            // consent prompt, where scripting System Events does. No extra
+            // startup args — an auto-started codeg is the same app the user
+            // would have launched by hand.
+            //
+            // Nothing rewrites the registration at startup, deliberately. The
+            // entry records an absolute path that no backend re-validates, so a
+            // refresh would repair a moved app — but `is_enabled()` only knows
+            // whether the *file* is there, and the desktop environments disable
+            // an entry in place: GNOME sets `X-GNOME-Autostart-enabled=false`
+            // inside the .desktop file the plugin would overwrite from a fixed
+            // template. Refreshing would therefore silently undo a disable the
+            // user made outside codeg. Re-toggling the setting rewrites the
+            // path, which is the same repair with consent attached.
+            //
+            // Two accepted defects live in `auto-launch`, which this plugin
+            // wraps, and are still unfixed as of its 0.6 line — so there is no
+            // version to upgrade to, and pinning past `auto-launch ^0.5` (what
+            // the plugin requires) would not help:
+            //   * Windows writes the Run value as `{app_path} {args}` with the
+            //     path unquoted. Per-user installs land under
+            //     `C:\Users\<name>\AppData\Local\codeg\`, so a username with a
+            //     space produces the classic unquoted-path value. Windows'
+            //     successive-prefix parsing still resolves it; the residual
+            //     risk is the usual hijack, which already requires the attacker
+            //     to be able to write `C:\Users\<first>.exe`.
+            //   * macOS builds the plist with a bare `<string>{path}</string>`
+            //     and no XML escaping, so an install path containing `&`, `<`
+            //     or `>` yields a malformed plist and autostart silently fails.
+            .plugin(tauri_plugin_autostart::init(
+                tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+                None,
+            ))
             .manage(ConnectionManager::new())
             .manage(TerminalManager::new())
             .manage(ChatChannelManager::new())
             .manage(windows::SettingsWindowState::new())
             .manage(windows::CommitWindowState::new())
             .manage(windows::MergeWindowState::new())
+            .manage(windows::AuxWindowState::new())
             .manage(web::WebServerState::new())
             // Remote-workspace IPC proxy. Routes HTTP / WS for windows
             // opened against a remote codeg-server through Rust so we
@@ -357,9 +665,18 @@ mod tauri_app {
                 // spawned. Anything still locked is left for next startup.
                 std::thread::spawn(|| {
                     let _ = std::panic::catch_unwind(|| {
+                        crate::acp::binary_cache::migrate_legacy_root();
                         crate::sweep_acp_binary_trash();
+                        crate::sweep_acp_scratch_dirs();
                     });
                 });
+
+                // Reclaim scratch directories this process loses track of
+                // mid-session. Its own timer on purpose: the ACP idle sweep is
+                // not spawned at all when `CODEG_ACP_IDLE_TIMEOUT_SECS=0`, and
+                // turning off idle disconnects must not also turn off disk
+                // reclamation on a machine leaking gigabytes per launch.
+                tauri::async_runtime::spawn(crate::scratch_sweep_task());
 
                 // Install bundled expert skills into the central store
                 // (`~/.codeg/skills/`). Runs in the background and does
@@ -428,20 +745,37 @@ mod tauri_app {
                     });
                 }
 
-                // Push the persisted default shell into the ACP terminal
-                // runtime BEFORE any background task that can spawn an agent
-                // (the chat-channel dispatcher below is one). The handle is
-                // read at terminal-create time, so a late seed would only ever
-                // be a narrow race — but "seeded before anything can connect"
-                // is cheap to guarantee here and matches server startup, which
-                // seeds before it binds.
+                // Push the persisted terminal settings into their live
+                // runtimes BEFORE any background task that can spawn an agent
+                // (the chat-channel dispatcher below is one). For the shell
+                // handle a late seed would only ever be a narrow race, since
+                // it is read at terminal-create time; the command-color flag
+                // is read while BUILDING a launch's env, so a late seed there
+                // would silently hand the first agent of the run the wrong
+                // one. "Seeded before anything can connect" covers both, and
+                // matches server startup, which seeds before it binds.
                 {
                     let db_for_shell = app.state::<db::AppDatabase>().conn.clone();
                     let shell_config = app.state::<ConnectionManager>().terminal_shell_config();
                     tauri::async_runtime::block_on(async move {
-                        crate::commands::system_settings::apply_persisted_terminal_shell_config(
+                        crate::commands::system_settings::apply_persisted_terminal_settings(
                             &db_for_shell,
                             &shell_config,
+                        )
+                        .await;
+                    });
+                }
+
+                // Seed the close-behavior atomic. `CloseRequested` is a
+                // synchronous callback that reads the cache, not the database,
+                // so an unseeded cache would serve "ask" to a user who pinned
+                // a choice months ago. Blocking here keeps that impossible
+                // even for a close in the first moments after launch.
+                {
+                    let db_for_close = app.state::<db::AppDatabase>().conn.clone();
+                    tauri::async_runtime::block_on(async move {
+                        crate::commands::system_settings::apply_persisted_close_behavior(
+                            &db_for_close,
                         )
                         .await;
                     });
@@ -466,6 +800,19 @@ mod tauri_app {
                             tracing::info!("[folders] labeled {n} worktree folder(s) by branch");
                         }
                     });
+                }
+
+                // Hand the chat-channel manager to the connection manager
+                // BEFORE the chat background tasks below start accepting
+                // messages: a `/new` that lands first would write its live ACP
+                // title against an `install_chat_channel` that hasn't happened
+                // yet, and skip the topic rename for good (the later
+                // reconciliation passes only sync titles their own conditional
+                // UPDATE wrote, and this one already converged).
+                {
+                    let cm = app.state::<ConnectionManager>();
+                    let ccm = app.state::<ChatChannelManager>();
+                    cm.install_chat_channel(ccm.clone_ref());
                 }
 
                 // Start chat channel background tasks
@@ -657,9 +1004,19 @@ mod tauri_app {
                             ),
                         ),
                     );
+                    // Bind through the service handle rather than a bare
+                    // `listener.run` spawn: it keeps the bind error and the
+                    // accept-loop handle around, which is what lets the
+                    // workspace status indicator report why the broker socket
+                    // is down and rebind it without an app restart.
+                    let service = crate::acp::delegation::service::DelegationService::new(
+                        listener,
+                        socket_path,
+                    );
+                    crate::acp::delegation::service::install(service.clone());
                     tauri::async_runtime::spawn(async move {
-                        if let Err(e) = listener.run(socket_path).await {
-                            tracing::info!("[delegation] listener exited: {e}");
+                        if let Err(e) = service.start().await {
+                            tracing::error!("[delegation] listener failed to start: {e}");
                         }
                     });
                     broker
@@ -765,12 +1122,63 @@ mod tauri_app {
                     tauri::async_runtime::spawn(crate::work_task::run_task_engine(engine));
                 }
 
+                // OS `codeg://` URLs. Register the listener after the DB is
+                // live so a warm-start click can look the conversation up.
+                // Cold-start URLs are also read here and baked into the main
+                // window path — an event emitted before the webview subscribes
+                // would be dropped, but `DeepLinkBootstrap` reads the query.
+                // macOS delivers its launch URL only after this hook returns,
+                // so that path lands on the listener below and is parked for
+                // `take_pending_deep_link` instead.
+                {
+                    use tauri_plugin_deep_link::DeepLinkExt;
+                    let handle = app.handle().clone();
+                    let _ = app.deep_link().on_open_url(move |event| {
+                        let urls: Vec<String> =
+                            event.urls().iter().map(|url| url.to_string()).collect();
+                        crate::deep_link::handle_raw_urls(&handle, &urls);
+                    });
+                    // The Linux bundler writes a `.desktop` whose `Exec` has no
+                    // `%u` field code (tauri#16014), so an installed deb/rpm/
+                    // AppImage is advertised as the `x-scheme-handler/codeg`
+                    // owner but is launched with no argument at all. The
+                    // plugin's own registration writes a handler entry that
+                    // does pass `%u`; on Windows it adds the HKCU class key a
+                    // portable/zip copy never gets from the installer. Debug
+                    // builds are skipped so a dev run cannot steal the scheme
+                    // from the installed app (same reason single-instance is
+                    // release-only above).
+                    #[cfg(all(not(debug_assertions), any(windows, target_os = "linux")))]
+                    if let Err(e) = app.deep_link().register_all() {
+                        tracing::warn!("[deep-link] scheme registration failed: {e}");
+                    }
+                }
+                let startup_urls: Vec<String> = {
+                    use tauri_plugin_deep_link::DeepLinkExt;
+                    app.deep_link()
+                        .get_current()
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|url| url.to_string())
+                        .collect()
+                };
+                let workspace_path = tauri::async_runtime::block_on(
+                    crate::deep_link::startup_workspace_path(
+                        &db::AppDatabase {
+                            conn: app.state::<db::AppDatabase>().conn.clone(),
+                        },
+                        &startup_urls,
+                    ),
+                );
+
                 // Single-window workspace: ensure the main window exists.
                 // Workspace state (open folders, opened tabs, active tab) is
                 // restored by the frontend via `list_open_folder_details` /
                 // `list_opened_tabs` inside the main window.
                 if app.get_webview_window("main").is_none() {
-                    let url = tauri::WebviewUrl::App("workspace".into());
+                    let url = tauri::WebviewUrl::App(workspace_path.into());
                     let builder = tauri::WebviewWindowBuilder::new(app, "main", url)
                         .title("Codeg")
                         .inner_size(1260.0, 860.0)
@@ -875,6 +1283,20 @@ mod tauri_app {
                     }
                 }
 
+                // Stash, push, project boot and the session importer share one
+                // owner map, so this arm matches on the map instead of a list
+                // of label prefixes: a window that never registered an owner
+                // has none to hand back, and `main` never registers one at all.
+                if matches!(
+                    event,
+                    tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+                ) {
+                    let app = window.app_handle();
+                    if let Some(state) = app.try_state::<windows::AuxWindowState>() {
+                        windows::restore_window_after_aux(app, &state, &label);
+                    }
+                }
+
                 if label == "pet"
                     && matches!(
                         event,
@@ -923,31 +1345,28 @@ mod tauri_app {
 
                 if label == "main" {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                        // The close button does one of two things, depending
-                        // on whether the platform can keep the workspace
-                        // recoverable while it's hidden:
+                        // What the close button does is the user's choice
+                        // (`ask` / `minimize` / `exit`), with one platform
+                        // override:
                         //
-                        //   * tray usable (macOS, Windows + tray): WeChat-style
-                        //     hide. App keeps running, tray brings it back.
                         //   * tray not usable (Linux, tray install failed):
-                        //     force a real app exit. Letting only `main`
+                        //     the preference cannot apply. Letting only `main`
                         //     close would orphan the desktop pet and other
                         //     aux windows in a process with no workspace and
                         //     no way to bring it back — `pet` runs with
                         //     `skip_taskbar(true)`, and the single-instance
                         //     callback's `show_main_window` is a no-op once
-                        //     main is destroyed.
+                        //     main is destroyed. So the choice folds to Exit,
+                        //     rather than exiting right here: folding keeps
+                        //     the running-terminal confirmation below on the
+                        //     path for this platform too.
                         //
                         // ExitRequested itself reaches this branch with
                         // APP_QUITTING already set — that's the only path
                         // that should fall through to the cleanup below.
                         if !APP_QUITTING.load(Ordering::Relaxed) {
                             api.prevent_close();
-                            if windows::can_hide_to_tray() {
-                                let _ = window.hide();
-                            } else {
-                                window.app_handle().exit(0);
-                            }
+                            handle_main_close_request(window, &label);
                             return;
                         }
                         let app = window.app_handle();
@@ -998,8 +1417,14 @@ mod tauri_app {
                 folders::resolve_worktree_folder,
                 folders::open_folder_in_workspace,
                 folders::open_folder_by_id,
+                open_in::open_in_code,
                 folders::remove_folder_from_workspace,
-                folders::reorder_folders,
+                folders::list_folder_groups,
+                folders::create_folder_group,
+                folders::update_folder_group,
+                folders::delete_folder_group,
+                folders::apply_sidebar_layout,
+                folders::set_folder_group,
                 folders::update_folder_color,
                 folders::update_folder_alias,
                 folders::update_folder_default_agent,
@@ -1009,6 +1434,14 @@ mod tauri_app {
                 folder_links::rename_folder_link,
                 folder_links::repair_folder_link,
                 folder_links::remove_folder_link,
+                canvas_commands::canvas_list_nodes,
+                canvas_commands::canvas_create_node,
+                canvas_commands::canvas_group_into_region,
+                canvas_commands::canvas_update_node,
+                canvas_commands::canvas_move_nodes,
+                canvas_commands::canvas_detach_member,
+                canvas_commands::canvas_delete_node,
+                canvas_commands::canvas_delete_nodes,
                 folders::add_folder_to_history,
                 folders::remove_folder_from_history,
                 folders::create_folder_directory,
@@ -1041,6 +1474,7 @@ mod tauri_app {
                 folders::git_diff_with_branch,
                 folders::git_show_diff,
                 folders::git_show_file,
+                folders::git_show_file_base64,
                 folders::git_commit,
                 folders::git_rollback_file,
                 folders::git_add_files,
@@ -1117,6 +1551,7 @@ mod tauri_app {
                 windows::close_pet_panel,
                 windows::resize_pet_panel,
                 windows::focus_conversation,
+                crate::deep_link::take_pending_deep_link,
                 windows::update_traffic_light_position,
                 windows::update_appearance_mode,
                 windows::set_tray_locale,
@@ -1142,6 +1577,9 @@ mod tauri_app {
                 background_commands::background_read,
                 background_commands::background_set,
                 background_commands::background_clear,
+                background_commands::background_market_search,
+                background_commands::background_market_asset,
+                background_commands::background_market_download,
                 app_update_commands::app_update_state,
                 app_update_commands::perform_app_update,
                 app_update_commands::restart_app,
@@ -1160,6 +1598,11 @@ mod tauri_app {
                 system_settings::probe_terminal_shell_path,
                 system_settings::get_system_rendering_settings,
                 system_settings::update_system_rendering_settings,
+                system_settings::get_system_autostart_settings,
+                system_settings::update_system_autostart_settings,
+                system_settings::get_system_close_behavior_settings,
+                system_settings::update_system_close_behavior_settings,
+                system_settings::resolve_close_request,
                 logging_commands::get_log_settings,
                 logging_commands::set_log_settings,
                 logging_commands::get_recent_logs,
@@ -1167,6 +1610,9 @@ mod tauri_app {
                 logging_commands::open_logs_dir,
                 delegation_commands::get_delegation_settings,
                 delegation_commands::set_delegation_settings,
+                crate::commands::mcp_service::get_codeg_mcp_service_status,
+                crate::commands::mcp_service::start_codeg_mcp_service,
+                crate::commands::mcp_service::set_codeg_mcp_tool_group,
                 feedback_commands::get_feedback_settings,
                 feedback_commands::set_feedback_settings,
                 feedback_commands::submit_session_feedback,
@@ -1182,6 +1628,8 @@ mod tauri_app {
                 version_control::update_git_settings,
                 version_control::get_github_accounts,
                 version_control::validate_github_token,
+                version_control::validate_gitlab_token,
+                version_control::validate_gitea_token,
                 version_control::update_github_accounts,
                 version_control::save_account_token,
                 version_control::get_account_token,
@@ -1189,6 +1637,7 @@ mod tauri_app {
                 acp_commands::acp_preflight,
                 acp_commands::acp_cursor_auth_status,
                 acp_commands::acp_cursor_list_models,
+                acp_commands::acp_qoder_auth_status,
                 acp_commands::acp_connect,
                 acp_commands::acp_prompt,
                 acp_commands::acp_set_mode,
@@ -1197,6 +1646,7 @@ mod tauri_app {
                 acp_commands::acp_describe_agent_options,
                 acp_commands::acp_cancel,
                 acp_commands::acp_fork,
+                acp_commands::acp_stop_async_task,
                 acp_commands::acp_respond_permission,
                 acp_commands::acp_answer_question,
                 acp_commands::acp_answer_plan_approval,
@@ -1210,6 +1660,8 @@ mod tauri_app {
                 acp_commands::acp_get_agent_status,
                 acp_commands::acp_env_diagnostics,
                 acp_commands::acp_clear_binary_cache,
+                acp_commands::acp_scan_leaked_temp,
+                acp_commands::acp_reclaim_leaked_temp,
                 acp_commands::acp_download_agent_binary,
                 acp_commands::acp_install_uv_tool,
                 acp_commands::acp_detect_agent_local_version,
@@ -1221,9 +1673,16 @@ mod tauri_app {
                 acp_commands::acp_update_hermes_config,
                 acp_commands::acp_update_kimi_code_config,
                 acp_commands::acp_fetch_kimi_models,
+                deepseek_settings_commands::acp_load_deepseek_model_catalog,
+                deepseek_settings_commands::acp_update_deepseek_model_catalog,
                 acp_commands::acp_update_pi_config,
                 acp_commands::acp_load_pi_config,
                 acp_commands::acp_validate_pi_command,
+                acp_commands::acp_sync_antigravity_settings,
+                acp_commands::acp_antigravity_login_start,
+                acp_commands::acp_antigravity_login_finish,
+                acp_commands::acp_antigravity_login_cancel,
+                acp_commands::acp_antigravity_sign_out,
                 acp_commands::acp_pi_project_trust_state,
                 acp_commands::acp_pi_set_project_trust,
                 acp_commands::acp_pi_acknowledge_project_trust,
@@ -1333,6 +1792,7 @@ mod tauri_app {
                 work_task_commands::work_task_cancel,
                 work_task_commands::work_task_merge,
                 work_task_commands::work_task_merge_unqueue,
+                work_task_commands::work_task_deliver_pr,
                 work_task_commands::work_task_complete,
                 work_task_commands::work_task_archive,
                 work_task_commands::work_task_cleanup,
@@ -1346,9 +1806,27 @@ mod tauri_app {
                 work_task_commands::work_task_template_list,
                 work_task_commands::work_task_template_save,
                 work_task_commands::work_task_template_delete,
+                forge_commands::folder_forge_remote,
+                forge_commands::forge_list_issues,
+                forge_commands::forge_tab_count,
+                forge_commands::forge_list_labels,
+                forge_commands::forge_list_comments,
+                forge_commands::forge_create_comment,
+                forge_commands::forge_set_item_state,
+                forge_commands::forge_create_issue,
+                forge_commands::forge_change_detail,
+                forge_commands::forge_change_files,
+                forge_commands::forge_identity,
+                forge_commands::forge_merge_options,
+                forge_commands::forge_merge_change,
+                forge_commands::work_task_create_from_forge,
+                forge_commands::work_task_lookup_by_source,
+                forge_commands::forge_settings_get,
+                forge_commands::forge_settings_set,
                 terminal_commands::terminal_spawn,
                 terminal_commands::terminal_write,
                 terminal_commands::terminal_resize,
+                terminal_commands::terminal_snapshot,
                 terminal_commands::terminal_kill,
                 terminal_commands::terminal_list,
                 mcp_commands::mcp_scan_local,
@@ -1360,13 +1838,20 @@ mod tauri_app {
                 mcp_commands::mcp_set_server_apps,
                 mcp_commands::mcp_remove_server,
                 notification::send_notification,
+                notification::notification_identity,
+                notification::open_system_notification_settings,
                 file_io::save_binary_file,
                 file_io::save_text_file,
                 backup::backup_create,
-                backup::backup_inspect,
+                backup::backup_prepare_source,
+                backup::backup_release_source,
                 backup::backup_scan_external_conflicts,
                 backup::backup_restore_stage,
                 backup::backup_cancel,
+                backup::backup_list_safety_snapshots,
+                backup::backup_rollback,
+                backup::backup_discard_pending,
+                backup::backup_active_agents,
                 chat_channel_commands::list_chat_channels,
                 chat_channel_commands::create_chat_channel,
                 chat_channel_commands::update_chat_channel,

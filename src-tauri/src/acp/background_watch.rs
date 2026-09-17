@@ -37,13 +37,23 @@
 //!   consumed exactly once, so a cron//loop re-fire of the SAME text later
 //!   correctly classifies as out-of-turn).
 //!
+//! * **Session title** — Claude Code's generated name arrives as a dedicated
+//!   `ai-title` transcript record whenever the background summarizer finishes,
+//!   routinely AFTER the turn that triggered it ended. The ACP adapter only
+//!   pulls the name at turn-end (`maybeUpdateSessionTitle`, claude-agent-acp
+//!   0.69.0), so on a short session there is nothing to read yet and no wire
+//!   event ever follows. These bytes are already being tailed, so the records
+//!   are folded here and handed to [`publish_native_title`] — the same path a
+//!   live ACP title takes. Not activity: it rides alongside the activity event
+//!   rather than inside it (see `run_watch`).
+//!
 //! The watcher is connection-scoped on purpose: background work cannot outlive
 //! the agent CLI process, whose lifetime IS the connection's. Poll ticks are
 //! mtime-gated (an unchanged file costs one `stat`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -51,14 +61,16 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use crate::acp::session_state::{background_keepalive_max_age, SessionState};
+use crate::acp::session_title::publish_native_title;
 use crate::acp::types::{AcpEvent, BackgroundSettledInfo, ConnectionStatus};
 use crate::models::agent::AgentType;
 use crate::models::message::MessageTurn;
 use crate::parsers::claude::{
-    capture_tag, find_session_file, group_into_turns, is_meta_message, slash_command_display,
-    task_notification_result_regex, task_notification_status_regex, task_notification_summary_regex,
-    task_notification_task_id_regex, task_notification_tool_use_id_regex, ClaudeRecordAccumulator,
-    BACKGROUND_RESULT_MAX_CHARS, CONTEXT_CONTINUATION_PREFIX,
+    capture_tag, capture_title_record, find_session_file, group_into_turns, is_meta_message,
+    slash_command_display, task_notification_result_regex, task_notification_status_regex,
+    task_notification_summary_regex, task_notification_task_id_regex,
+    task_notification_tool_use_id_regex, ClaudeRecordAccumulator, BACKGROUND_RESULT_MAX_CHARS,
+    CONTEXT_CONTINUATION_PREFIX,
 };
 use crate::parsers::truncate_str;
 use crate::web::event_bridge::{emit_with_state, EventEmitter};
@@ -99,6 +111,41 @@ const MAX_EPISODE_MESSAGES: usize = 512;
 /// hard cap on per-tick work. Double the boundary threshold so normal
 /// boundary rotation always wins for multi-turn episodes.
 const FORCE_ROTATE_MESSAGES: usize = MAX_EPISODE_MESSAGES * 2;
+
+/// How a transcript record supplied its turn-initiating text. Verbatim text
+/// can use the ledger's ordinary prefix match; a slash command reconstructed
+/// from tags needs the narrower command-separator normalization below.
+#[derive(Debug, PartialEq, Eq)]
+enum TurnInitiatorText {
+    Verbatim(String),
+    ReconstructedSlashCommand(String),
+}
+
+impl TurnInitiatorText {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Verbatim(text) | Self::ReconstructedSlashCommand(text) => text,
+        }
+    }
+}
+
+/// Reproduce the one lossy transformation made by [`slash_command_display`]:
+/// whitespace separating the command name from its arguments becomes one
+/// space. Whitespace *inside* the arguments remains byte-for-byte significant.
+fn reconstructed_slash_command_fingerprint(text: &str) -> Option<String> {
+    let text = text.trim();
+    let name_end = text.find(char::is_whitespace).unwrap_or(text.len());
+    let name = &text[..name_end];
+    if !name.starts_with('/') {
+        return None;
+    }
+    let args = text[name_end..].trim();
+    if args.is_empty() {
+        Some(name.to_string())
+    } else {
+        Some(format!("{name} {args}"))
+    }
+}
 
 /// Fingerprints of prompts codeg itself sent on this connection, so the
 /// watcher can tell wire-rendered foreground turns apart from out-of-turn
@@ -153,31 +200,45 @@ impl PromptLedger {
     /// Match `initiator_text` (the transcript turn's initiating user text)
     /// against the unconsumed fingerprints; on match the entry is consumed —
     /// exactly once per sent prompt, so a later same-text autonomous re-fire
-    /// finds no entry and classifies as out-of-turn. The record may carry
-    /// appended wrapper content after the sent text, hence prefix matching.
-    fn consume_matching(&self, initiator_text: &str) -> bool {
-        let text = initiator_text.trim();
+    /// finds no entry and classifies as out-of-turn. A verbatim record may
+    /// carry appended wrapper content after the sent text, hence its prefix
+    /// matching fallback.
+    ///
+    /// A slash command's initiator text is RECONSTRUCTED rather than read back:
+    /// the CLI persists the invocation as command tags, and
+    /// [`slash_command_display`] rebuilds it as `"/name" + ' ' + trimmed args`.
+    /// For that record type only, reproduce the same separator normalization on
+    /// the fingerprint. Normalizing every whitespace run would conflate
+    /// semantically different ordinary prompts and command arguments, risking
+    /// suppression of a genuine out-of-turn turn.
+    fn consume_matching(&self, initiator: &TurnInitiatorText) -> bool {
+        let text = initiator.as_str().trim();
         if text.is_empty() {
             return false;
         }
         let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         entries.retain(|e| e.recorded_at.elapsed() < LEDGER_TTL);
-        if let Some(pos) = entries
-            .iter()
-            .position(|e| text == e.fingerprint || text.starts_with(e.fingerprint.as_str()))
-        {
+        if let Some(pos) = entries.iter().position(|e| match initiator {
+            TurnInitiatorText::Verbatim(_) => {
+                text == e.fingerprint || text.starts_with(e.fingerprint.as_str())
+            }
+            TurnInitiatorText::ReconstructedSlashCommand(_) => {
+                text == e.fingerprint
+                    || reconstructed_slash_command_fingerprint(&e.fingerprint).as_deref()
+                        == Some(text)
+            }
+        }) {
             entries.remove(pos);
             return true;
         }
         false
     }
 
-    /// Fingerprint a bare string. Used for `_session/steering` injections,
-    /// which reach the agent outside `session/prompt` yet still land in the
-    /// transcript as a user record that [`group_into_turns`] reads as the
-    /// start of a turn — one the wire is already rendering, so it must
-    /// classify foreground like any prompt (see the `Steer` arm in
-    /// `connection.rs`).
+    /// Fingerprint a bare string — test convenience over
+    /// [`Self::record_prompt_blocks`]. (The `_session/steering` arm in
+    /// `connection.rs` used to be the production caller; it now records the
+    /// steered blocks directly, since a steered draft can carry attachments.)
+    #[cfg(test)]
     pub(crate) fn record_text(&self, text: &str) {
         self.record_prompt_blocks(&[crate::acp::types::PromptInputBlock::Text {
             text: text.to_string(),
@@ -232,7 +293,7 @@ async fn run_watch(
     // to account, classify, and ledger-consume. A RESUMED session's history
     // predates this instant and is skipped. Baselining blindly at EOF on
     // first discovery used to drop that pre-discovery window: the ack never
-    // registered (no keep-alive/chip) and the first prompt's ledger entry
+    // registered (no keep-alive) and the first prompt's ledger entry
     // lingered, able to swallow a later same-text cron refire.
     let spawn_epoch = std::time::SystemTime::now();
     let mut first_arm_done = false;
@@ -302,6 +363,31 @@ async fn run_watch(
                 continue;
             }
         };
+
+        // Publish a title the transcript just named the session, exactly like
+        // a live ACP one (same skip-cache, same lifecycle write). Deliberately
+        // OUTSIDE the activity emit below: a tick whose tail is nothing but an
+        // `ai-title` record produces no turns, no settlements and no
+        // accounting change, so `tick` correctly returns `None` — which is the
+        // common case for a title generated after the last turn ended.
+        //
+        // Held rather than dropped while the conversation row is still
+        // unbound: unlike a live ACP title there is no resend to COUNT on.
+        // These bytes are read exactly once, and while the CLI does re-emit the
+        // record on its own metadata flushes, nothing guarantees another one
+        // lands after the row binds — a session that ends right there would
+        // keep its first-prompt name.
+        //
+        // Bound to a `let` so the read guard is released before
+        // `publish_native_title` asks for the write lock, and short-circuited
+        // on `pending_title` so a settled session never takes the lock at all.
+        let title_is_publishable =
+            ws.pending_title.is_some() && state.read().await.conversation_id.is_some();
+        if title_is_publishable {
+            if let Some(title) = ws.pending_title.take() {
+                publish_native_title(&state, &emitter, title).await;
+            }
+        }
 
         if let Some(event) = event {
             if let AcpEvent::BackgroundActivity {
@@ -451,6 +537,23 @@ pub(crate) struct WatchState {
     /// they were written before the transcript file was first discovered;
     /// records before it are pre-existing history. Set by `rearm`.
     epoch: Option<std::time::SystemTime>,
+    /// Newest non-empty `custom-title` / `ai-title` value this watch has read
+    /// off the transcript, in the parser's own two slots (`parsers::claude::
+    /// capture_title_record`). Kept separate rather than folded into one
+    /// string so the user's `/rename` keeps winning over a title Claude Code
+    /// generates afterwards, exactly as `parse_conversation_detail` resolves
+    /// the pair over the whole file.
+    ///
+    /// Seeded from the skipped pre-baseline history at arm time
+    /// (`seed_titles_from_history`) precisely because that resolution IS a
+    /// whole-file rule — the two records are appended independently, so the
+    /// tail alone is not enough to resolve them.
+    custom_title: Option<String>,
+    ai_title: Option<String>,
+    /// A resolved title this watch read but has not published yet. Set only
+    /// when a title RECORD actually changed the resolution, so a session with
+    /// a settled name costs nothing per tick.
+    pending_title: Option<String>,
 }
 
 impl WatchState {
@@ -479,6 +582,45 @@ impl WatchState {
             armed_logged: false,
             last_episode_base: 0,
             epoch: None,
+            custom_title: None,
+            ai_title: None,
+            pending_title: None,
+        }
+    }
+
+    /// The session's name as this watch currently understands it: the user's
+    /// own `/rename` first, then Claude Code's generated summary — the same
+    /// precedence `parsers::claude` applies when it resolves the whole file.
+    fn resolved_title(&self) -> Option<String> {
+        self.custom_title.clone().or_else(|| self.ai_title.clone())
+    }
+
+    /// Fold one transcript record into the title slots, queueing the result
+    /// for publication when it changed the resolved name.
+    ///
+    /// Claude Code writes its generated title as a dedicated `ai-title`
+    /// record, and it lands whenever the background summarizer finishes —
+    /// routinely AFTER the turn that triggered it has already ended. The ACP
+    /// adapter only reads the name back at turn-end, so on a short session
+    /// that title is never published and the conversation keeps its
+    /// first-prompt fallback name. The watcher is already tailing these exact
+    /// bytes, so surfacing the record here is what makes the name appear
+    /// while the session is still live instead of on its next detail load.
+    ///
+    /// Only records that carry a title are inspected — everything else costs
+    /// one string compare.
+    fn capture_title(&mut self, value: &serde_json::Value) {
+        let record_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if !matches!(record_type, "custom-title" | "ai-title") {
+            return;
+        }
+        let before = self.resolved_title();
+        capture_title_record(value, record_type, &mut self.custom_title, &mut self.ai_title);
+        let after = self.resolved_title();
+        // `capture_title_record` ignores blank values, so `after` is `None`
+        // only when nothing has ever been captured — never a clear.
+        if after.is_some() && after != before {
+            self.pending_title = after;
         }
     }
 
@@ -656,6 +798,7 @@ impl WatchState {
                             Err(_) => continue,
                         };
                         self.account(&value, &mut settled);
+                        self.capture_title(&value);
                         self.classify_and_feed(&value, ledger, cwd, &mut changed_turns);
                     }
                     if !lines.is_empty() {
@@ -700,23 +843,11 @@ impl WatchState {
         // existing card in-memory from this payload (`resolveBackgroundTask`)
         // rather than issuing the `refetchDetail` it used to — see §3.2.
         // `outstanding`/`watermark` are computed independently and untouched by
-        // this filter, so the sweep-exemption/chip accounting stays accurate.
-        //
-        // Instead of dropping a held-turn settle we TAG it: `wire_visible` marks
-        // a settle whose task belongs to a turn #870 is holding open (its id is
-        // still in `current_turn_launched_ids`), so its reply is already on the
-        // wire. The frontend reads this to skip arming the "syncing results"
-        // hint for such a settle (there's no gap to bridge) — a backend-derived
-        // classification, correct even when this tick reads the settlement after
-        // the turn already fell back to `Connected` (the set isn't cleared until
-        // the next rising edge).
+        // this filter, so the sweep-exemption accounting stays accurate.
         changed_turns.retain(|t| {
             let origin = self.turn_origin_task_ids.remove(&t.id).flatten();
             !matches!(origin, Some(task_id) if self.current_turn_launched_ids.contains(&task_id))
         });
-        for s in settled.iter_mut() {
-            s.wire_visible = self.current_turn_launched_ids.contains(&s.task_id);
-        }
 
         let outstanding = self.tasks.len() as u32;
         let accounting_changed =
@@ -753,8 +884,63 @@ impl WatchState {
             // must see this tick as changed so a baseline that landed BEFORE
             // EOF (pre-discovery records to process) is read immediately, not
             // on the next unrelated append.
+            self.seed_titles_from_history(&f, self.committed);
         }
         self.file = Some(f);
+    }
+
+    /// Fold the title records in the SKIPPED history into the title slots,
+    /// without queueing any of them for publication.
+    ///
+    /// `customTitle ?? aiTitle` is a WHOLE-FILE rule, and Claude Code appends
+    /// the two records INDEPENDENTLY: `/rename` writes a lone `custom-title`,
+    /// the background summarizer writes a lone `ai-title` (verified in the
+    /// 2.1.185 CLI — two separate one-record writers, plus a metadata flush
+    /// that re-emits whichever are set). A session renamed before this watch
+    /// armed therefore keeps its `custom-title` entirely in the history the
+    /// baseline skips, and resolving over the tail alone would let the next
+    /// `ai-title` publish over the user's own name — which the CLI re-emits
+    /// constantly (228 identical copies in one observed transcript), so the
+    /// exposure is not theoretical. Seeding costs one bounded read of the
+    /// prefix, once per arm, on top of the whole-file read
+    /// `baseline_offset_since` just did.
+    ///
+    /// `pending_title` is deliberately untouched: history renders through the
+    /// ordinary detail fetch, which already resolved this same pair over these
+    /// same bytes, so re-publishing it would rename on every reconnect.
+    fn seed_titles_from_history(&mut self, path: &PathBuf, upto: u64) {
+        if upto == 0 {
+            return;
+        }
+        let Ok(file) = std::fs::File::open(path) else {
+            return;
+        };
+        let mut reader = std::io::BufReader::new(file.take(upto));
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            // Mirror the tail reader: a non-UTF-8 (or unparsable) line is
+            // skipped, never fatal to the rest of the scan.
+            let Ok(text) = std::str::from_utf8(&line) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim_end()) else {
+                continue;
+            };
+            let Some(record_type) = value.get("type").and_then(|t| t.as_str()) else {
+                continue;
+            };
+            capture_title_record(
+                &value,
+                record_type,
+                &mut self.custom_title,
+                &mut self.ai_title,
+            );
+        }
     }
 
     /// Read bytes appended since `committed`, returning COMPLETE lines only;
@@ -913,9 +1099,6 @@ impl WatchState {
                                 summary,
                                 tool_use_id,
                                 result,
-                                // Set in `tick()` from `current_turn_launched_ids`
-                                // once the whole batch has been read.
-                                wire_visible: false,
                             });
                         }
                     }
@@ -1007,8 +1190,9 @@ impl WatchState {
             self.foreground_awaiting_reply = false;
         }
 
-        if let Some(initiator_text) = turn_initiator_text(value) {
-            if ledger.consume_matching(&initiator_text) {
+        if let Some(initiator) = turn_initiator_text(value) {
+            let initiator_text = initiator.as_str();
+            if ledger.consume_matching(&initiator) {
                 // A codeg-sent prompt: the wire renders this turn. Close any
                 // open episode first (flush its final state) and go silent.
                 tracing::debug!("[bg-watch] foreground turn matched ledger");
@@ -1027,7 +1211,7 @@ impl WatchState {
             if self.foreground_awaiting_reply
                 && self.foreground_submission_id.is_some()
                 && record_submission_id(value) == self.foreground_submission_id
-                && task_notification_origin_id(&initiator_text).is_none()
+                && task_notification_origin_id(initiator_text).is_none()
             {
                 // Still inside the matched prompt's own submission — command
                 // output, the instruction `/goal` injects, image metadata. None
@@ -1059,7 +1243,7 @@ impl WatchState {
                         self.file.clone().unwrap_or_else(|| PathBuf::from("")),
                     ),
                     emitted_hashes: HashMap::new(),
-                    origin_task_id: task_notification_origin_id(&initiator_text),
+                    origin_task_id: task_notification_origin_id(initiator_text),
                 });
             }
             self.mode = Mode::Background;
@@ -1181,7 +1365,7 @@ fn user_record_text(value: &serde_json::Value) -> Option<String> {
 ///   still rendering it — never a boundary;
 /// * everything else user-typed/injected (real prompts, `<task-notification>`
 ///   records, cron prompts) initiates.
-fn turn_initiator_text(value: &serde_json::Value) -> Option<String> {
+fn turn_initiator_text(value: &serde_json::Value) -> Option<TurnInitiatorText> {
     if value.get("type").and_then(|t| t.as_str()) != Some("user") {
         return None;
     }
@@ -1194,9 +1378,9 @@ fn turn_initiator_text(value: &serde_json::Value) -> Option<String> {
         // A slash command persists as command tags; codeg sent the display
         // form ("/name args"), so match the ledger against that.
         if let Some(display) = slash_command_display(s) {
-            return Some(display);
+            return Some(TurnInitiatorText::ReconstructedSlashCommand(display));
         }
-        return Some(s.to_string());
+        return Some(TurnInitiatorText::Verbatim(s.to_string()));
     }
 
     let arr = content.as_array()?;
@@ -1214,7 +1398,7 @@ fn turn_initiator_text(value: &serde_json::Value) -> Option<String> {
     if text.starts_with(CONTEXT_CONTINUATION_PREFIX) {
         return None;
     }
-    Some(text)
+    Some(TurnInitiatorText::Verbatim(text))
 }
 
 /// The submission a record belongs to. Claude Code stamps every user record it
@@ -1421,6 +1605,17 @@ mod tests {
         format!(
             r#"{{"type":"user","timestamp":"2026-07-07T03:49:00.000Z","uuid":"u-cron","isMeta":true,"userType":"external","message":{{"role":"user","content":"{text}"}}}}"#
         )
+    }
+
+    /// Real-shape generated-title record. Claude Code writes it with NO
+    /// timestamp and no message body (captured from a live transcript).
+    fn ai_title(title: &str) -> String {
+        format!(r#"{{"type":"ai-title","aiTitle":"{title}","sessionId":"s1"}}"#)
+    }
+
+    /// Real-shape user-set title record (`/rename`, `claude -n`, a fork).
+    fn custom_title(title: &str) -> String {
+        format!(r#"{{"type":"custom-title","customTitle":"{title}","sessionId":"s1"}}"#)
     }
 
     fn tick_now(ws: &mut WatchState, ledger: &PromptLedger) -> Option<AcpEvent> {
@@ -1808,6 +2003,85 @@ mod tests {
         );
     }
 
+    /// The command record is the only one the ledger can match, and its
+    /// initiator text is REBUILT from command tags — `slash_command_display`
+    /// joins the name and the trimmed args with a single space, whatever the
+    /// sender typed. The composer inserts a space after a command badge, so a
+    /// sender who types their own lands two, and the rebuilt text no longer
+    /// starts with the fingerprint. That miss leaves the submission window
+    /// unarmed and every following side record classifies out-of-turn, which
+    /// is the same duplicated `/goal` turn as above by a different route.
+    #[test]
+    fn a_command_matches_the_ledger_despite_a_rebuilt_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        let ledger = PromptLedger::shared();
+        // As SENT: two spaces after the command badge.
+        ledger.record_text("/goal  build a test page");
+
+        let mut ws = WatchState::new();
+        ws.session_id = Some("s1".into());
+        ws.epoch = Some(epoch("2020-01-01T00:00:00Z"));
+        ws.adopt_file(path.clone());
+
+        // As PERSISTED: the CLI trims the args, so the display form rebuilds
+        // with one space.
+        let command = r#"{"type":"user","timestamp":"2026-07-07T03:50:00.000Z","uuid":"u-cmd","promptId":"p1","message":{"role":"user","content":"<command-name>/goal</command-name>\n<command-args>build a test page</command-args>"}}"#;
+        let hook = r#"{"type":"user","timestamp":"2026-07-07T03:50:00.200Z","uuid":"u-hook","promptId":"p1","isMeta":true,"userType":"external","message":{"role":"user","content":"A session-scoped Stop hook is now active with condition: build a test page."}}"#;
+        write_lines(&path, &[command, hook, &assistant_text("a1", "On it.")]);
+        let event = tick_prompting(&mut ws, &ledger);
+        assert!(
+            event.is_none() || unpack(event.unwrap()).0.is_empty(),
+            "the wire renders this turn — a rebuilt separator must not turn it \
+             into an overlay copy"
+        );
+    }
+
+    #[test]
+    fn ledger_normalizes_only_a_reconstructed_command_separator() {
+        let ledger = PromptLedger::shared();
+        ledger.record_text("/goal  build  a test page");
+        assert!(
+            !ledger.consume_matching(&TurnInitiatorText::ReconstructedSlashCommand(
+                "/goal build a test page".into()
+            )),
+            "whitespace inside the arguments remains significant"
+        );
+        assert!(
+            ledger.consume_matching(&TurnInitiatorText::ReconstructedSlashCommand(
+                "/goal build  a test page".into()
+            ))
+        );
+        assert!(
+            !ledger.consume_matching(&TurnInitiatorText::ReconstructedSlashCommand(
+                "/goal build  a test page".into()
+            )),
+            "a reconstructed match consumes the entry exactly once"
+        );
+
+        let ledger = PromptLedger::shared();
+        ledger.record_text("build  a test page");
+        assert!(
+            !ledger.consume_matching(&TurnInitiatorText::Verbatim("build a test page".into())),
+            "ordinary prompt whitespace must remain byte-for-byte significant"
+        );
+        assert!(ledger.consume_matching(&TurnInitiatorText::Verbatim("build  a test page".into())));
+
+        let ledger = PromptLedger::shared();
+        ledger.record_text("/goal  build");
+        assert!(
+            !ledger.consume_matching(&TurnInitiatorText::ReconstructedSlashCommand(
+                "/goal builder".into()
+            )),
+            "reconstructed command arguments do not use the verbatim prefix fallback"
+        );
+        assert!(
+            ledger.consume_matching(&TurnInitiatorText::ReconstructedSlashCommand(
+                "/goal build".into()
+            ))
+        );
+    }
+
     /// The window is scoped by SUBMISSION, not by time: an autonomous prompt
     /// that lands in the same interval — after the ledger match, before the
     /// model's first record — carries a different `promptId` and must still
@@ -2127,10 +2401,6 @@ mod tests {
             "settle must carry the launching tool_use_id for the in-memory flip"
         );
         assert_eq!(settled[0].result.as_deref(), Some("Build OK"));
-        assert!(
-            settled[0].wire_visible,
-            "a held-turn task's settle is wire-visible → frontend must not arm the syncing hint"
-        );
     }
 
     /// The exact real-world race that broke a naive "is_prompting right now"
@@ -2176,12 +2446,11 @@ mod tests {
             "must still suppress the overlay for an arbitrarily-delayed read, got {turns:?}"
         );
         assert_eq!(outstanding, 0);
-        // Settle still flows (un-suppressed) so the card can flip; wire_visible
-        // holds even though this tick read it after the falling edge (the set
-        // isn't cleared until the next rising edge).
+        // Settle still flows (un-suppressed) so the card can flip, even though
+        // this tick read it after the falling edge (the set isn't cleared until
+        // the next rising edge).
         assert_eq!(settled.len(), 1);
         assert_eq!(settled[0].tool_use_id.as_deref(), Some("toolu_01"));
-        assert!(settled[0].wire_visible);
     }
 
     /// A turn that ends ABNORMALLY (cancelled, refused, etc — the same
@@ -2228,10 +2497,6 @@ mod tests {
             1,
             "the notification must fire — nothing else will tell the user"
         );
-        assert!(
-            !settled[0].wire_visible,
-            "an abnormally-ended turn released the id → reply not wire-visible, overlay shows it"
-        );
     }
 
     /// A background shell launched while `Prompting` must NOT enter
@@ -2272,10 +2537,6 @@ mod tests {
             settled.len(),
             1,
             "a shell's notification must never be suppressed"
-        );
-        assert!(
-            !settled[0].wire_visible,
-            "a shell is never in the launched set → not wire-visible"
         );
     }
 
@@ -2329,10 +2590,6 @@ mod tests {
         // The settle still flows to re-flip the card for the resumed run.
         assert_eq!(settled.len(), 1);
         assert_eq!(settled[0].tool_use_id.as_deref(), Some("toolu_01"));
-        assert!(
-            settled[0].wire_visible,
-            "the resuming turn holds it open → wire-visible"
-        );
     }
 
     /// A cron//loop autonomous turn has no originating task id at all (its
@@ -2620,9 +2877,11 @@ mod tests {
     fn ledger_prefix_matches_and_consumes_once() {
         let ledger = PromptLedger::shared();
         ledger.record_text("deploy the app");
-        assert!(ledger.consume_matching("deploy the app\n<system-hint>extra</system-hint>"));
+        assert!(ledger.consume_matching(&TurnInitiatorText::Verbatim(
+            "deploy the app\n<system-hint>extra</system-hint>".into()
+        )));
         assert!(
-            !ledger.consume_matching("deploy the app"),
+            !ledger.consume_matching(&TurnInitiatorText::Verbatim("deploy the app".into())),
             "an entry is consumed exactly once"
         );
     }
@@ -2638,11 +2897,15 @@ mod tests {
             serde_json::from_str(&notification("x", "completed")).unwrap();
         assert!(turn_initiator_text(&note)
             .unwrap()
+            .as_str()
             .starts_with("<task-notification>"));
 
         // cron prompt (isMeta + string): initiates with the prompt text.
         let cron: serde_json::Value = serde_json::from_str(&cron_prompt("check weather")).unwrap();
-        assert_eq!(turn_initiator_text(&cron).as_deref(), Some("check weather"));
+        assert_eq!(
+            turn_initiator_text(&cron).as_ref().map(|text| text.as_str()),
+            Some("check weather")
+        );
 
         // context-continuation summary: never a boundary.
         let cont = format!(
@@ -2655,6 +2918,252 @@ mod tests {
         // slash command record matches via its display form.
         let cmd = r#"{"type":"user","uuid":"u-cmd","message":{"role":"user","content":"<command-name>/init</command-name><command-args>now</command-args>"}}"#;
         let cmd: serde_json::Value = serde_json::from_str(cmd).unwrap();
-        assert_eq!(turn_initiator_text(&cmd).as_deref(), Some("/init now"));
+        assert_eq!(
+            turn_initiator_text(&cmd),
+            Some(TurnInitiatorText::ReconstructedSlashCommand(
+                "/init now".into()
+            ))
+        );
+    }
+
+    /// The whole point of reading titles here: Claude Code's background
+    /// summarizer writes `ai-title` AFTER the turn that triggered it has
+    /// ended, and the ACP adapter only reads the name back at turn-end — so on
+    /// a short session nothing ever publishes it. That tail is pure metadata:
+    /// no turns, no settlements, no accounting change, so `tick` returns
+    /// `None`. The title must still come out, which is why `run_watch` takes
+    /// it independently of the activity event.
+    #[test]
+    fn a_title_only_tail_yields_no_activity_event_but_still_surfaces_the_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        write_lines(&path, &[]);
+        let ledger = PromptLedger::shared();
+        let mut ws = WatchState::with_file_for_test("s1", path.clone());
+
+        write_lines(&path, &[&ai_title("Find current vLLM stable release tag")]);
+
+        assert!(
+            tick_now(&mut ws, &ledger).is_none(),
+            "a title record is not background ACTIVITY"
+        );
+        assert_eq!(
+            ws.pending_title.take().as_deref(),
+            Some("Find current vLLM stable release tag")
+        );
+    }
+
+    /// Once taken, the same name must not be re-queued on every later tick —
+    /// each publish walks the state write lock and a DB write.
+    #[test]
+    fn an_unchanged_title_is_queued_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        write_lines(&path, &[]);
+        let ledger = PromptLedger::shared();
+        let mut ws = WatchState::with_file_for_test("s1", path.clone());
+
+        write_lines(&path, &[&ai_title("Fix the login flow")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(ws.pending_title.take().as_deref(), Some("Fix the login flow"));
+
+        // Claude Code re-emits the record; the resolved name did not change.
+        write_lines(&path, &[&ai_title("Fix the login flow")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(ws.pending_title, None);
+
+        // A genuinely new name is queued again.
+        write_lines(&path, &[&ai_title("Fix the signup flow")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(ws.pending_title.take().as_deref(), Some("Fix the signup flow"));
+    }
+
+    /// `customTitle ?? aiTitle` — Claude Code's own precedence, and the one
+    /// `parsers::claude` applies over the whole file. A generated title
+    /// arriving after the user named the session must not take the name back.
+    #[test]
+    fn a_user_set_title_outranks_a_later_generated_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        write_lines(&path, &[]);
+        let ledger = PromptLedger::shared();
+        let mut ws = WatchState::with_file_for_test("s1", path.clone());
+
+        write_lines(&path, &[&custom_title("auth-refactor")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(ws.pending_title.take().as_deref(), Some("auth-refactor"));
+
+        write_lines(&path, &[&ai_title("Concise AI Summary")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(
+            ws.pending_title,
+            None,
+            "the generated title must not displace the user's own name"
+        );
+        assert_eq!(ws.resolved_title().as_deref(), Some("auth-refactor"));
+
+        // A NEW user-set name still wins.
+        write_lines(&path, &[&custom_title("auth-refactor-v2")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(ws.pending_title.take().as_deref(), Some("auth-refactor-v2"));
+    }
+
+    /// Claude Code writes an empty `aiTitle` for trivial sessions. Publishing
+    /// it would rename the conversation to nothing.
+    #[test]
+    fn a_blank_title_record_is_never_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        write_lines(&path, &[]);
+        let ledger = PromptLedger::shared();
+        let mut ws = WatchState::with_file_for_test("s1", path.clone());
+
+        write_lines(&path, &[&ai_title("   ")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(ws.pending_title, None);
+        assert_eq!(ws.resolved_title(), None);
+    }
+
+    /// History before the arm baseline renders through the ordinary detail
+    /// fetch, which resolves the title from the whole file. Re-publishing it
+    /// from here would rename the conversation on every reconnect.
+    #[test]
+    fn a_title_in_pre_baseline_history_is_not_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        write_lines(
+            &path,
+            &[
+                &user_prompt_array("u-old", "old prompt"),
+                &ai_title("Old Session Name"),
+            ],
+        );
+
+        let ledger = PromptLedger::shared();
+        let mut ws = WatchState::new();
+        // Arm with an epoch after the existing records, exactly as `run_watch`
+        // does for a resumed session, and take the real baseline.
+        ws.rearm("s1".to_string(), epoch("2030-01-01T00:00:00Z"));
+        ws.adopt_file(path.clone());
+
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(ws.pending_title, None);
+
+        // A title written from here on IS this watch's to surface.
+        write_lines(&path, &[&ai_title("New Session Name")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(ws.pending_title.take().as_deref(), Some("New Session Name"));
+    }
+
+    /// `customTitle ?? aiTitle` is a WHOLE-FILE rule, but the two records are
+    /// appended independently — `/rename` writes a lone `custom-title`, the
+    /// summarizer a lone `ai-title`. A session renamed BEFORE this watch armed
+    /// keeps its `custom-title` in the skipped history, so resolving over the
+    /// tail alone would let the very next `ai-title` (the CLI re-emits it
+    /// constantly) publish over the user's own name. The arm seeds the slots
+    /// from history to close that.
+    #[test]
+    fn a_pre_baseline_user_title_outranks_a_generated_one_read_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        write_lines(
+            &path,
+            &[
+                &user_prompt_array("u-old", "old prompt"),
+                &custom_title("auth-refactor"),
+            ],
+        );
+
+        let ledger = PromptLedger::shared();
+        let mut ws = WatchState::new();
+        ws.rearm("s1".to_string(), epoch("2030-01-01T00:00:00Z"));
+        ws.adopt_file(path.clone());
+        assert_eq!(
+            ws.resolved_title().as_deref(),
+            Some("auth-refactor"),
+            "the arm must read the name the user already set"
+        );
+        assert_eq!(
+            ws.pending_title, None,
+            "seeding is not a publication — history rides the detail fetch"
+        );
+
+        // Only the GENERATED title lands in this watch's tail.
+        write_lines(&path, &[&ai_title("Concise AI Summary")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(
+            ws.pending_title, None,
+            "a generated title must not take the name back from the user"
+        );
+        assert_eq!(ws.resolved_title().as_deref(), Some("auth-refactor"));
+
+        // A new user-set name still publishes normally.
+        write_lines(&path, &[&custom_title("auth-refactor-v2")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(ws.pending_title.take().as_deref(), Some("auth-refactor-v2"));
+    }
+
+    /// The CLI re-emits the SAME `ai-title` record throughout a session (228
+    /// identical copies in one observed transcript). On a resumed session the
+    /// first one past the baseline is a repeat of what history — and therefore
+    /// the detail fetch, and therefore the row — already holds, so seeding must
+    /// swallow it rather than spend a lifecycle write on a no-op.
+    #[test]
+    fn a_generated_title_already_in_history_is_not_republished() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        write_lines(
+            &path,
+            &[
+                &user_prompt_array("u-old", "old prompt"),
+                &ai_title("Old Session Name"),
+            ],
+        );
+
+        let ledger = PromptLedger::shared();
+        let mut ws = WatchState::new();
+        ws.rearm("s1".to_string(), epoch("2030-01-01T00:00:00Z"));
+        ws.adopt_file(path.clone());
+
+        write_lines(&path, &[&ai_title("Old Session Name")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(ws.pending_title, None);
+
+        // A genuinely NEW generated name is still this watch's to surface.
+        write_lines(&path, &[&ai_title("Renamed By The Summarizer")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(
+            ws.pending_title.take().as_deref(),
+            Some("Renamed By The Summarizer")
+        );
+    }
+
+    /// A brand-new session baselines at offset 0 (its file is created after the
+    /// spawn epoch), so there is no history to seed and the seed must be a
+    /// no-op — the path this PR actually targets stays untouched.
+    #[test]
+    fn seeding_is_a_noop_for_a_fresh_session_whose_whole_file_is_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        write_lines(
+            &path,
+            &[
+                &user_prompt_array("u-new", "first prompt"),
+                &ai_title("Find current vLLM stable release tag"),
+            ],
+        );
+
+        let ledger = PromptLedger::shared();
+        let mut ws = WatchState::new();
+        ws.rearm("s1".to_string(), epoch("2020-01-01T00:00:00Z"));
+        ws.adopt_file(path.clone());
+        assert_eq!(ws.committed, 0, "the whole file belongs to this watch");
+        assert_eq!(ws.resolved_title(), None, "nothing to seed from");
+
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(
+            ws.pending_title.take().as_deref(),
+            Some("Find current vLLM stable release tag")
+        );
     }
 }

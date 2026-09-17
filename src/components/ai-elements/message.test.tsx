@@ -6,11 +6,20 @@ vi.mock("streamdown", () => ({
   Streamdown: ({
     children,
     className,
+    mode,
+    parseIncompleteMarkdown,
   }: {
     children: ReactNode
     className?: string
+    mode?: string
+    parseIncompleteMarkdown?: boolean
   }) => (
-    <div className={className} data-testid="streamdown-root">
+    <div
+      className={className}
+      data-testid="streamdown-root"
+      data-mode={mode}
+      data-parse-incomplete={String(parseIncompleteMarkdown)}
+    >
       {children}
     </div>
   ),
@@ -43,6 +52,42 @@ describe("MessageResponse", () => {
     expect(screen.getByTestId("streamdown-root")).toHaveClass(
       "[&_ol]:list-decimal",
       "[&_ol]:pl-3"
+    )
+  })
+
+  it("keeps finished replies in static mode so remend cannot append leftover * / _", () => {
+    render(
+      <MessageResponse>{"see `tools/dsv4-0731-c1/*` please."}</MessageResponse>
+    )
+
+    const root = screen.getByTestId("streamdown-root")
+    expect(root).toHaveAttribute("data-mode", "static")
+    expect(root).toHaveAttribute("data-parse-incomplete", "false")
+  })
+
+  it("opts the live stream back into remend", () => {
+    render(
+      <MessageResponse mode="streaming" parseIncompleteMarkdown>
+        {"see `tools/dsv4-0731-c1/*` please."}
+      </MessageResponse>
+    )
+
+    const root = screen.getByTestId("streamdown-root")
+    expect(root).toHaveAttribute("data-mode", "streaming")
+    expect(root).toHaveAttribute("data-parse-incomplete", "true")
+  })
+
+  it("re-declares the blockquote rule Streamdown's own classes lose", () => {
+    // Streamdown sets `border-l-4 border-muted-foreground/30 … italic` on
+    // blockquotes from inside node_modules, which Tailwind v4 does not scan — so
+    // those utilities generate no CSS and a quote renders with no rule at all.
+    // Declaring them here (scanned source) is what actually paints them.
+    render(<MessageResponse>{"> quoted"}</MessageResponse>)
+
+    expect(screen.getByTestId("streamdown-root")).toHaveClass(
+      "[&_blockquote]:border-l-2",
+      "[&_blockquote]:border-border",
+      "[&_blockquote]:not-italic"
     )
   })
 })

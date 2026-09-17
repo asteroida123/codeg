@@ -14,9 +14,11 @@ import { BookOpenText } from "lucide-react"
 import type { RichComposerHandle } from "@/components/chat/composer/rich-composer"
 import {
   placeAnchoredPopup,
+  readViewport,
   type PopupPosition,
 } from "@/components/chat/composer/suggestion/popup-position"
 import {
+  buildKnownInvocations,
   commandInvocationToken,
   commandToReference,
   skillToReference,
@@ -25,6 +27,7 @@ import type { ReferenceAttrs } from "@/components/chat/composer/types"
 import { useAgentSkills } from "@/hooks/use-agent-skills"
 import { rankByTextMatch } from "@/lib/fuzzy-text-match"
 import { isImeCompositionKey } from "@/lib/ime-composition"
+import type { KnownInvocations } from "@/lib/invocation-token"
 import { cn } from "@/lib/utils"
 import type {
   AgentSkillItem,
@@ -52,6 +55,9 @@ export interface ComposerInvocations {
   isOpen: boolean
   commands: AvailableCommandInfo[]
   skills: AgentSkillItem[]
+  /** Every invocation this menu could offer, for the composer's `knownInvocations`
+   *  — so seeded / pasted text badges exactly what the menu would insert. */
+  knownInvocations: KnownInvocations
   /** Index into the merged [commands, skills] list. */
   activeIndex: number
   /** Re-evaluate the trigger from the editor's current caret (call on change). */
@@ -132,6 +138,18 @@ export function useComposerInvocations({
       (skill) => skill.id
     )
   }, [isCodex, open, triggerChar, skills, filter])
+
+  // Built from the FULL lists, not the filtered ones: this answers "is there
+  // such a command", which the current query has no say in.
+  const knownInvocations = useMemo(
+    () =>
+      buildKnownInvocations(
+        availableCommands,
+        isCodex ? skills : null,
+        isCodex ? "$" : "/"
+      ),
+    [availableCommands, isCodex, skills]
+  )
 
   const count = commands.length + matchedSkills.length
   // Clamp on read so a shrinking filtered list never points past the end (avoids
@@ -227,6 +245,7 @@ export function useComposerInvocations({
     isOpen: open && count > 0,
     commands,
     skills: matchedSkills,
+    knownInvocations,
     activeIndex,
     detect,
     onKeyDown,
@@ -295,7 +314,7 @@ export function ComposerInvocationsPopup({
         placeAnchoredPopup(
           { left: anchor.left, top: anchor.top, bottom: anchor.bottom },
           { width: anchor.width, height: rect.height },
-          { width: window.innerWidth, height: window.innerHeight },
+          readViewport(),
           { prefer: "below" }
         )
       )
@@ -303,9 +322,18 @@ export function ComposerInvocationsPopup({
     reposition()
     window.addEventListener("resize", reposition)
     window.addEventListener("scroll", reposition, true)
+    // The on-screen keyboard opening is a visual-viewport event and nothing
+    // else — it need not resize the layout viewport — so without these the
+    // panel keeps the geometry it was measured with while the band it has to
+    // fit inside shrinks underneath it.
+    const visual = window.visualViewport ?? null
+    visual?.addEventListener("resize", reposition)
+    visual?.addEventListener("scroll", reposition)
     return () => {
       window.removeEventListener("resize", reposition)
       window.removeEventListener("scroll", reposition, true)
+      visual?.removeEventListener("resize", reposition)
+      visual?.removeEventListener("scroll", reposition)
     }
   }, [inv.isOpen, itemCount, anchorWidth])
 
@@ -340,9 +368,9 @@ export function ComposerInvocationsPopup({
         // Hidden until the first measure positions it (avoids a flash at 0,0).
         visibility: pos ? "visible" : "hidden",
         zIndex: 50,
-        // The panel portals to `body`, and a modal Radix layer (the Dialog or
-        // Sheet hosting the composer) sets `pointer-events: none` on `body` —
-        // only the layer itself is re-enabled. Without this the panel is
+        // The panel portals to `body`, and a modal Radix layer (the Dialog
+        // hosting the composer) sets `pointer-events: none` on `body` — only
+        // the layer itself is re-enabled. Without this the panel is
         // click-dead there and the press lands on the document instead, which
         // the layer reads as an outside press and closes itself. Radix's
         // outside test walks the REACT tree, so a press that does reach the

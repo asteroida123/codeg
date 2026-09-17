@@ -13,8 +13,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { SelectorTooltip } from "@/components/chat/selector-tooltip"
 import { cn } from "@/lib/utils"
-import type { AgentOptionsSnapshot, SessionConfigOptionInfo } from "@/lib/types"
+import type {
+  AgentOptionsSnapshot,
+  AgentType,
+  SessionConfigOptionInfo,
+} from "@/lib/types"
+import { useAgentVocabulary } from "@/hooks/use-agent-vocabulary"
 
 // Picking this clears the override (inherit the agent's own default). Mirrors
 // delegation-agent-defaults.tsx; the codeg prefix avoids colliding with a real
@@ -25,6 +31,10 @@ interface AgentConfigSectionProps {
   /** Probe result, owned by the parent (so a single probe also feeds the `/`
    *  command menu). Null while loading / on error / before the first probe. */
   snapshot: AgentOptionsSnapshot | null
+  /** Which agent the snapshot came from. Only used to localise the agent's own
+   *  mode / option vocabulary (see `lib/agent-label-vocabulary`); optional so a
+   *  caller without it keeps verbatim rendering. */
+  agentType?: AgentType | null
   loading: boolean
   error: string | null
   onReload: () => void
@@ -54,8 +64,10 @@ export function AgentConfigSection({
   onModeChange,
   onConfigChange,
   layout = "stacked",
+  agentType,
 }: AgentConfigSectionProps) {
   const t = useTranslations("Automations")
+  const vocabulary = useAgentVocabulary(agentType)
   const inline = layout === "inline"
 
   if (loading) {
@@ -137,16 +149,17 @@ export function AgentConfigSection({
           allowInherit={!inline}
           currentValue={snapshot.modes.current_mode_id}
           onChange={onModeChange}
-          items={snapshot.modes.available_modes.map((m) => ({
+          items={vocabulary.modes(snapshot.modes.available_modes).map((m) => ({
             value: m.id,
             name: m.name,
+            description: m.description,
           }))}
         />
       ) : null}
       {snapshot.config_options.map((option) => (
         <ConfigOptionRow
           key={option.id}
-          option={option}
+          option={vocabulary.configOption(option)}
           value={configValues[option.id] ?? null}
           inheritLabel={t("inherit")}
           inline={inline}
@@ -251,6 +264,7 @@ export function snapshotLabels(
 // bottom bar; callers supply only the differing <SelectContent>.
 function FieldRow({
   label,
+  description,
   value,
   inline,
   allowInherit,
@@ -259,6 +273,10 @@ function FieldRow({
   children,
 }: {
   label: string
+  /** Secondary line for the inline chip's hover hint — the same subtitle the
+   *  chat composer's chips carry. Inline only: the stacked layout shows its
+   *  label outright and has no hint to hang it off. */
+  description?: string | null
   value: string | null
   inline?: boolean
   /** When false (automations), the "inherit/default" escape hatch is dropped:
@@ -291,28 +309,37 @@ function FieldRow({
           onChange(allowInherit ? (v === DEFAULT_SENTINEL ? null : v) : v)
         }
       >
-        <SelectTrigger
-          size="sm"
-          // The dropped label still rides along for hover/screen readers.
-          aria-label={label}
-          title={inline ? label : undefined}
-          // 24px (not the size="sm" default) is deliberate: inline chips share
-          // the task editor's composer bottom bar with the "+" add-menu button,
-          // which is a `size="icon-xs"` (h-6) Button, and the chat composer's
-          // own selectors are h-6 too (`size="xs"`, session-config-selector).
-          // It takes `data-[size=sm]:h-6` to get there: a bare `h-6` loses to
-          // the trigger's own `data-[size=sm]:h-8`, whose attribute selector is
-          // the more specific rule, and tailwind-merge only drops the base
-          // class when the override carries the same variant. `py-0` sheds the
-          // base padding that a 24px box has no room for.
-          className={
-            inline
-              ? "h-6 w-auto max-w-[12rem] gap-1 border-0 bg-transparent px-1.5 py-0 text-xs text-muted-foreground shadow-none hover:text-foreground data-[size=sm]:h-6"
-              : "w-52"
-          }
+        {/* The dropped label still rides along for hover (`SelectorTooltip`, the
+            same hint the chat composer's chips use) and screen readers
+            (`aria-label`). Stacked keeps its visible <label>, so it passes
+            `null` and renders the trigger bare. A Radix `Select` blocks outside
+            pointer events while open, so no `suppressed` is needed. */}
+        <SelectorTooltip
+          label={inline ? label : null}
+          description={inline ? description : null}
         >
-          <SelectValue />
-        </SelectTrigger>
+          <SelectTrigger
+            size="sm"
+            aria-label={label}
+            // 24px (not the size="sm" default) is deliberate: inline chips
+            // share the task editor's composer bottom bar with the "+" add-menu
+            // button, which is a `size="icon-xs"` (h-6) Button, and the chat
+            // composer's own selectors are h-6 too (`size="xs"`,
+            // session-config-selector). It takes `data-[size=sm]:h-6` to get
+            // there: a bare `h-6` loses to the trigger's own
+            // `data-[size=sm]:h-8`, whose attribute selector is the more
+            // specific rule, and tailwind-merge only drops the base class when
+            // the override carries the same variant. `py-0` sheds the base
+            // padding that a 24px box has no room for.
+            className={
+              inline
+                ? "h-6 w-auto max-w-[12rem] gap-1 border-0 bg-transparent px-1.5 py-0 text-xs text-muted-foreground shadow-none hover:text-foreground data-[size=sm]:h-6"
+                : "w-52"
+            }
+          >
+            <SelectValue />
+          </SelectTrigger>
+        </SelectorTooltip>
         {children}
       </Select>
     </div>
@@ -336,11 +363,15 @@ function FlatSelect({
   allowInherit: boolean
   currentValue?: string | null
   onChange: (v: string | null) => void
-  items: Array<{ value: string; name: string }>
+  items: Array<{ value: string; name: string; description?: string | null }>
 }) {
+  // The chip's hint describes the mode it is currently on, mirroring the chat
+  // composer's mode selector (which hangs the selected mode's blurb off it).
+  const selected = items.find((it) => it.value === (value ?? currentValue))
   return (
     <FieldRow
       label={label}
+      description={selected?.description}
       value={value}
       inline={inline}
       allowInherit={allowInherit}
@@ -352,7 +383,11 @@ function FlatSelect({
           <SelectItem value={DEFAULT_SENTINEL}>{inheritLabel}</SelectItem>
         ) : null}
         {items.map((it) => (
-          <SelectItem key={it.value} value={it.value}>
+          <SelectItem
+            key={it.value}
+            value={it.value}
+            description={it.description}
+          >
             {it.name}
           </SelectItem>
         ))}
@@ -381,6 +416,7 @@ function ConfigOptionRow({
   return (
     <FieldRow
       label={option.name}
+      description={option.description}
       value={value}
       inline={inline}
       allowInherit={allowInherit}
@@ -396,14 +432,22 @@ function ConfigOptionRow({
               <SelectGroup key={g.group}>
                 <SelectLabel>{g.name}</SelectLabel>
                 {g.options.map((it) => (
-                  <SelectItem key={`${g.group}-${it.value}`} value={it.value}>
+                  <SelectItem
+                    key={`${g.group}-${it.value}`}
+                    value={it.value}
+                    description={it.description}
+                  >
                     {it.name}
                   </SelectItem>
                 ))}
               </SelectGroup>
             ))
           : option.kind.options.map((it) => (
-              <SelectItem key={it.value} value={it.value}>
+              <SelectItem
+                key={it.value}
+                value={it.value}
+                description={it.description}
+              >
                 {it.name}
               </SelectItem>
             ))}

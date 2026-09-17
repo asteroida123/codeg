@@ -68,9 +68,13 @@ const FOLDER_TAB_LABEL_KEY: Record<
 // overlay (terminal/aux/settings, plus the native caption on Windows/Linux)
 // floats over the RIGHT edge. Once the panel is too narrow to seat the control
 // left of that reserved region, we swap it for a single icon-button + dropdown.
-const SEGMENTED_TABS_WIDTH = 130
-const TAB_STRIP_GUTTER = 12 // pl-3
-const TAB_STRIP_GAP = 12 // breathing room before the chrome overlay
+// In rem: the control is built from rem-sized triggers and `pl-3` is rem too, so
+// all three grow with the zoom level — as `rightReserve` already does. Pinned at
+// their 100% pixel values the strip would stay expanded at higher zoom levels
+// and slide under the chrome overlay.
+const SEGMENTED_TABS_WIDTH_REM = 8.125 // ~130px @100%
+const TAB_STRIP_GUTTER_REM = 0.75 // pl-3
+const TAB_STRIP_GAP_REM = 0.75 // breathing room before the chrome overlay
 
 /**
  * Whether the top tab strip should collapse into a single dropdown picker.
@@ -78,16 +82,20 @@ const TAB_STRIP_GAP = 12 // breathing room before the chrome overlay
  * `panelWidth` is the aux panel's measured width; `rightReserve` is the fixed
  * width the window-chrome overlay claims on the right (platform-dependent). A
  * zero/unknown width (first paint, before the ResizeObserver fires) never
- * collapses, so the segmented control stays the default until measured. Pure +
+ * collapses, so the segmented control stays the default until measured.
+ *
+ * `remPx` is what one rem currently resolves to (the zoom level moves it); it
+ * defaults to the 100% value so callers that don't care read unchanged. Pure +
  * exported for unit tests.
  */
 export function shouldCollapseAuxTabs(
   panelWidth: number,
-  rightReserve: number
+  rightReserve: number,
+  remPx = 16
 ): boolean {
   if (panelWidth <= 0) return false
-  const available = panelWidth - TAB_STRIP_GUTTER - rightReserve
-  return available < SEGMENTED_TABS_WIDTH + TAB_STRIP_GAP
+  const available = panelWidth - TAB_STRIP_GUTTER_REM * remPx - rightReserve
+  return available < (SEGMENTED_TABS_WIDTH_REM + TAB_STRIP_GAP_REM) * remPx
 }
 
 /**
@@ -179,7 +187,7 @@ export function AuxPanel() {
   // on desktop Windows/Linux the native caption buttons sit beyond it. The
   // segmented control has to fit LEFT of all that — otherwise collapse it into
   // a dropdown. Only relevant to the desktop layout (mobile is a full-width
-  // Sheet), and only when there's more than the lone Session Details tab.
+  // Drawer), and only when there's more than the lone Session Details tab.
   const winLinuxControls = isDesktop() && (isWindows || isLinux)
   const rightReserve = rightChromeReserve(winLinuxControls, zoomLevel)
   const collapsed =
@@ -187,7 +195,8 @@ export function AuxPanel() {
     showFolderTabs &&
     shouldCollapseAuxTabs(
       measuredWidth > 0 ? measuredWidth : width,
-      rightReserve
+      rightReserve,
+      (16 * zoomLevel) / 100
     )
 
   const tabLabel = useCallback(
@@ -269,7 +278,7 @@ export function AuxPanel() {
   return (
     // Desktop: background matches the middle workspace (bg-background), not the
     // darker sidebar shade, so the right column reads as one surface with it.
-    // Mobile (Sheet) is unchanged — keep the sidebar shade.
+    // Mobile (Drawer) is unchanged — keep the sidebar shade.
     <aside
       ref={asideRef}
       className={cn(
@@ -285,7 +294,7 @@ export function AuxPanel() {
         className="flex h-full min-h-0 flex-col gap-0"
       >
         {isMobile ? (
-          // Mobile (Sheet): unchanged — full-width underline tabs + a divider.
+          // Mobile (Drawer): unchanged — full-width underline tabs + a divider.
           <TabsList
             variant="line"
             className="h-10 w-full shrink-0 justify-start border-b border-border ws-chrome-border px-3 group-data-horizontal/tabs:h-10"

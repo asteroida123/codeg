@@ -18,7 +18,7 @@ import { cn } from "@/lib/utils"
 import { ReferenceIcon } from "../badges/reference-badge"
 import type { ReferenceAttrs, ReferenceKind } from "../types"
 import type { MentionRenderState } from "./mention-suggestion"
-import { placeAnchoredPopup } from "./popup-position"
+import { placeAnchoredPopup, readViewport } from "./popup-position"
 import type {
   ReferenceSearch,
   SuggestionGroup,
@@ -306,7 +306,7 @@ export const SuggestionPopup = forwardRef<
         placeAnchoredPopup(
           anchor,
           { width: box ? box.width : rect.width, height: rect.height },
-          { width: window.innerWidth, height: window.innerHeight }
+          readViewport()
         )
       )
     }
@@ -323,6 +323,13 @@ export const SuggestionPopup = forwardRef<
     const run = () => repositionRef.current()
     window.addEventListener("resize", run)
     window.addEventListener("scroll", run, true)
+    // The on-screen keyboard sliding up is a visual-viewport event and nothing
+    // else: iOS never resizes the layout viewport for it, so neither `resize`
+    // nor `scroll` above fires and the panel would keep the geometry it was
+    // opened with — which is to say, the half now hidden behind the keyboard.
+    const visual = window.visualViewport ?? null
+    visual?.addEventListener("resize", run)
+    visual?.addEventListener("scroll", run)
     const anchorEl = anchorRef?.current ?? null
     let resizeObserver: ResizeObserver | null = null
     let mutationObserver: MutationObserver | null = null
@@ -379,6 +386,8 @@ export const SuggestionPopup = forwardRef<
     return () => {
       window.removeEventListener("resize", run)
       window.removeEventListener("scroll", run, true)
+      visual?.removeEventListener("resize", run)
+      visual?.removeEventListener("scroll", run)
       resizeObserver?.disconnect()
       mutationObserver?.disconnect()
       if (frame) cancelAnimationFrame(frame)
@@ -419,9 +428,19 @@ export const SuggestionPopup = forwardRef<
           }
           case "Enter": {
             const chosen = flat[selectedIndex]
-            if (chosen) onSelect(chosen.reference, state.range)
-            // No fresh row (still loading, or empty tab): consume without
-            // inserting or submitting. Escape dismisses the panel.
+            // No fresh row (still loading, or an empty tab): decline the key
+            // instead of eating it. Claiming a key we did not act on is not
+            // free — ProseMirror synthesizes an Enter *after* the browser has
+            // already applied the DOM change on Android's soft keyboard
+            // (`readDOMChange`, both the "looks like Enter" branch and the
+            // enter-and-pick-suggestion one for prosemirror-view#1059), and a
+            // `true` there makes it drop that change rather than reconcile it,
+            // so the user's newline silently disappears. Declining cannot send
+            // the message either way: the composer's own `handleKeyDown` bails
+            // out ahead of the submit decision while the panel is open, so the
+            // key falls through to the editor's plain newline.
+            if (!chosen) return false
+            onSelect(chosen.reference, state.range)
             return true
           }
           case "Escape":
@@ -457,9 +476,9 @@ export const SuggestionPopup = forwardRef<
         // `visibility` it would have inherited in place.
         visibility: pos && !anchorHidden ? "visible" : "hidden",
         zIndex: 50,
-        // The panel portals to `body`, and a modal Radix layer (a Dialog or
-        // Sheet hosting the composer) sets `pointer-events: none` on `body` —
-        // only the layer itself is re-enabled. Without this the panel is
+        // The panel portals to `body`, and a modal Radix layer (a Dialog
+        // hosting the composer) sets `pointer-events: none` on `body` — only
+        // the layer itself is re-enabled. Without this the panel is
         // click-dead there and the press lands on the document instead, which
         // the layer reads as an outside press and closes itself. Radix's
         // outside test walks the REACT tree, so a press that does reach the

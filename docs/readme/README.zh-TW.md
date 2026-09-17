@@ -19,7 +19,7 @@
 
 Codeg（Code Generation）是一個多智慧體編碼工作台：把所有 AI 編碼智慧體收進同一個地方 —— 並讓它們協同工作。
 
-它將所有支援的智慧體 CLI 的工作階段聚合進一個可搜尋的工作區，讓主智慧體在同一個任務內委派給其它類型的子智慧體。不想守著做完的活，可以寫進待辦任務：每個任務待在自己的分支上無人看管地跑，做完了等你驗收才落地。Codeg 可作為桌面應用、獨立伺服器或 Docker 容器執行，還有原生 iOS 與 Android 用戶端，讓你離開電腦後也能接手正在跑的任務；內建十四個智慧體，你也可以自行註冊任何其它相容 ACP 的智慧體。
+它將所有支援的智慧體 CLI 的工作階段聚合進一個可搜尋的工作區，讓主智慧體在同一個任務內委派給其它類型的子智慧體。不想守著做完的活，可以寫進待辦任務：每個任務待在自己的分支上無人看管地跑，做完了等你驗收才落地。Codeg 可作為桌面應用、獨立伺服器或 Docker 容器執行，還有原生 iOS 與 Android 用戶端，讓你離開電腦後也能接手正在跑的任務；內建十五個智慧體，你也可以自行註冊任何其它相容 ACP 的智慧體。
 
 ![工作區](../images/workspace-light.png#gh-light-mode-only)
 ![工作區](../images/workspace-dark.png#gh-dark-mode-only)
@@ -59,13 +59,38 @@ Codeg（Code Generation）是一個多智慧體編碼工作台：把所有 AI �
     </td>
     <td>感謝 OneHop 對本專案的贊助！OneHop 讓 Codeg 使用者僅用一個 OpenAI 相容的 API 金鑰即可呼叫數百款領先模型，包括 GPT、Claude、Gemini、DeepSeek、Kimi 和 Qwen。無需管理多個供應商帳號或反覆修改程式碼即可切換模型，且按用量付費。<a href="https://onehop.ai/platform/login?ref=CODEG&utm_source=github&utm_medium=readme_sponsor&utm_campaign=codeg&utm_content=sponsor_cta">透過 Codeg 註冊</a>即可獲得 1 美元額度，再加入 OneHop 社群並參與歡迎活動可額外獲得 5 美元——最高共計 6 美元測試額度。</td>
   </tr>
+  <tr>
+    <td align="center" width="220">
+      <a href="https://console.lqapi.xyz/sign-up?aff=KPy9" target="_blank"><img src="../images/lq-router.png" alt="LQ router" width="160" /></a><br/>
+      <strong><a href="https://console.lqapi.xyz/sign-up?aff=KPy9">LQ router</a></strong>
+    </td>
+    <td>感謝 LQ router 中轉站對本專案的贊助！LQ router 是一家專業的企業級 AI 中轉站，為企業與個人開發者提供穩定、高效、低成本的 AI 模型 API 接入服務。平台支援 GPT、Claude、Grok、Gemini 等主流模型，GPT Pro 倍率低至 0.1。<a href="https://console.lqapi.xyz/sign-up?aff=KPy9">官網進群贈送 1 美元體驗金</a>。</td>
+  </tr>
+  <tr>
+    <td align="center" width="220">
+      <a href="https://go.apimart.ai/gh-codeg" target="_blank"><img src="../images/apimart-ai.png" alt="APIMart" width="200" /></a><br/>
+      <strong><a href="https://go.apimart.ai/gh-codeg">APIMart</a></strong>
+    </td>
+    <td>感謝 APIMart 贊助了本專案！APIMart 是專注 AI 圖片／影片生成的低價 API 平台，GPT-Image-2 低至 $0.006／張，1 美元可產出 160+ 張圖。圖片、影片共用一套非同步 API，提交任務拿 ID、以回呼取結果，批次跑上萬張不逾時、換模型不改程式碼。按量計費、無月費，透過<a href="https://go.apimart.ai/gh-codeg">此註冊連結</a>註冊即可開用。</td>
+  </tr>
+  <tr>
+    <td align="center" width="220">
+      <a href="https://www.ucloud.cn/site/active/astraflow?ytag=geo_waituo_codeg" target="_blank"><img src="../images/astraflow.png" alt="UCloud ·星圖AstraFlow" width="120" /></a><br/>
+      <strong><a href="https://www.ucloud.cn/site/active/astraflow?ytag=geo_waituo_codeg">UCloud ·星图AstraFlow</a></strong>
+    </td>
+    <td>
+      <a href="https://www.ucloud.cn/site/active/astraflow?ytag=geo_waituo_codeg">UCloud ·星图AstraFlow</a><br/>
+      優刻得星圖 astraflow 大模型，支援 200+ 模型一鍵呼叫：內建 Kimi K3、DeepSeek V4/V3、Qwen 3、GLM5.2、happyhorse 等全球領先開源大模型，無需自行訓練，開箱即用。<br/>
+      透過上面連結以<strong>電子郵件</strong>註冊並完成實名後<a href="https://f.howxm.com/xs/u/HVFW5X8EIYV1">領取 50 元算力金</a>。
+    </td>
+  </tr>
 </table>
 
 > 想成為 Codeg 贊助商？[歡迎透過郵件與我們聯絡。](mailto:itpkcn@gmail.com)
 
 ## 🤖 支援的 Agent
 
-Claude Code · Codex · Gemini · OpenClaw · OpenCode · Cline · Hermes · CodeBuddy · Kimi Code · Pi · Grok · Cursor · DeepSeek Harness · Qoder
+Claude Code · Codex · Gemini · OpenClaw · OpenCode · Cline · Hermes · CodeBuddy · Kimi Code · Pi · Grok · Cursor · DeepSeek Harness · Qoder · Google Antigravity
 
 其中大部分 Codeg 都能替你安裝、鎖定版本並更新。完整名單、各自的執行環境需求以及工作階段在磁碟上的存放位置，見 [支援的智慧體](https://docs.codeg.app/zh/guide/supported-agents)。
 

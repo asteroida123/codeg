@@ -172,6 +172,78 @@ describe("InlineSessionConfigSelector — model grouping", () => {
   })
 })
 
+// codex-acp 1.11.0 names a recommended value per select
+// (`_meta.jetbrains.air.recommendedValue`). What makes it worth rendering at
+// all is that it is NOT the selection: codeg replays a persisted per-agent
+// preference into every new session, so the selected row is routinely a model
+// the agent no longer defaults to.
+describe("InlineSessionConfigSelector — the agent's recommended value", () => {
+  afterEach(() => cleanup())
+
+  const withRecommendation = (recommended: string | null) => ({
+    ...modelOption(
+      [
+        { value: "gpt-6-astra", name: "6 Astra" },
+        { value: "gpt-5.5", name: "5.5" },
+      ],
+      // Selected ≠ recommended, the case the badge exists for.
+      "gpt-5.5"
+    ),
+    recommended_value: recommended,
+  })
+
+  it("badges the recommended row, not the selected one", async () => {
+    const user = userEvent.setup()
+    render(
+      <InlineSessionConfigSelector
+        option={withRecommendation("gpt-6-astra")}
+        onSelect={vi.fn()}
+        recommendedLabel="Recommended"
+      />
+    )
+    await user.click(screen.getByRole("button", { name: /5\.5/ }))
+
+    const recommended = await screen.findByRole("menuitemradio", {
+      name: /6 Astra/,
+    })
+    expect(recommended).toHaveTextContent("Recommended")
+    // The selected row keeps its checkmark and gains nothing.
+    const selected = screen.getByRole("menuitemradio", { name: /^5\.5/ })
+    expect(selected).not.toHaveTextContent("Recommended")
+  })
+
+  it("shows nothing when the agent named no recommendation", async () => {
+    const user = userEvent.setup()
+    render(
+      <InlineSessionConfigSelector
+        option={withRecommendation(null)}
+        onSelect={vi.fn()}
+        recommendedLabel="Recommended"
+      />
+    )
+    await user.click(screen.getByRole("button", { name: /5\.5/ }))
+    await screen.findByRole("menuitemradio", { name: /6 Astra/ })
+    expect(screen.queryByText("Recommended")).toBeNull()
+  })
+
+  // A recommendation that matches no option marks nothing — the backend
+  // deliberately does not validate membership, so this is the guard that makes
+  // that safe.
+  it("ignores a recommendation that names no option in the list", async () => {
+    const user = userEvent.setup()
+    render(
+      <InlineSessionConfigSelector
+        option={withRecommendation("gpt-7-retired")}
+        onSelect={vi.fn()}
+        recommendedLabel="Recommended"
+      />
+    )
+    await user.click(screen.getByRole("button", { name: /5\.5/ }))
+    await screen.findByRole("menuitemradio", { name: /6 Astra/ })
+    expect(screen.queryByText("Recommended")).toBeNull()
+  })
+})
+
 // Cline 3.0.50's `auto_approve` — the first boolean config option any pinned
 // agent ships.
 function autoApproveOption(current: boolean): SessionConfigOptionInfo {
@@ -240,5 +312,49 @@ describe("InlineSessionConfigToggle", () => {
       />
     )
     expect(container).toBeEmptyDOMElement()
+  })
+})
+
+// The chips carry a `SelectorTooltip` instead of a native `title`: same hover
+// affordance, themed, and naming the setting rather than echoing the value the
+// chip already shows.
+describe("selector hover hints", () => {
+  afterEach(() => cleanup())
+
+  it("names the setting on hover, without echoing the value the chip shows", async () => {
+    const user = userEvent.setup()
+    const longName = "claude-opus-4-1-20250805-with-a-very-long-name"
+    const option = modelOption([{ value: "opus", name: longName }], "opus")
+    render(<InlineSessionConfigSelector option={option} onSelect={vi.fn()} />)
+
+    const trigger = screen.getByRole("button")
+    expect(trigger).not.toHaveAttribute("title")
+
+    await user.hover(trigger)
+    const tip = await screen.findByRole("tooltip")
+    expect(tip).toHaveTextContent("Model")
+    expect(tip).not.toHaveTextContent(longName)
+  })
+
+  it("shows the toggle's description on hover", async () => {
+    const user = userEvent.setup()
+    render(
+      <InlineSessionConfigToggle
+        option={autoApproveOption(true)}
+        onSelect={vi.fn()}
+        onLabel="On"
+        offLabel="Off"
+      />
+    )
+
+    const trigger = screen.getByRole("button")
+    expect(trigger).not.toHaveAttribute("title")
+
+    await user.hover(trigger)
+    const tip = await screen.findByRole("tooltip")
+    expect(tip).toHaveTextContent("Auto-approve tools")
+    expect(tip).toHaveTextContent(
+      "Automatically approve all tool calls without asking"
+    )
   })
 })

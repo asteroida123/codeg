@@ -14,9 +14,9 @@ use crate::acp::feedback::{FeedbackItem, FeedbackStatus};
 use crate::acp::plan_approval::PendingPlanApprovalState;
 use crate::acp::question::PendingQuestionState;
 use crate::acp::types::{
-    AcpEvent, AvailableCommandInfo, ConfigStaleKind, ConnectionStatus, EventEnvelope,
-    GrokModelSpec, PromptCapabilitiesInfo, SessionConfigOptionInfo, SessionFailureRecord,
-    SessionModeStateInfo, ToolCallImageInfo,
+    AcpEvent, AsyncTaskRecord, AvailableCommandInfo, ConfigStaleKind, ConnectionStatus,
+    EventEnvelope, GrokModelSpec, PromptCapabilitiesInfo, SessionConfigOptionInfo,
+    SessionFailureRecord, SessionModeStateInfo, ToolCallImageInfo,
 };
 use crate::models::agent::AgentType;
 use crate::models::message::MessageRole;
@@ -331,6 +331,56 @@ pub struct SessionState {
     /// non-Grok agents and when the response carried no `models` (flat fallback).
     /// Backend-internal — not serialized.
     pub grok_model_specs: Option<std::collections::HashMap<String, GrokModelSpec>>,
+
+    /// pi only: the session prelude pi-acp reports as `_meta.piAcp.startupInfo`
+    /// on `session/new`, held until the matching `agent_message_chunk` arrives
+    /// so that chunk can be recognized and dropped instead of rendering as the
+    /// assistant's opening words (see `pi_take_startup_banner`).
+    ///
+    /// `Some` only between `session/new` and that first chunk: it is taken on
+    /// the match, so a later chunk that happens to repeat the text is prose and
+    /// renders. `None` for every other agent, for `session/load` / `session/fork`
+    /// (pi-acp sets the prelude in `newSession` only), and when pi's
+    /// `quietStartup` setting suppressed the prelude at the source.
+    /// Backend-internal — not serialized.
+    pub pi_startup_banner: Option<String>,
+
+    /// Config-option values codeg asserted while establishing this session
+    /// (`apply_preferred_session_options`) and the agent confirmed — the user's
+    /// saved preferences on a connect, the parent's selectors on a fork.
+    ///
+    /// Kept only until the user's first prompt, to arbitrate ONE race: an agent
+    /// may re-pin its own model AFTER answering our `set_config_option`, and the
+    /// resulting `config_option_update` push is indistinguishable from the user
+    /// picking that model themselves. Claude does exactly this on the resume
+    /// that re-establishes a forked session — the push lands ~2ms after our
+    /// apply and silently reverts it, and effort follows because a model switch
+    /// re-scopes the effort option. Before the user has said anything, such a
+    /// push can only be establishment noise, so the connection re-asserts once
+    /// (see `take_asserted_config_drift`). Once a prompt is sent, every push is
+    /// attributable to what the user asked for — `/model` typed in chat is one —
+    /// so the map is cleared and the agent wins from then on.
+    ///
+    /// Backend-internal — not serialized, not carried on `to_snapshot()`.
+    pub asserted_config_values: BTreeMap<String, String>,
+    /// Config-option ids this launch pinned through the environment, which the
+    /// agent will therefore refuse to change for as long as the process lives.
+    ///
+    /// Cline forced this. codeg pins the provider with `CLINE_PROVIDER` — the
+    /// only way a bring-your-own provider clears cline's ACP auth gate — and
+    /// cline then answers `set_config_option("provider", …)` with `Invalid
+    /// params: Cannot change provider: CLINE_PROVIDER environment variable is
+    /// set`. It keeps advertising the selector regardless, so without this the
+    /// composer offers a dropdown whose every choice is an error, and a
+    /// preference saved from one of those clicks is replayed — and fails —
+    /// on every later connect.
+    ///
+    /// codeg is what disabled the control, so codeg is what withholds it: these
+    /// ids are dropped from what the frontend is told about and skipped when
+    /// saved preferences are replayed.
+    ///
+    /// Backend-internal — not serialized, not carried on `to_snapshot()`.
+    pub env_pinned_config_option_ids: Vec<String>,
     pub prompt_capabilities: Option<PromptCapabilitiesInfo>,
     pub fork_supported: bool,
     pub available_commands: Vec<AvailableCommandInfo>,
@@ -388,6 +438,13 @@ pub struct SessionState {
     /// keep round-tripping after the parent session ends.
     pub delegation_token: Option<String>,
 
+    /// Whether `delegate_to_agent` was exposed to THIS agent at launch (the
+    /// `delegation` feature was on when its companion was injected). The sole
+    /// gate on appending the `@agent` routing frame: an agent with no such tool
+    /// would just be told to route through something it cannot call. Backend-only
+    /// and fixed for the connection's lifetime.
+    pub delegation_enabled: bool,
+
     /// Whether the `check_user_feedback` MCP tool was exposed to THIS agent at
     /// launch (the `feedback` feature was on when its companion was injected).
     /// Fixed for the connection's lifetime — tool exposure can't change after
@@ -408,6 +465,19 @@ pub struct SessionState {
     /// comes back `startedNewTurn` (adapter ignored the `promptRequired`
     /// opt-in), rerouting subsequent notes to the MCP pull path.
     pub native_steering_available: bool,
+
+    /// Which generation of codex-acp's `request_user_input` bridge this
+    /// connection is talking to — 1.12.0 swapped the question and the tab
+    /// header between a form property's `title` and `description`, and nothing
+    /// on the wire distinguishes the two. Pinned ONCE at initialize from the
+    /// RUNNING adapter's `agentInfo.version`
+    /// (`connection.rs::codex_user_input_shape`), because launch may resolve an
+    /// older PATH install or a user's custom pinned version rather than the
+    /// registry's. `None` for every non-codex agent, and for a codex adapter
+    /// that reported no `agentInfo`; the elicitation parser then dates the form
+    /// from its own markers. Backend-internal routing only: not part of the
+    /// client snapshot.
+    pub codex_user_input_shape: Option<crate::acp::question::CodexUserInputShape>,
 
     /// Which `session_info_update` meta key carries goal snapshots for this
     /// connection: `true` ⇒ the provider-neutral `_meta.goal` (adapter
@@ -470,6 +540,25 @@ pub struct SessionState {
     /// subsequent live events. BTreeMap for a deterministic snapshot order.
     pub session_failures: BTreeMap<String, SessionFailureRecord>,
 
+    /// AIR async tasks projected by task id (see [`AsyncTaskRecord`]) — the
+    /// merged form of the deltas on `AcpEvent::AsyncTask`.
+    ///
+    /// Terminal rows are RETAINED for the connection's lifetime rather than
+    /// dropped on their last state update. The adapter revises a task after it
+    /// settles (a late `outputFilePath`, and a `task_notification` that corrects
+    /// a best-effort `stopped` into the real `completed`/`failed`), so an
+    /// evicted row would be re-created by its own correction — as a fresh
+    /// "running" one, since `spawned` is what carries the identity. Presentation
+    /// decides what to show; this table decides what is true. BTreeMap for a
+    /// deterministic snapshot order.
+    pub async_tasks: BTreeMap<String, AsyncTaskRecord>,
+
+    /// When the last async-task delta of any kind landed. Bounds the keep-alive
+    /// exemption in `has_active_background_work` exactly the way
+    /// `background_activity_at` bounds the watcher's half — see
+    /// [`Self::has_live_async_task`].
+    pub async_task_activity_at: Option<DateTime<Utc>>,
+
     /// Concatenated text content of the just-completed turn's assistant
     /// message. Captured at TurnComplete (just before live_message is
     /// cleared) so the lifecycle subscriber can surface it as the
@@ -504,6 +593,23 @@ pub struct SessionState {
     /// not part of the client-visible snapshot.
     pub turn_in_flight: bool,
 
+    /// How many `TurnComplete`s this connection has applied — the turn's
+    /// IDENTITY, paired with `turn_in_flight`. `turn_in_flight` alone only says
+    /// "some turn is running"; a caller that admitted itself against turn N and
+    /// then awaited something cannot tell, on waking, whether it is still
+    /// looking at turn N or at an N+1 that started meanwhile. Comparing this
+    /// counter answers that: it moves only when a turn ends, so it is stable
+    /// for a turn's whole life and differs across turns.
+    ///
+    /// Incremented unconditionally next to the `turn_in_flight` clear below —
+    /// `TurnComplete` has three emitters and a repeat can land on an already
+    /// settled turn, so this is a monotonic marker, not an exact turn count.
+    /// Only inequality is ever read. Not serialized: backend-internal, like
+    /// `turn_in_flight`. Sole consumer today is
+    /// `ConnectionManager::submit_feedback_native`, which re-checks it across
+    /// attachment hydration so a steered note cannot ride into the next turn.
+    pub turns_completed: u64,
+
     /// Whether the most recently completed turn ended via a stop reason other
     /// than `"end_turn"` (cancelled, refusal, max_tokens, max_turn_requests,
     /// empty, unknown — the same "abnormal ending" bucket `connection.rs`
@@ -530,6 +636,14 @@ pub struct SessionState {
     /// Which settings surface drifted, for the banner's wording. `Some` iff
     /// `config_stale`; reset to `None` when staleness clears.
     pub config_stale_kind: Option<ConfigStaleKind>,
+
+    /// Last live ACP session title we actually emitted on this connection.
+    /// Used to skip identical `session_info_update.title` repeats (CodeBuddy
+    /// resends its fallback after every turn with no last-sent guard).
+    /// Backend-internal: not on the client snapshot. Cleared on
+    /// `ConversationLinked` so a title dropped while the row was still
+    /// unbound can be accepted on the next send.
+    pub last_native_title: Option<String>,
 }
 
 impl SessionState {
@@ -563,6 +677,9 @@ impl SessionState {
             current_mode: None,
             config_options: None,
             grok_model_specs: None,
+            pi_startup_banner: None,
+            asserted_config_values: BTreeMap::new(),
+            env_pinned_config_option_ids: Vec::new(),
             prompt_capabilities: None,
             fork_supported: false,
             available_commands: Vec::new(),
@@ -575,20 +692,26 @@ impl SessionState {
             event_stream: Arc::new(ConnectionEventStream::new()),
             recent_events: RecentEventsBuffer::new(),
             delegation_token: None,
+            delegation_enabled: false,
             feedback_tool_available: false,
             native_steering_available: false,
+            codex_user_input_shape: None,
             neutral_goal_channel: false,
             goal_control_method: crate::acp::codex_goal::LEGACY_GOAL_CONTROL_METHOD.to_string(),
             goal_actions: None,
             goal_active: false,
             session_failures: BTreeMap::new(),
+            async_tasks: BTreeMap::new(),
+            async_task_activity_at: None,
             last_assistant_text: None,
             pending_user_message: None,
             pending_user_message_started_at: None,
             turn_in_flight: false,
+            turns_completed: 0,
             last_turn_ended_abnormally: false,
             config_stale: false,
             config_stale_kind: None,
+            last_native_title: None,
         }
     }
 
@@ -637,6 +760,19 @@ impl SessionState {
             AcpEvent::SessionStarted { session_id } => {
                 if self.external_id.as_deref() != Some(session_id.as_str()) {
                     self.external_id_changed_at = Some(std::time::SystemTime::now());
+                    // The AIR task table is keyed to the session we just left.
+                    // Its rows can never settle here again: the adapter
+                    // publishes their terminal frames on the OLD session id, and
+                    // `ActiveSessionHandler` stops routing that id to this
+                    // connection the moment we attach to the new one. Keeping
+                    // them would leave the strip showing tasks that can never
+                    // finish and — because a live row exempts this connection
+                    // from idle reaping — pin the agent CLI alive for good. A
+                    // fork is the ordinary way here: a background task outlives
+                    // the turn that started it, and "fork from here" is only
+                    // accepted between turns.
+                    self.async_tasks.clear();
+                    self.async_task_activity_at = None;
                 }
                 self.external_id = Some(session_id.clone());
                 self.status = ConnectionStatus::Connected;
@@ -936,6 +1072,22 @@ impl SessionState {
                 // call (no concluding text) → empty, which CLEARS the field so a
                 // prior turn's text can't leak as this turn's result; the LLM
                 // reads the full result by opening the child session instead.
+                //
+                // Cleared FIRST, because a turn can end with no live message at
+                // all — cancelled before it produced anything, or one whose only
+                // chunk was an empty text delta (dropped by
+                // `append_text_delta`). Leaving the field alone there would
+                // serve the PREVIOUS turn's answer as this turn's result.
+                //
+                // Guarded on the turn actually being open, because
+                // `TurnComplete` has three emitters (stop-reason message,
+                // prompt response, and the cancel path — which deliberately
+                // does not wait for the agent, so its response can bring a
+                // second one). A repeat must not wipe the text the first one
+                // captured.
+                if self.turn_in_flight || self.live_message.is_some() {
+                    self.last_assistant_text = None;
+                }
                 if let Some(live) = self.live_message.as_ref() {
                     let after_last_tool_call = live
                         .content
@@ -959,11 +1111,9 @@ impl SessionState {
                         })
                         .collect::<Vec<&str>>()
                         .join("");
-                    self.last_assistant_text = if assembled.trim().is_empty() {
-                        None
-                    } else {
-                        Some(assembled)
-                    };
+                    if !assembled.trim().is_empty() {
+                        self.last_assistant_text = Some(assembled);
+                    }
                 }
                 self.live_message = None;
                 self.active_tool_calls.clear();
@@ -978,6 +1128,10 @@ impl SessionState {
                 // cancel, stop-reason — emit TurnComplete; disconnect/error
                 // discard the state entirely, so no stale flag can outlive them.)
                 self.turn_in_flight = false;
+                // Same edge, the identity half: anyone holding "the turn I was
+                // admitted against" can now see that it is gone, even if a new
+                // turn sets `turn_in_flight` again before they look.
+                self.turns_completed = self.turns_completed.saturating_add(1);
                 // NOTE: `active_delegations` is intentionally NOT cleared here.
                 // A running delegation's child runs in the background long after
                 // the parent's `delegate_to_agent` tool call returns and this
@@ -1048,6 +1202,10 @@ impl SessionState {
             } => {
                 self.conversation_id = Some(*conversation_id);
                 self.folder_id = Some(*folder_id);
+                // A title published before this bind was dropped (no row yet).
+                // Forget the skip-cache so a later resend of the same string
+                // is not suppressed.
+                self.last_native_title = None;
             }
             AcpEvent::PlanUpdate { entries } => {
                 // Replace any existing Plan block, then append at end.
@@ -1139,7 +1297,42 @@ impl SessionState {
                 // here so snapshot replay reconstructs the same list the live
                 // node holds.
                 if !self.feedback.iter().any(|f| f.id == item.id) {
-                    self.feedback.push(item.clone());
+                    let mut item = item.clone();
+                    // Enforce the per-turn attachment budget HERE, under the
+                    // same `&mut self` that appends, because this is the only
+                    // authorized writer. Checking it at the submit site instead
+                    // would be a read followed by a write with an agent
+                    // round-trip in between: two steers admitted concurrently
+                    // would both read the same retained total, both pass, and
+                    // both retain — and a replay/attach node applying this
+                    // event would not be bounded at all. One critical section
+                    // makes the bound hold however the note got here.
+                    //
+                    // Only the RETAINED copy is trimmed. The note still
+                    // delivers and the event still carried its blocks to
+                    // whoever is attached right now; what the budget protects
+                    // is this list, which outlives the event and is rebuilt
+                    // into every snapshot.
+                    if let Some(blocks) = item.blocks.as_deref() {
+                        let retained: usize = self
+                            .feedback
+                            .iter()
+                            .filter_map(|f| f.blocks.as_deref())
+                            .map(crate::acp::feedback::attachment_bytes)
+                            .sum();
+                        let incoming = crate::acp::feedback::attachment_bytes(blocks);
+                        if retained.saturating_add(incoming)
+                            > crate::acp::feedback::MAX_FEEDBACK_ATTACHMENT_BYTES_PER_TURN
+                        {
+                            tracing::warn!(
+                                "[ACP][feedback] steer attachments exceed the per-turn \
+                                 budget (retained={retained} incoming={incoming}); \
+                                 keeping the note without them"
+                            );
+                            item.blocks = None;
+                        }
+                    }
+                    self.feedback.push(item);
                 }
             }
             AcpEvent::FeedbackConsumed { ids, delivered_at } => {
@@ -1181,10 +1374,37 @@ impl SessionState {
                         .insert(record.id.clone(), record.clone());
                 }
             }
+            AcpEvent::AsyncTask { delta } => {
+                // The SAME merge the frontend reducer applies, so a client
+                // seeded from the snapshot and one that watched every delta
+                // hold identical rows. Only a `spawned` frame may create:
+                // progress naming an unknown task means we failed to read its
+                // announcement, and a row we can't name or type is worse than
+                // no row (see `AsyncTaskDelta::spawned`).
+                match self.async_tasks.get_mut(&delta.task_id) {
+                    Some(existing) => delta.apply_to(existing),
+                    None if delta.spawned => {
+                        self.async_tasks
+                            .insert(delta.task_id.clone(), delta.to_record());
+                    }
+                    None => {
+                        tracing::debug!(
+                            task_id = %delta.task_id,
+                            "[ACP] ignoring async-task delta for an unannounced task"
+                        );
+                    }
+                }
+                // Stamped for EVERY delta, including one we just dropped: the
+                // adapter is demonstrably still talking about background work
+                // on this connection, which is the only thing the keep-alive
+                // window asks.
+                self.async_task_activity_at = Some(Utc::now());
+            }
             AcpEvent::ClaudeSdkMessage { .. }
             | AcpEvent::ConfigOptionRejected { .. }
             | AcpEvent::SessionLoadFailed { .. }
             | AcpEvent::TurnRetrying { .. }
+            | AcpEvent::NativeSessionTitle { .. }
             | AcpEvent::UserPromptSent { .. } => {
                 // 这些事件不直接修改 SessionState 的可见字段。
                 // UserPromptSent 是纯通知事件，仅供 chat-channel 推送消费。
@@ -1209,10 +1429,62 @@ impl SessionState {
     /// `background_outstanding` here — this check is the belt to that
     /// suspenders.)
     pub fn has_active_background_work(&self, now: DateTime<Utc>) -> bool {
+        // OR, not a sum. The two sources — the transcript watcher's
+        // `background_outstanding` and the AIR async-task table — observe
+        // overlapping work through different channels, so adding them would
+        // double-count the same background shell. An OR cannot: whichever
+        // source still believes work is pending keeps the connection alive,
+        // and reaping only resumes once BOTH have let go. That asymmetry is
+        // deliberate — a false "still running" costs one idle connection, a
+        // false "settled" kills the agent CLI and the work with it.
+        if self.has_live_async_task(now) {
+            return true;
+        }
         if self.background_outstanding == 0 {
             return false;
         }
         match self.background_activity_at {
+            Some(at) => now.signed_duration_since(at) < background_keepalive_max_age(),
+            None => false,
+        }
+    }
+
+    /// Whether any AIR async task is still non-terminal AND the adapter has
+    /// said something about async tasks recently enough to believe it.
+    ///
+    /// The age bound is the same belt-and-suspenders the watcher's half of
+    /// `has_active_background_work` carries, for the same reason: a row that
+    /// never reaches a terminal state would otherwise exempt this connection
+    /// from idle reaping FOREVER, and the exemption is the only thing standing
+    /// between an idle connection and being reaped. The adapter does close every
+    /// task it announced (terminal edge, superseding liveness level, and the
+    /// end-of-stream / reset / stream-error `finishAll` paths), but a row can
+    /// still strand when the terminal frame is published on a session id this
+    /// connection has already left — a fork is the ordinary way there. That case
+    /// is handled directly (`SessionStarted` clears the table on a session-id
+    /// change); this window is what catches the ones nobody predicted.
+    ///
+    /// Refreshed by ANY async-task delta, so a task that keeps reporting keeps
+    /// its exemption for as long as it runs.
+    ///
+    /// That clause is claude-only in practice. codex-acp publishes no
+    /// `async_task_progress` channel at all (only `_spawned` and
+    /// `_state_update`), so a codex background terminal stamps the clock ONCE at
+    /// its announcement and then goes quiet — its exemption expires one window
+    /// after it started, however long the process actually runs. Deliberately
+    /// left alone: before this capability was advertised a codex background
+    /// terminal had no exemption whatsoever, and inventing a refresh here would
+    /// mean pinning a connection open on a liveness claim nothing re-verifies —
+    /// the exact failure this age bound exists to prevent.
+    pub fn has_live_async_task(&self, now: DateTime<Utc>) -> bool {
+        if !self
+            .async_tasks
+            .values()
+            .any(|t| !crate::acp::types::async_task_state_is_terminal(&t.state))
+        {
+            return false;
+        }
+        match self.async_task_activity_at {
             Some(at) => now.signed_duration_since(at) < background_keepalive_max_age(),
             None => false,
         }
@@ -1423,6 +1695,21 @@ impl SessionState {
     }
 
     fn append_text_delta(&mut self, text: &str, parent_tool_use_id: Option<&str>) {
+        // An empty text delta has nothing to render, so the only thing it could
+        // contribute is a block boundary — and the frontend reducer never
+        // creates one (it drops an empty `CONTENT_DELTA` outright, before it
+        // would even open a live message). Dropping it here too is what keeps
+        // the two block lists identical; otherwise a snapshot-hydrated client
+        // carries an empty `Text` block that the streaming client never had,
+        // and prose either side of it looks like two separate runs.
+        //
+        // Empty THINKING deltas are deliberately NOT dropped: there the empty
+        // block IS the signal (it renders the "Thinking…" indicator before any
+        // reasoning text arrives, and newer Claude models redact the text
+        // entirely while still emitting the block).
+        if text.is_empty() {
+            return;
+        }
         let live = self.ensure_live_message();
         // Merge only into a trailing block of the same kind AND the same
         // subagent attribution — main text → subagent text → main text must
@@ -1585,6 +1872,7 @@ impl SessionState {
             config_stale_kind: self.config_stale_kind,
             last_error: self.last_error.clone(),
             session_failures: self.session_failures.values().cloned().collect(),
+            async_tasks: self.async_tasks.values().cloned().collect(),
             goal_actions: self.goal_actions.clone(),
             event_seq: self.event_seq,
         }
@@ -1701,6 +1989,13 @@ pub struct LiveSessionSnapshot {
     /// common case) to keep the wire shape byte-identical pre-feature.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub session_failures: Vec<SessionFailureRecord>,
+    /// AIR async tasks, merged (see `SessionState.async_tasks`). Terminal rows
+    /// included: they carry the ids the subsequent live deltas revise, so a
+    /// client seeded without them would re-create a settled task as a running
+    /// one on its next correction. Omitted while empty (the common case) to
+    /// keep the wire shape byte-identical pre-feature.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub async_tasks: Vec<AsyncTaskRecord>,
     /// Goal-control action vocabulary the goal card gates its buttons on
     /// (see `SessionState.goal_actions`): the advertised list for neutral-goal
     /// adapters, the legacy ["pause","clear"] pair for the rest.
@@ -1807,9 +2102,9 @@ fn extract_tool_call_id(tool_call: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use crate::acp::types::{
-        AcpEvent, ConnectionStatus, DelegationResultSummary, EventEnvelope, PromptCapabilitiesInfo,
-        SessionConfigKindInfo, SessionConfigOptionInfo, SessionConfigSelectInfo, SessionModeInfo,
-        SessionModeStateInfo, UserMessageBlock,
+        AcpEvent, AsyncTaskDelta, AsyncTaskUsage, ConnectionStatus, DelegationResultSummary,
+        EventEnvelope, PromptCapabilitiesInfo, SessionConfigKindInfo, SessionConfigOptionInfo,
+        SessionConfigSelectInfo, SessionModeInfo, SessionModeStateInfo, UserMessageBlock,
     };
 
     fn fresh_state() -> SessionState {
@@ -1820,6 +2115,32 @@ mod tests {
             "win-test".to_string(),
             None,
         )
+    }
+
+    /// `ConversationLinked` must forget the live-title skip-cache.
+    ///
+    /// Today this clear can only ever be a no-op: `emit_conversation_update`
+    /// refuses to cache a title while `conversation_id` is `None`, and both
+    /// producers of `ConversationLinked` fire only from that same unbound
+    /// state, so the cache is already empty every time this runs. It is kept —
+    /// and pinned here — because the day something rebinds a LIVE connection to
+    /// another row, a cache carried over from the old one would classify the
+    /// new row's first title as a repeat and leave it Untitled for the rest of
+    /// the connection, with no error anywhere to point at.
+    #[test]
+    fn conversation_linked_clears_the_native_title_skip_cache() {
+        let mut s = fresh_state();
+        s.last_native_title = Some("Fix the login flow".into());
+
+        s.apply_event(&AcpEvent::ConversationLinked {
+            conversation_id: 7,
+            folder_id: 1,
+            parent_conversation_id: None,
+            parent_tool_use_id: None,
+        });
+
+        assert_eq!(s.conversation_id, Some(7));
+        assert!(s.last_native_title.is_none());
     }
 
     #[test]
@@ -1928,6 +2249,202 @@ mod tests {
             f.get("id").and_then(|v| v.as_str()) == Some("t1:error")
                 && f.get("revision").and_then(|v| v.as_u64()) == Some(4)
         }));
+    }
+
+    fn async_task_delta(task_id: &str, spawned: bool) -> AsyncTaskDelta {
+        AsyncTaskDelta {
+            task_id: task_id.into(),
+            spawned,
+            name: None,
+            task_type: None,
+            description: None,
+            show_in_transcript: None,
+            can_stop: None,
+            state: None,
+            summary: None,
+            last_tool_name: None,
+            usage: None,
+            output_file_path: None,
+            tool_call_id: None,
+        }
+    }
+
+    /// Only the spawn frame carries a task's identity, so it is the only one
+    /// allowed to create a row: a progress delta for an id we never saw
+    /// announced means codeg failed to read the announcement, and a row with a
+    /// placeholder name and no type is worse than no row at all.
+    #[test]
+    fn async_task_rows_are_created_only_by_a_spawn_delta() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::AsyncTask {
+            delta: async_task_delta("ghost", false),
+        });
+        assert!(s.async_tasks.is_empty());
+
+        let spawn = AsyncTaskDelta {
+            name: Some("pnpm test".into()),
+            task_type: Some("shell".into()),
+            description: Some("pnpm test --watch".into()),
+            show_in_transcript: Some(false),
+            can_stop: Some(true),
+            ..async_task_delta("t1", true)
+        };
+        s.apply_event(&AcpEvent::AsyncTask { delta: spawn });
+        let row = &s.async_tasks["t1"];
+        assert_eq!(row.name, "pnpm test");
+        assert_eq!(row.task_type, "shell");
+        assert!(!row.show_in_transcript);
+        assert!(row.can_stop);
+        // A spawn frame carries no state field; the row starts live.
+        assert_eq!(row.state, "running");
+    }
+
+    /// Progress/state deltas are PARTIAL: an absent field must leave the stored
+    /// value alone, or the first progress tick would blank out the task's name.
+    #[test]
+    fn async_task_deltas_revise_only_the_fields_they_carry() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::AsyncTask {
+            delta: AsyncTaskDelta {
+                name: Some("pnpm test".into()),
+                task_type: Some("shell".into()),
+                ..async_task_delta("t1", true)
+            },
+        });
+        s.apply_event(&AcpEvent::AsyncTask {
+            delta: AsyncTaskDelta {
+                last_tool_name: Some("Bash".into()),
+                usage: Some(AsyncTaskUsage {
+                    total_tokens: 1200,
+                    tool_uses: 3,
+                    duration_ms: 4500,
+                }),
+                output_file_path: Some("/tmp/tasks/t1.output".into()),
+                ..async_task_delta("t1", false)
+            },
+        });
+        let row = &s.async_tasks["t1"];
+        assert_eq!(row.name, "pnpm test");
+        assert_eq!(row.task_type, "shell");
+        assert_eq!(row.last_tool_name.as_deref(), Some("Bash"));
+        assert_eq!(row.usage.as_ref().unwrap().total_tokens, 1200);
+        assert_eq!(row.output_file_path.as_deref(), Some("/tmp/tasks/t1.output"));
+
+        // The adapter revises a task AFTER it settles — correcting a
+        // best-effort `stopped` into the real outcome, or attaching a late
+        // output path. Retaining the row is what lets that correction land as a
+        // revision instead of resurrecting the task as a fresh running one.
+        s.apply_event(&AcpEvent::AsyncTask {
+            delta: AsyncTaskDelta {
+                state: Some("stopped".into()),
+                ..async_task_delta("t1", false)
+            },
+        });
+        assert_eq!(s.async_tasks["t1"].state, "stopped");
+        s.apply_event(&AcpEvent::AsyncTask {
+            delta: AsyncTaskDelta {
+                state: Some("completed".into()),
+                summary: Some("all green".into()),
+                ..async_task_delta("t1", false)
+            },
+        });
+        assert_eq!(s.async_tasks["t1"].state, "completed");
+        assert_eq!(s.async_tasks["t1"].summary.as_deref(), Some("all green"));
+
+        // The whole table rides the snapshot so a client attaching mid-session
+        // merges subsequent deltas against the same rows.
+        let snap = s.to_snapshot();
+        assert_eq!(snap.async_tasks.len(), 1);
+        assert_eq!(snap.async_tasks[0].task_id, "t1");
+    }
+
+    /// Reaping an idle connection kills the agent CLI, and with it any
+    /// background work. A live async task must hold the connection open on its
+    /// own — the transcript watcher is a separate, overlapping observer, so the
+    /// two combine by OR (never a sum, which would double-count one shell).
+    #[test]
+    fn a_live_async_task_alone_defers_the_idle_sweep() {
+        let mut s = fresh_state();
+        let now = Utc::now();
+        assert!(!s.has_active_background_work(now));
+
+        s.apply_event(&AcpEvent::AsyncTask {
+            delta: AsyncTaskDelta {
+                name: Some("watch".into()),
+                ..async_task_delta("t1", true)
+            },
+        });
+        // No `BackgroundActivity` has ever arrived, so this exemption is coming
+        // from the async-task table alone.
+        assert_eq!(s.background_outstanding, 0);
+        assert!(s.has_active_background_work(now));
+
+        s.apply_event(&AcpEvent::AsyncTask {
+            delta: AsyncTaskDelta {
+                state: Some("completed".into()),
+                ..async_task_delta("t1", false)
+            },
+        });
+        assert!(!s.has_active_background_work(now));
+    }
+
+    /// The exemption is what stops the idle sweep, so a row that never reaches a
+    /// terminal state would otherwise hold the agent CLI open forever. Bounded
+    /// by the same window as the watcher's half, and refreshed by any delta —
+    /// a task that keeps reporting keeps its exemption for as long as it runs.
+    #[test]
+    fn a_silent_async_task_stops_deferring_the_sweep_after_the_keepalive_window() {
+        let mut s = fresh_state();
+        let now = Utc::now();
+        s.apply_event(&AcpEvent::AsyncTask {
+            delta: async_task_delta("t1", true),
+        });
+        assert!(s.has_active_background_work(now));
+
+        let past_window = now + background_keepalive_max_age() + chrono::Duration::seconds(1);
+        assert!(
+            !s.has_active_background_work(past_window),
+            "a row that never settles must not exempt the connection forever"
+        );
+
+        // Any delta re-arms it, terminal state notwithstanding: the adapter is
+        // demonstrably still talking about this task.
+        s.apply_event(&AcpEvent::AsyncTask {
+            delta: AsyncTaskDelta {
+                last_tool_name: Some("Bash".into()),
+                ..async_task_delta("t1", false)
+            },
+        });
+        assert!(s.has_active_background_work(Utc::now()));
+    }
+
+    /// A fork attaches to a NEW session id on the same process. The old
+    /// session's task rows can never settle here again — their terminal frames
+    /// are published on the id `ActiveSessionHandler` has stopped routing to
+    /// this connection — so they must go, or the strip shows work that never
+    /// finishes and the keep-alive pins the CLI open.
+    #[test]
+    fn a_session_id_change_drops_the_previous_session_tasks() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::SessionStarted {
+            session_id: "s1".into(),
+        });
+        s.apply_event(&AcpEvent::AsyncTask {
+            delta: async_task_delta("t1", true),
+        });
+        assert!(s.has_active_background_work(Utc::now()));
+
+        // A duplicate announcement of the SAME id is a replay, not a fork.
+        s.apply_event(&AcpEvent::SessionStarted {
+            session_id: "s1".into(),
+        });
+        assert_eq!(s.async_tasks.len(), 1);
+
+        s.apply_event(&AcpEvent::SessionStarted {
+            session_id: "s2".into(),
+        });
+        assert!(s.async_tasks.is_empty());
+        assert!(!s.has_active_background_work(Utc::now()));
     }
 
     #[test]
@@ -2654,6 +3171,49 @@ mod tests {
         }
     }
 
+    /// The frontend reducer drops an empty `CONTENT_DELTA` outright, so a
+    /// streaming client never sees an empty `Text` block. If this side kept
+    /// one, a snapshot-hydrated client would get an extra block the streaming
+    /// one lacks — and prose either side of it would render as two runs
+    /// instead of one (#494 on the snapshot path only).
+    #[test]
+    fn empty_text_delta_adds_no_block_and_never_splits_a_run() {
+        let mut s = fresh_state();
+        s.status = ConnectionStatus::Prompting;
+        s.apply_event(&AcpEvent::Thinking {
+            text: "before".into(),
+            parent_tool_use_id: None,
+        });
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: String::new(),
+            parent_tool_use_id: None,
+        });
+        s.apply_event(&AcpEvent::Thinking {
+            text: " after".into(),
+            parent_tool_use_id: None,
+        });
+        let live = s.live_message.as_ref().expect("live message");
+        assert_eq!(live.content.len(), 1, "no empty Text block was inserted");
+        assert!(
+            matches!(&live.content[0], LiveContentBlock::Thinking { text, .. } if text == "before after"),
+            "the thinking run stayed one block, got {:?}",
+            live.content[0]
+        );
+    }
+
+    /// …and it must not open a live message either — same as the reducer,
+    /// which returns before `ensureLiveMessage`.
+    #[test]
+    fn empty_text_delta_does_not_open_a_live_message() {
+        let mut s = fresh_state();
+        s.status = ConnectionStatus::Prompting;
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: String::new(),
+            parent_tool_use_id: None,
+        });
+        assert!(s.live_message.is_none());
+    }
+
     #[test]
     fn parented_deltas_with_same_parent_merge() {
         let mut s = fresh_state();
@@ -3274,6 +3834,62 @@ mod tests {
         assert_eq!(s.last_assistant_text, None);
     }
 
+    /// A turn that never opened a live message has no text of its own either.
+    /// An agent whose only output was an empty text chunk reaches exactly that
+    /// state (`append_text_delta` drops it), and the turn still ends on
+    /// `end_turn` — so without clearing, `get_delegation_status` would hand the
+    /// PREVIOUS turn's answer back as this turn's result.
+    #[test]
+    fn turn_complete_clears_stale_text_when_the_turn_produced_nothing() {
+        let mut s = fresh_state();
+        s.status = ConnectionStatus::Prompting;
+        s.turn_in_flight = true;
+        s.last_assistant_text = Some("stale text from an earlier turn".into());
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: String::new(),
+            parent_tool_use_id: None,
+        });
+        assert!(s.live_message.is_none(), "empty chunk opens no live message");
+        s.apply_event(&AcpEvent::TurnComplete {
+            session_id: "ext".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: "codex".into(),
+        });
+        assert_eq!(s.last_assistant_text, None);
+    }
+
+    /// `TurnComplete` is emitted from three places, and the cancel path does
+    /// not wait for the agent — so a second one can land on an already-settled
+    /// turn. It must not wipe the text the first one captured.
+    #[test]
+    fn a_repeat_turn_complete_keeps_the_captured_text() {
+        let mut s = fresh_state();
+        s.status = ConnectionStatus::Prompting;
+        s.turn_in_flight = true;
+        s.live_message = Some(LiveMessage {
+            id: "m1".into(),
+            role: MessageRole::Assistant,
+            content: vec![LiveContentBlock::Text {
+                text: "the answer".into(),
+                parent_tool_use_id: None,
+            }],
+            started_at: Utc::now(),
+        });
+        let complete = AcpEvent::TurnComplete {
+            session_id: "ext".into(),
+            stop_reason: "cancelled".into(),
+            agent_type: "codex".into(),
+        };
+        s.apply_event(&complete);
+        assert_eq!(s.last_assistant_text.as_deref(), Some("the answer"));
+        s.apply_event(&complete);
+        assert_eq!(
+            s.last_assistant_text.as_deref(),
+            Some("the answer"),
+            "the agent's late response must not erase the captured result"
+        );
+    }
+
     #[test]
     fn permission_resolved_clears_matching_request() {
         // Mirrors the pet snapshot semantics: when the user (or auto-approve)
@@ -3440,6 +4056,7 @@ mod tests {
                     options: vec![],
                     groups: vec![],
                 }),
+                recommended_value: None,
             }],
         });
         s.apply_event(&AcpEvent::UsageUpdate {

@@ -1,13 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use walkdir::WalkDir;
 
+use crate::acp::agent_mentions::{
+    contains_only_internal_agent_routes, strip_internal_agent_routes,
+};
 use crate::models::*;
 use crate::parsers::codex_code_mode::{
     extract_chunk_ids, extract_shell_session_ids, is_code_mode_call, parse_code_mode_script,
@@ -21,6 +24,97 @@ use crate::parsers::{
 
 pub struct CodexParser {
     base_dir: PathBuf,
+}
+
+/// How many by-reference fork hops to follow when assembling a rollout's
+/// inherited history. Forking a fork is ordinary; an unbounded chain is not,
+/// and each hop costs a directory walk plus a whole file.
+const MAX_FORK_HOPS: usize = 8;
+
+/// How far into a rollout to look for the `session_meta` carrying the fork
+/// pointer. It is line 0 in every file on disk; the slack is for a future
+/// preamble, and the bound is what keeps this off the cost of a full parse for
+/// the overwhelming majority of rollouts, which are not forks.
+const FORK_HEADER_SCAN_LINES: usize = 4;
+
+/// A rollout line's `ordinal`, the position codex assigns within a thread's
+/// stream. `None` for older rollouts, which predate the field.
+fn codex_line_ordinal(line: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()?
+        .get("ordinal")?
+        .as_u64()
+}
+
+/// Drop the parent history a sub-agent rollout opens with, keeping the child's
+/// own header and everything it did itself.
+///
+/// A codex sub-agent runs as a full rollout of its own, but codex seeds the file
+/// with however much of the parent's thread the spawn asked to carry
+/// (`fork_turns`). Those records are the PARENT's, and at the record level they
+/// are indistinguishable from the child's — reading the file whole is what puts
+/// somebody else's conversation at the top of the child's transcript.
+///
+/// `subagent_history_start_ordinal` is codex's own declaration of where the seed
+/// ends, so the cut is exact rather than inferred. It is REQUIRED: rollouts
+/// without it (codex ≤ 0.147, `history_mode: "legacy"`) are returned untouched.
+/// Guessing a boundary there would be a bad trade — the obvious candidate, the
+/// first inter-agent message addressed to this child, also appears inside the
+/// replayed prefix whenever the parent had already talked to an earlier
+/// sub-agent of the same name.
+///
+/// Independent of the by-reference fork splice in `rollout_lines_inner`, and the
+/// two never fire on one file: a by-reference fork is identified by
+/// `forked_from_ordinal_exclusive`, which no sub-agent rollout carries.
+fn trim_subagent_replay_prefix(own: Vec<String>) -> Vec<String> {
+    let Some((header_idx, cut)) = own
+        .iter()
+        .enumerate()
+        .take_while(|(idx, _)| *idx < FORK_HEADER_SCAN_LINES)
+        .find_map(|(idx, line)| {
+            let value: serde_json::Value = serde_json::from_str(line).ok()?;
+            if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+                return None;
+            }
+            let payload = value.get("payload")?;
+            // Both are required: the ordinal alone would let an ordinary thread
+            // that happens to carry the field lose its opening records.
+            codex_parent_thread_id(payload)?;
+            let cut = payload
+                .get("subagent_history_start_ordinal")
+                .and_then(serde_json::Value::as_u64)?;
+            Some((idx, cut))
+        })
+    else {
+        return own;
+    };
+
+    // The seed is a PREFIX of the stream — `subagent_history_start_ordinal` is
+    // an index into it, not a predicate — so scan for the boundary and keep the
+    // rest verbatim. That costs one JSON parse per SEEDED record (ten or so in
+    // practice) instead of one per line: the session viewer re-reads a running
+    // child every couple of seconds, and these files run past a thousand lines.
+    //
+    // A record with no ordinal ends the scan too. It cannot be placed on either
+    // side, and stopping there can only keep more than necessary — never drop
+    // work the child did.
+    let boundary = own
+        .iter()
+        .position(|line| codex_line_ordinal(line).is_none_or(|ord| ord >= cut))
+        .unwrap_or(own.len());
+    // Nothing was seeded ahead of the child's own stream (a `cut` of 0, or a
+    // header that is already at or past it) — there is nothing to drop, and
+    // splicing the header back in would duplicate it.
+    if boundary <= header_idx {
+        return own;
+    }
+
+    // The header declares the lineage the parser latches identity from, and
+    // sits below the cut itself.
+    let mut kept = Vec::with_capacity(own.len() - boundary + 1);
+    kept.push(own[header_idx].clone());
+    kept.extend(own.into_iter().skip(boundary));
+    kept
 }
 
 impl Default for CodexParser {
@@ -40,6 +134,128 @@ impl CodexParser {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn with_base_dir(base_dir: PathBuf) -> Self {
         Self { base_dir }
+    }
+
+    /// Every line of a rollout, with a BY-REFERENCE fork's inherited history
+    /// spliced in ahead of its own.
+    ///
+    /// codex-acp 1.8.0's `session/fork` writes the child a rollout that contains
+    /// no history at all — just `session_meta` naming
+    /// `forked_from_id` + `forked_from_ordinal_exclusive`, then whatever the
+    /// child does next. Read alone it parses to zero turns, which is what put
+    /// "this session has no messages" under every `[Fork] …` row.
+    ///
+    /// Older forks are not like this: they REPLAY the parent inline (that is the
+    /// second `session_meta` header `is_forked_thread_header` keys off) and so
+    /// need no help. `forked_from_ordinal_exclusive` is what tells the two
+    /// apart — on disk, only the by-reference shape carries it. The ordinal
+    /// filter makes that distinction self-enforcing rather than a bet: the
+    /// parent contributes ordinals BELOW the cut and the child only its own
+    /// at-or-above, so a child that did replay inline can't end up with the
+    /// history twice.
+    ///
+    /// The assembled order reproduces codex's own inline shape exactly — the
+    /// child's header, then the parent's stream, then the child's body — because
+    /// the parser latches `parent_id` from the FIRST header it sees and the
+    /// child's is the one that declares the lineage.
+    fn rollout_lines(&self, path: &std::path::Path) -> Result<Vec<String>, ParseError> {
+        self.rollout_lines_inner(path, MAX_FORK_HOPS)
+    }
+
+    fn rollout_lines_inner(
+        &self,
+        path: &std::path::Path,
+        hops_left: usize,
+    ) -> Result<Vec<String>, ParseError> {
+        let own: Vec<String> = BufReader::new(fs::File::open(path)?)
+            .lines()
+            .map_while(Result::ok)
+            .collect();
+        let own = trim_subagent_replay_prefix(own);
+
+        // The fork pointer rides the first header; anything past it is content.
+        let Some((header_idx, parent_id, cut)) = own
+            .iter()
+            .enumerate()
+            .take_while(|(idx, _)| *idx < FORK_HEADER_SCAN_LINES)
+            .find_map(|(idx, line)| {
+                let value: serde_json::Value = serde_json::from_str(line).ok()?;
+                let payload = value.get("payload")?;
+                if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+                    return None;
+                }
+                let parent = payload
+                    .get("forked_from_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())?;
+                let cut = payload
+                    .get("forked_from_ordinal_exclusive")
+                    .and_then(serde_json::Value::as_u64)?;
+                Some((idx, parent.to_string(), cut))
+            })
+        else {
+            return Ok(own);
+        };
+
+        if hops_left == 0 {
+            tracing::warn!(
+                parent_id = %parent_id,
+                "[codex] fork chain deeper than {MAX_FORK_HOPS}; rendering without inherited history"
+            );
+            return Ok(own);
+        }
+
+        // A parent codeg cannot find is not an error: the rollout may have been
+        // pruned, or live in a codex home this parser isn't pointed at. Degrade
+        // to the child's own lines rather than refusing the conversation.
+        let Some(parent_path) = self.find_rollout_by_session_id(&parent_id) else {
+            tracing::debug!(
+                parent_id = %parent_id,
+                "[codex] forked rollout names a parent with no file here"
+            );
+            return Ok(own);
+        };
+        if parent_path == path {
+            return Ok(own);
+        }
+        let parent = self.rollout_lines_inner(&parent_path, hops_left - 1)?;
+
+        let mut assembled = Vec::with_capacity(parent.len() + own.len());
+        assembled.push(own[header_idx].clone());
+        assembled.extend(
+            parent
+                .into_iter()
+                .filter(|line| codex_line_ordinal(line).is_none_or(|ord| ord < cut)),
+        );
+        assembled.extend(own.into_iter().enumerate().filter_map(|(idx, line)| {
+            if idx == header_idx {
+                return None;
+            }
+            codex_line_ordinal(&line)
+                .is_none_or(|ord| ord >= cut)
+                .then_some(line)
+        }));
+        Ok(assembled)
+    }
+
+    /// The rollout file for a session id. Codex embeds the id in the filename,
+    /// so this never opens a file.
+    fn find_rollout_by_session_id(&self, session_id: &str) -> Option<std::path::PathBuf> {
+        if session_id.is_empty() || session_id.contains(['/', '\\']) || session_id.contains("..") {
+            return None;
+        }
+        WalkDir::new(&self.base_dir)
+            .into_iter()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().to_path_buf())
+            .find(|path| {
+                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    return false;
+                }
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                name.starts_with("rollout-") && name.contains(session_id)
+            })
     }
 
     /// Load Codex's append-only session title index. The transcript remains the
@@ -81,13 +297,14 @@ impl CodexParser {
 
     fn parse_jsonl_summary(
         &self,
-        path: &PathBuf,
+        path: &Path,
     ) -> Result<Option<ConversationSummary>, ParseError> {
-        let file = fs::File::open(path)?;
-        let reader = BufReader::new(file);
+        let lines = self.rollout_lines(path)?;
 
         let mut conversation_id: Option<String> = None;
         let mut cwd: Option<String> = None;
+        let mut parent_id: Option<String> = None;
+        let mut session_header_seen = false;
         let mut git_branch: Option<String> = None;
         let mut model: Option<String> = None;
         let mut title: Option<String> = None;
@@ -108,12 +325,34 @@ impl CodexParser {
         let mut has_real_user = false;
         let mut goal_objective: Option<String> = None;
         let mut goal_opens_session = false;
+        // Mirror of the detail parser's `response_item.message` promotion — see
+        // [`ResponseItemPromotion`]. The two must agree or the sidebar entry and
+        // the opened conversation disagree about count and title. Only the
+        // per-candidate PAYLOAD differs (the list path needs no blocks): here it
+        // is `(is_user, title_candidate)`, kept parallel to the shared tracker's
+        // own candidate vector.
+        let mut promotion = ResponseItemPromotion::new();
+        let mut pending_promotions: Vec<(bool, Option<String>)> = Vec::new();
+        let mut first_goal_ordinal: Option<u64> = None;
+        let mut title_source_ordinal: Option<u64> = None;
+        let mut title_from_thread_name = false;
+        // Cross-channel dedup, mirroring the detail parser's
+        // `should_skip_duplicate_user_message`: codex writes the same prompt
+        // through BOTH `event_msg` and `response_item`, so counting each one
+        // would put the sidebar's message count one ahead of the turns the
+        // opened conversation actually renders.
+        let mut recent_user_records: Vec<(DateTime<Utc>, UserTurnFingerprint)> = Vec::new();
+        // Plan mode, mirroring the detail parser so the sidebar count tracks the
+        // turns the opened conversation renders: a plan document counts once
+        // (whichever of its two copies is seen first), and the synthetic
+        // approval prompt counts not at all. Pairing slot and approval guard are
+        // separate for the same reason they are there — see that parser.
+        let mut collaboration_mode_is_plan = false;
+        let mut plan_approval_expected = false;
+        let mut pending_plan_twin: Option<String> = None;
+        let mut plan_counted = false;
 
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
+        for line in lines {
             if line.trim().is_empty() {
                 continue;
             }
@@ -124,6 +363,9 @@ impl CodexParser {
             };
 
             let msg_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+            let record_ordinal =
+                promotion.note_record(msg_type, promotion_payload_type(msg_type, &value));
 
             if let Some(ts_str) = value.get("timestamp").and_then(|t| t.as_str()) {
                 if let Ok(ts) = ts_str.parse::<DateTime<Utc>>() {
@@ -136,7 +378,20 @@ impl CodexParser {
 
             match msg_type {
                 "session_meta" => {
-                    if let Some(payload) = value.get("payload") {
+                    // The FIRST header is this thread's own; every later one
+                    // belongs to a parent. Two shapes put a second header in
+                    // this stream: an inline-replay fork writes the parent's
+                    // header into its own file, and a by-reference fork gets
+                    // the parent's lines spliced in by `rollout_lines`. In both
+                    // the parent header carries the PARENT's `id`, `cwd` and
+                    // branch, so a last-one-wins read would file the child's
+                    // whole summary under the parent's session id — two rollouts
+                    // claiming one id, which the conversation-list dedup then
+                    // collapses, losing the fork. Latch every identity field,
+                    // not just `parent_id`. Same rule `parse_codex_subagent_stats`
+                    // uses.
+                    if let Some(payload) = value.get("payload").filter(|_| !session_header_seen) {
+                        session_header_seen = true;
                         conversation_id = payload
                             .get("id")
                             .and_then(|s| s.as_str())
@@ -145,6 +400,7 @@ impl CodexParser {
                             .get("cwd")
                             .and_then(|s| s.as_str())
                             .map(|s| s.to_string());
+                        parent_id = codex_parent_thread_id(payload);
                         _cli_version = payload
                             .get("cli_version")
                             .and_then(|s| s.as_str())
@@ -156,12 +412,26 @@ impl CodexParser {
                             .map(|s| s.to_string());
                     }
                 }
-                "turn_context" if model.is_none() => {
-                    model = value
-                        .get("payload")
-                        .and_then(|p| p.get("model"))
-                        .and_then(|m| m.as_str())
-                        .map(|s| s.to_string());
+                "turn_context" => {
+                    if model.is_none() {
+                        model = value
+                            .get("payload")
+                            .and_then(|p| p.get("model"))
+                            .and_then(|m| m.as_str())
+                            .map(|s| s.to_string());
+                    }
+                    // Arm the plan-approval filter — see the detail parser's
+                    // `turn_context` arm for why the mode flip is the signal and
+                    // why a repeated context must not disarm.
+                    if let Some(mode) = turn_collaboration_mode(&value) {
+                        let is_plan = mode == "plan";
+                        if is_plan {
+                            plan_approval_expected = false;
+                        } else if collaboration_mode_is_plan {
+                            plan_approval_expected = true;
+                        }
+                        collaboration_mode_is_plan = is_plan;
+                    }
                 }
                 "event_msg" => {
                     if let Some(payload) = value.get("payload") {
@@ -169,17 +439,62 @@ impl CodexParser {
                             payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
                         match payload_type {
                             "user_message" => {
+                                let raw_text = payload
+                                    .get("message")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("");
+                                // codex's own post-approval prompt — suppressed in
+                                // the detail parser, so it must not be counted here
+                                // either. Both signals required, and the wording
+                                // compared verbatim; see that arm. Consumed as the
+                                // FIRST thing this arm does, matching the detail
+                                // parser: the arm names the next user record, so a
+                                // record that later `continue`s must still spend it.
+                                let approval_armed = std::mem::take(&mut plan_approval_expected);
+                                if approval_armed
+                                    && raw_text == CODEX_PLAN_APPROVAL_PROMPT
+                                    && std::mem::take(&mut plan_counted)
+                                {
+                                    continue;
+                                }
+
+                                let visible_text = strip_internal_agent_routes(raw_text);
+                                let has_images = payload
+                                    .get("images")
+                                    .and_then(|v| v.as_array())
+                                    .is_some_and(|images| !images.is_empty());
+                                if contains_only_internal_agent_routes(raw_text) && !has_images {
+                                    continue;
+                                }
+                                if skip_duplicate_user_record(
+                                    &mut recent_user_records,
+                                    UserTurnFingerprint::from_event_message(payload),
+                                    parse_codex_timestamp(&value).unwrap_or_else(Utc::now),
+                                ) {
+                                    continue;
+                                }
                                 message_count += 1;
                                 has_real_user = true;
                                 if title.is_none() {
-                                    title = payload
-                                        .get("message")
-                                        .and_then(|m| m.as_str())
-                                        .and_then(|text| extract_codex_title_candidate(text, true));
+                                    title = extract_codex_title_candidate(&visible_text, true);
+                                    if title.is_some() {
+                                        title_source_ordinal = Some(record_ordinal);
+                                    }
                                 }
                             }
                             "agent_message" => {
                                 message_count += 1;
+                            }
+                            "item_completed" => {
+                                // A Plan turn publishes its answer here instead of
+                                // on `agent_message`, so it counts like one. The
+                                // body is remembered so this plan's assistant
+                                // `response_item` copy does not count a second time.
+                                if let Some(plan) = completed_plan_item_text(payload) {
+                                    message_count += 1;
+                                    pending_plan_twin = Some(plan.to_string());
+                                    plan_counted = true;
+                                }
                             }
                             "thread_goal_updated" => {
                                 // Capture the first OPENING goal for the fallback,
@@ -208,8 +523,12 @@ impl CodexParser {
                                                     &marker.objective,
                                                     true,
                                                 );
+                                                if title.is_some() {
+                                                    title_source_ordinal = Some(record_ordinal);
+                                                }
                                             }
                                             goal_objective = Some(marker.objective);
+                                            first_goal_ordinal = Some(record_ordinal);
                                         }
                                     }
                                 }
@@ -227,6 +546,7 @@ impl CodexParser {
                                     .filter(|n| !n.is_empty())
                                 {
                                     title = Some(truncate_str(name, 100));
+                                    title_from_thread_name = true;
                                 }
                             }
                             _ => {}
@@ -239,28 +559,126 @@ impl CodexParser {
                             payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
                         if payload_type == "message" {
                             let role = payload.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                            // The detail parser only turns an IMAGE-bearing
+                            // The detail parser turns an IMAGE-bearing
                             // `response_item` user into a real user turn
-                            // (`extract_response_item_user_image_blocks`) and only
-                            // titles from that same turn. Text-only `response_item`
-                            // users are internal envelopes (`<environment_context>`,
-                            // `<codex_internal_context>`, `<turn_aborted>`, …) or
-                            // duplicates of `event_msg.user_message` — detail ignores
-                            // them for BOTH the turn and the title, so the summary
-                            // must too. Mirroring it here keeps the pure-`/goal`
-                            // fallback (title + count) in exact sync and stops
-                            // internal text from leaking into the list title.
+                            // (`extract_response_item_user_image_blocks`) and titles
+                            // from that same turn — unconditionally, because the
+                            // canonical channel never carries the image. Everything
+                            // else goes through the same held-back promotion the
+                            // detail parser uses, so the two stay in exact sync on
+                            // both the count and the pure-`/goal` fallback.
                             if role == "user" && response_item_user_has_image(payload) {
+                                // Same dedup the detail parser applies before
+                                // pushing this turn — without it a prompt codex
+                                // wrote to BOTH channels counts twice here and
+                                // once there.
+                                if skip_duplicate_user_record(
+                                    &mut recent_user_records,
+                                    UserTurnFingerprint::from_response_item(payload),
+                                    parse_codex_timestamp(&value).unwrap_or_else(Utc::now),
+                                ) {
+                                    continue;
+                                }
+                                message_count += 1;
                                 has_real_user = true;
                                 if title.is_none() {
                                     title = extract_codex_text_content(payload)
                                         .and_then(|t| extract_codex_title_candidate(&t, false));
+                                    if title.is_some() {
+                                        title_source_ordinal = Some(record_ordinal);
+                                    }
+                                }
+                            } else if let Some(is_user) = match role {
+                                "user" => Some(true),
+                                "assistant" => Some(false),
+                                _ => None,
+                            } {
+                                if let Some(blocks) =
+                                    extract_response_item_message_blocks(payload, is_user)
+                                {
+                                    let text = first_text_block(&blocks).unwrap_or_default();
+
+                                    // Plan document, counted outside the promotion
+                                    // gate exactly as the detail parser renders it
+                                    // outside that gate — once per plan, no matter
+                                    // which of its two copies the rollout carries.
+                                    // The pairing slot is consumed either way, so
+                                    // two plan turns proposing the same body still
+                                    // count twice.
+                                    if !is_user {
+                                        if let Some(body) = proposed_plan_body(&text) {
+                                            let is_twin = pending_plan_twin
+                                                .take()
+                                                .is_some_and(|seen| seen == body);
+                                            if !is_twin {
+                                                message_count += 1;
+                                            }
+                                            plan_counted = true;
+                                            continue;
+                                        }
+                                    }
+
+                                    let promotable = if text.trim().is_empty() {
+                                        true
+                                    } else if is_user {
+                                        is_promotable_user_text(&text)
+                                    } else {
+                                        is_promotable_assistant_text(&text)
+                                    };
+                                    if promotable {
+                                        promotion.push_candidate(record_ordinal, is_user);
+                                        pending_promotions.push((
+                                            is_user,
+                                            is_user
+                                                .then(|| {
+                                                    extract_codex_title_candidate(&text, true)
+                                                })
+                                                .flatten(),
+                                        ));
+                                    }
                                 }
                             }
                         }
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Promote the held-back `response_item.message` records — see the twin
+        // block in `parse_conversation_detail`, whose `turns.len()` this count
+        // has to track.
+        let survivors = promotion.resolve();
+        let promoted_user_ordinal = promotion.first_surviving_user_ordinal(&survivors);
+        message_count += survivors.iter().filter(|keep| **keep).count() as u32;
+
+        if let (Some(goal_ordinal), Some(user_ordinal)) =
+            (first_goal_ordinal, promoted_user_ordinal)
+        {
+            if user_ordinal < goal_ordinal {
+                goal_opens_session = false;
+            }
+        }
+
+        // NOTE: `has_real_user` deliberately is NOT back-filled here. Its only
+        // consumer is the in-loop `goal_opens_session = !has_real_user`, whose
+        // outcome the ordinal comparison above already corrects; assigning it
+        // post-loop would be dead code that reads as if it did something.
+
+        if !title_from_thread_name {
+            if let Some(user_ordinal) = promoted_user_ordinal {
+                let promoted_title = pending_promotions
+                    .into_iter()
+                    .zip(&survivors)
+                    .find(|((is_user, _), keep)| **keep && *is_user)
+                    .and_then(|((_, candidate), _)| candidate);
+                if let Some(candidate) = promoted_title {
+                    if title.is_none()
+                        || title_source_ordinal.is_none_or(|current| user_ordinal < current)
+                    {
+                        title = Some(candidate);
+                    }
+                }
             }
         }
 
@@ -300,7 +718,7 @@ impl CodexParser {
             message_count,
             model,
             git_branch,
-            parent_id: None,
+            parent_id,
             parent_tool_use_id: None,
             delegation_call_id: None,
         }))
@@ -1027,6 +1445,236 @@ fn unwrap_code_mode_script(
     )
 }
 
+#[derive(Debug)]
+struct CompletedMcpCall {
+    id: String,
+    server: String,
+    tool: String,
+    input_preview: Option<String>,
+    output_preview: Option<String>,
+    is_error: bool,
+}
+
+/// How much of a serialized MCP result stands in for a call that answered in
+/// blocks with no text of its own. Matches `pi`'s cap on the same shape: enough
+/// to show what came back, not enough for a base64 blob to swamp the card.
+const MCP_RESULT_FALLBACK_CAP: usize = 4000;
+
+/// A sink that accepts `budget` bytes and then refuses, so a serializer writing
+/// into it stops instead of running to the end of its input.
+struct BudgetedSink {
+    buf: Vec<u8>,
+    budget: usize,
+}
+
+impl std::io::Write for BudgetedSink {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let room = self.budget.saturating_sub(self.buf.len());
+        if room == 0 {
+            return Err(std::io::Error::other("preview budget reached"));
+        }
+        let take = room.min(data.len());
+        self.buf.extend_from_slice(&data[..take]);
+        Ok(take)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `value` serialized into a `max_chars` preview without ever building an
+/// UNBOUNDED serialization. A value that fits is still written out whole —
+/// into a buffer that cannot grow past the budget.
+///
+/// `serde_json::to_string` materializes all of it first — for an image-only
+/// MCP result that is the entire base64 blob, allocated and then walked twice
+/// more by `truncate_str`, to keep a few thousand characters of it. This
+/// produces exactly the same string while the buffer stays at
+/// `4 * max_chars + 1` bytes. UTF-8 spends at most 4 bytes per character, so
+/// that many always cover `max_chars` of them — and the `+ 1` is what makes it
+/// STRICTLY more, which is the whole proof: a full buffer therefore always
+/// decodes to more than `max_chars` characters, so it is always truncated, so
+/// the partial character a byte cut leaves behind is always among the ones
+/// dropped. At `4 * max_chars` alone the strictness would rest on JSON always
+/// opening with an ASCII byte and so never letting a full buffer land on
+/// exactly `max_chars` — which holds for every `max_chars` but zero, and even
+/// then is a fact about the format rather than about this function. The `+ 1`
+/// is what makes it a property of the arithmetic.
+///
+/// What it bounds is the MEMORY, which is the part that can fail. Time is only
+/// mostly bounded: `serde_json` walks a string looking for escapes before
+/// offering any of it to the writer, so one oversized string is still read
+/// through once — a pass over bytes already resident, not a second copy of
+/// them. Stopping even that would mean replacing the serializer.
+///
+/// `None` for a value that serializes to nothing at all.
+fn serialize_preview(value: &serde_json::Value, max_chars: usize) -> Option<String> {
+    let mut sink = BudgetedSink {
+        buf: Vec::new(),
+        budget: max_chars.saturating_mul(4).saturating_add(1),
+    };
+    // A value that fits reports `Ok`; one that does not aborts with the sink's
+    // own error. Both leave `buf` holding the prefix, and `serde_json` cannot
+    // fail on a `Value` for any other reason.
+    let _ = serde_json::to_writer(&mut sink, value);
+    let text = String::from_utf8_lossy(&sink.buf);
+    (!text.is_empty()).then(|| truncate_str(&text, max_chars))
+}
+
+fn completed_mcp_call(payload: &serde_json::Value) -> Option<CompletedMcpCall> {
+    let item = payload.get("item")?;
+    if item.get("type").and_then(|v| v.as_str()) != Some("McpToolCall") {
+        return None;
+    }
+    let result = item.get("result").filter(|value| !value.is_null());
+    let stated_error = item.get("error").filter(|value| is_stated_error(value));
+    // Text first, then the structured twin. The last two are for the shapes
+    // that carry neither — a transport failure that answered with `error` and
+    // no result, or a `content` array holding only blocks this reader cannot
+    // render (an image, a resource). The semantic path DISCARDS the wrapper's
+    // own printed output, so a `None` here is not a quiet degradation, it is a
+    // card that says nothing at all where the script card used to show the
+    // run's text.
+    //
+    // Only the LAST one is truncated, and only for what the card SHOWS — it is
+    // the shape that can be a base64 blob, and a card must not be flooded with
+    // one. Nothing may decide an OUTCOME from a cut string: the heuristic below
+    // re-parses a preview that opens with `{` or `[` and looks for a failed
+    // `status` inside it (`infer_output_text_is_error`), and truncating valid
+    // JSON makes that parse fail silently, settling a call that reported
+    // failure GREEN. So the cut branch also hands back the value it cut, and
+    // the outcome is read from that instead.
+    let output_preview = result
+        .and_then(|result| result.get("content"))
+        .and_then(crate::parsers::pi::tool_result_content_text)
+        .or_else(|| {
+            result
+                .and_then(|result| result.get("structuredContent"))
+                .and_then(|value| serde_json::to_string(value).ok())
+        })
+        .or_else(|| value_to_preview(stated_error));
+    // `content` rather than the whole envelope. A call that returned NOTHING
+    // still says nothing — `{"content":[]}` is not worth rendering.
+    let blocks = output_preview
+        .is_none()
+        .then(|| result?.get("content"))
+        .flatten()
+        .filter(|content| content.as_array().is_some_and(|blocks| !blocks.is_empty()));
+    let output_preview = output_preview
+        .or_else(|| blocks.and_then(|content| serialize_preview(content, MCP_RESULT_FALLBACK_CAP)));
+    // The record STATES its outcome — `result.isError`, the item's own terminal
+    // `status`, and an `error` when the call never reached the server. Believe
+    // them. `infer_tool_call_output_is_error` reads tea leaves out of the
+    // output text because a script card has no such field; run against an
+    // authoritative record it can only invent failures, and a tool that
+    // legitimately PRINTS `exit code: 1` or answers with a line opening
+    // `Error:` returned perfectly well. Kept as the fallback for a record that
+    // states nothing. Stated failure outranks stated success, so a record
+    // contradicting itself settles as the error it reported.
+    let stated_is_error = result
+        .and_then(|result| result.get("isError"))
+        .and_then(serde_json::Value::as_bool);
+    let claimed_failed =
+        stated_is_error == Some(true)
+            || stated_error.is_some()
+            || item
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(is_failed_status);
+    let claimed_ok = stated_is_error == Some(false)
+        || item.get("status").and_then(serde_json::Value::as_str) == Some("completed");
+    Some(CompletedMcpCall {
+        id: item.get("id")?.as_str()?.to_string(),
+        server: item.get("server")?.as_str()?.to_string(),
+        tool: item.get("tool")?.as_str()?.to_string(),
+        input_preview: value_to_preview(item.get("arguments")),
+        is_error: claimed_failed
+            || (!claimed_ok
+                && (infer_tool_call_output_is_error(item, result, output_preview.as_deref())
+                    || blocks_report_failure(blocks))),
+        output_preview,
+    })
+}
+
+/// Whether any block in a result's `content` array REPORTS a failure.
+///
+/// The blocks are what the preview above was cut out of, and the cut string
+/// no longer re-parses, so the outcome has to be read here or not at all —
+/// truncation may cost a card characters, never a call its verdict.
+///
+/// A block's own report, deliberately, and no descent. A full
+/// `infer_output_value_is_error` walk follows `data`, which in a tool-output
+/// envelope is a nested result but on an MCP block is the PAYLOAD — the base64
+/// the cap above refuses to copy, and which `infer_output_text_is_error` would
+/// lowercase into a second copy of itself anyway. A payload that happens to
+/// read like an error is still just bytes. Depth 4 is how that is said to a
+/// walker whose own limit is 4: it reads the outcome fields it recognizes and
+/// then every descent refuses. Only OBJECT blocks are asked, because only they
+/// can carry such a field — MCP `content` holds typed blocks, and a bare
+/// string among them is not a shape this can read a verdict out of.
+///
+/// Still not free in the worst case: a recognized field can itself be huge
+/// (`{"stderr": "<megabytes of spaces>"}` costs a `trim`). That is a pass over
+/// one already-resident string, not a copy of it, and unlike `data` it is a
+/// field a block would have to have gone out of its way to carry.
+fn blocks_report_failure(blocks: Option<&serde_json::Value>) -> bool {
+    blocks
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| block.is_object())
+                .any(|block| infer_output_value_is_error(block, 4))
+        })
+}
+
+fn unwrap_completed_mcp_calls(
+    script: &CodeModeScript,
+    completed: Vec<CompletedMcpCall>,
+) -> Option<(Vec<ContentBlock>, Vec<ContentBlock>)> {
+    if script.tool_names.len() != completed.len() || script.tool_names.is_empty() {
+        return None;
+    }
+    let names_match = script
+        .tool_names
+        .iter()
+        .zip(&completed)
+        .all(|(tool_name, item)| {
+            let server = item.server.replace('-', "_");
+            tool_name == &format!("mcp__{server}__{}", item.tool)
+        });
+    if !names_match {
+        return None;
+    }
+    let mut uses = Vec::with_capacity(completed.len());
+    let mut results = Vec::with_capacity(completed.len());
+    for (index, item) in completed.into_iter().enumerate() {
+        uses.push(ContentBlock::ToolUse {
+            tool_use_id: Some(item.id.clone()),
+            tool_name: script.tool_names[index].clone(),
+            input_preview: item.input_preview,
+            // Read off the item's OWN outcome, never hardcoded: a code-mode
+            // script whose MCP call failed still prints `Script completed`
+            // (measured: a `delegate_to_agent` refused for `depth_limit`
+            // settles the script fine), so claiming `completed` here would
+            // contradict the very result block written next to it. This is a
+            // per-call terminal record — not `ScriptStatus`, which
+            // `ContentBlock::ToolUse::status` documents as unsafe to copy.
+            status: Some(if item.is_error { "failed" } else { "completed" }.into()),
+            meta: None,
+        });
+        results.push(ContentBlock::ToolResult {
+            tool_use_id: Some(item.id),
+            output_preview: item.output_preview,
+            is_error: item.is_error,
+            agent_stats: None,
+            images: Vec::new(),
+        });
+    }
+    Some((uses, results))
+}
+
 /// What the renderer needs to know about a call recovered from a code-mode
 /// script, as facts rather than prose: the backend states them, the frontend
 /// words them in the reader's language.
@@ -1466,6 +2114,18 @@ fn infer_output_text_is_error(text: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("error:"))
 }
 
+/// Whether an `error` field STATES an error rather than merely existing.
+/// `null`, `false` and a blank string are how a record says "no error", and a
+/// reader that took their presence for failure would fail every clean call
+/// that carries the key.
+fn is_stated_error(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(false) => false,
+        serde_json::Value::String(text) => !text.trim().is_empty(),
+        _ => true,
+    }
+}
+
 fn infer_output_value_is_error(value: &serde_json::Value, depth: usize) -> bool {
     if depth > 4 {
         return false;
@@ -1511,13 +2171,8 @@ fn infer_output_value_is_error(value: &serde_json::Value, depth: usize) -> bool 
                 }
             }
 
-            if let Some(error) = map.get("error") {
-                match error {
-                    serde_json::Value::Null => {}
-                    serde_json::Value::Bool(false) => {}
-                    serde_json::Value::String(s) if s.trim().is_empty() => {}
-                    _ => return true,
-                }
+            if map.get("error").is_some_and(is_stated_error) {
+                return true;
             }
 
             for key in ["output", "result", "details", "data"] {
@@ -1552,13 +2207,8 @@ fn infer_tool_call_output_is_error(
         }
     }
 
-    if let Some(error) = payload.get("error") {
-        match error {
-            serde_json::Value::Null => {}
-            serde_json::Value::Bool(false) => {}
-            serde_json::Value::String(s) if s.trim().is_empty() => {}
-            _ => return true,
-        }
+    if payload.get("error").is_some_and(is_stated_error) {
+        return true;
     }
 
     if let Some(output) = output_value {
@@ -1635,6 +2285,120 @@ fn is_native_team_spawn(args: Option<&serde_json::Value>) -> bool {
     args.is_some_and(|a| a.get("agent_type").is_none() && a.get("task_name").is_some())
 }
 
+/// Synthetic input key naming the sub-agent's TERMINAL state, when codex
+/// reported one. Absent while the child is still working (or was never heard
+/// from again), which is the state [`CODEX_SUBAGENT_LAUNCH_KEY`] describes.
+///
+/// Written by both the rollout parser and the live path
+/// (`acp/connection.rs`), so a reload cannot disagree with the stream about
+/// whether the child finished.
+pub const CODEX_SUBAGENT_STATE_KEY: &str = "__codegCodexSubagentState";
+
+/// One `SubAgentActivity` record, normalized across the two on-disk shapes.
+///
+/// `call_id` is the SPAWN's own `call_id` for a `started` record — the key that
+/// ties a child thread back to the capsule that launched it. A terminal record
+/// carries a synthetic id of its own (`subagent-completed-<uuid>`) instead, so
+/// only `thread_id` correlates there.
+struct CodexSubagentActivityRecord<'a> {
+    call_id: Option<&'a str>,
+    thread_id: &'a str,
+    agent_path: Option<&'a str>,
+    kind: &'a str,
+}
+
+/// Read one `event_msg` payload as a `SubAgentActivity`, whichever shape codex
+/// wrote it in.
+///
+/// TWO shapes are live on disk and neither may be dropped:
+///
+/// * `event_msg.sub_agent_activity` with flat
+///   `{event_id, agent_thread_id, agent_path, kind}` — codex ≤ 0.147.
+/// * `event_msg.item_completed.item` with
+///   `{type: "SubAgentActivity", id, agent_thread_id, agent_path, kind}` —
+///   codex 0.153.4, which retired the flat event entirely (measured on a real
+///   0.153.4 parent rollout: flat 0 records, nested 26).
+///
+/// Reading only the flat one — as this did before — meant every 0.153.4
+/// sub-agent capsule reloaded with no `agent_id` at all, so the badge the live
+/// stream showed disappeared on refresh and nothing could resolve the child's
+/// own rollout. `item.id` is the same spawn `call_id` the flat `event_id`
+/// carried, so the two normalize onto one record with no correlation loss.
+fn codex_subagent_activity_record<'a>(
+    payload_type: &str,
+    payload: &'a serde_json::Value,
+) -> Option<CodexSubagentActivityRecord<'a>> {
+    let source = match payload_type {
+        "sub_agent_activity" => payload,
+        "item_completed" => {
+            let item = payload.get("item")?;
+            if item.get("type").and_then(serde_json::Value::as_str) != Some("SubAgentActivity") {
+                return None;
+            }
+            item
+        }
+        _ => return None,
+    };
+    let str_field = |key: &str| {
+        source
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    Some(CodexSubagentActivityRecord {
+        // `event_id` on the flat shape, `id` on the nested item.
+        call_id: str_field("event_id").or_else(|| str_field("id")),
+        thread_id: str_field("agent_thread_id")?,
+        agent_path: str_field("agent_path"),
+        kind: str_field("kind").unwrap_or(""),
+    })
+}
+
+/// The envelope header codex puts on an inter-agent `agent_message`, and the
+/// only message type whose payload is readable.
+const CODEX_FINAL_ANSWER_HEADER: &str = "Message Type: FINAL_ANSWER";
+
+/// Where the envelope's own preamble ends and the sender's text begins.
+const CODEX_INTER_AGENT_PAYLOAD_MARKER: &str = "Payload:\n";
+
+/// A sub-agent's finished report, read off a `response_item.agent_message` in
+/// the PARENT's rollout: `(author path, body)`.
+///
+/// This is the one piece of a codex team-of-agents exchange that is not sealed.
+/// Every inter-agent message rides the same envelope, but only the terminal one
+/// carries plaintext — measured across every such record on disk for two
+/// months: `FINAL_ANSWER` 8/8 plaintext with a body, `MESSAGE` and `NEW_TASK`
+/// 0/82 (both are Fernet blobs in a sibling `encrypted_content` part, in the
+/// child's own rollout too, so there is nothing to recover for those).
+///
+/// The header match is anchored at the start of the text rather than a
+/// substring search: a sub-agent that merely writes ABOUT the protocol — which
+/// one reviewing this repository will — must not have its `MESSAGE` mistaken
+/// for a report.
+fn codex_inter_agent_final_answer(payload: &serde_json::Value) -> Option<(&str, String)> {
+    let author = payload
+        .get("author")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let text: String = payload
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter(|part| part.get("type").and_then(serde_json::Value::as_str) == Some("input_text"))
+        .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+        .collect();
+    if !text.starts_with(CODEX_FINAL_ANSWER_HEADER) {
+        return None;
+    }
+    let body = text
+        .split_once(CODEX_INTER_AGENT_PAYLOAD_MARKER)
+        .map(|(_, body)| body)?
+        .trim();
+    (!body.is_empty()).then(|| (author, body.to_string()))
+}
+
 /// Replace every encrypted envelope inside a parsed argument tree with
 /// [`CODEX_ENCRYPTED_PLACEHOLDER`], returning whether anything was replaced.
 ///
@@ -1677,10 +2441,16 @@ fn redact_encrypted_children<'a>(
     changed
 }
 
-/// Add `agent_id` to a spawn execution capsule's input JSON (the
+/// Add `agent_id` — and the child's terminal state, once codex has reported one
+/// — to a spawn execution capsule's input JSON (the
 /// `{subagent_type,prompt,description}` object), so the card can show the
-/// sub-agent UUID. Tolerates a missing/!object input by starting fresh.
-fn inject_agent_id_into_input(input: Option<&str>, agent_id: &str) -> String {
+/// sub-agent UUID and stop claiming the child's fate is unknowable. Tolerates a
+/// missing/!object input by starting fresh.
+fn inject_agent_id_into_input(
+    input: Option<&str>,
+    agent_id: &str,
+    terminal_kind: Option<&str>,
+) -> String {
     let mut obj = input
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         .and_then(|v| v.as_object().cloned())
@@ -1689,6 +2459,12 @@ fn inject_agent_id_into_input(input: Option<&str>, agent_id: &str) -> String {
         "agent_id".to_string(),
         serde_json::Value::String(agent_id.to_string()),
     );
+    if let Some(kind) = terminal_kind {
+        obj.insert(
+            CODEX_SUBAGENT_STATE_KEY.to_string(),
+            serde_json::Value::String(kind.to_string()),
+        );
+    }
     serde_json::Value::Object(obj).to_string()
 }
 
@@ -1775,10 +2551,100 @@ fn build_collab_wait_input(status: &serde_json::Map<String, serde_json::Value>) 
     (input.to_string(), any_error)
 }
 
-/// Whether a transcript's opening record declares it a forked thread
-/// (`session_meta.parent_thread_id`) — codex 0.147's sub-agent shape, where the
-/// child is a rollout of its own and `fork_turns` copies the parent's history
-/// into its head.
+/// The primary agent's own path in codex's team-of-agents tree. Every other
+/// path under it is a sub-agent.
+const CODEX_ROOT_AGENT_PATH: &str = "/root";
+
+/// Build a `collab_agent` capsule for `list_agents`, whose output is a roster:
+/// `{"agents":[{"agent_name","agent_status"}]}` where `agent_status` is either a
+/// bare state string (`"running"`) or the same terminal map a wait returns
+/// (`{"completed": "<full report>"}`).
+///
+/// Worth a capsule of its own because a finished child's ENTIRE report is in
+/// there: with the native team-of-agents there is no `close_agent`, and the wait
+/// carries only `{"message":"Wait completed.","timed_out":false}`, so a roster
+/// taken after a child finished is one of the few places its text survives in a
+/// readable form. It rendered as a wall of raw JSON on the generic tool card
+/// before this.
+///
+/// The root row is dropped: codex reports the parent through the same roster,
+/// and listing the conversation you are already reading as one of its own
+/// sub-agents is noise. `None` when nothing is left to show.
+fn build_collab_list_input(output: &serde_json::Value) -> Option<(String, bool)> {
+    let mut receiver_ids: Vec<serde_json::Value> = Vec::new();
+    let mut agents_states = serde_json::Map::new();
+    let mut any_error = false;
+    for entry in output.get("agents")?.as_array()? {
+        // `continue`, never `?`: the root row is present in every roster, so
+        // bailing out on it would drop the whole capsule.
+        let Some(name) = entry
+            .get("agent_name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|n| !n.is_empty() && *n != CODEX_ROOT_AGENT_PATH)
+        else {
+            continue;
+        };
+        let (st, msg) = match entry.get("agent_status") {
+            Some(value) => extract_wait_agent_status(value),
+            None => continue,
+        };
+        if is_error_collab_status(&st) {
+            any_error = true;
+        }
+        receiver_ids.push(serde_json::Value::String(name.to_string()));
+        agents_states.insert(
+            name.to_string(),
+            serde_json::json!({ "status": st, "message": msg }),
+        );
+    }
+    if agents_states.is_empty() {
+        return None;
+    }
+    let input = serde_json::json!({
+        "senderThreadId": "",
+        "receiverThreadIds": receiver_ids,
+        "agentsStates": serde_json::Value::Object(agents_states),
+        "status": if any_error { "failed" } else { "completed" },
+        COLLAB_OP_KEY: "list",
+    });
+    Some((input.to_string(), any_error))
+}
+
+/// The parent thread id a rollout's `session_meta` payload declares, or `None`
+/// for a root session.
+///
+/// TWO shapes carry it and both are live on disk, so neither branch may be
+/// dropped. The structured `source.subagent.thread_spawn.parent_thread_id` is
+/// the one every sub-agent rollout has (checked across on-disk rollouts from
+/// 0.117 through 0.147); the flat `parent_thread_id` is a later, additive
+/// mirror that only some versions write, always alongside the structured form
+/// and never on its own. Reading only the flat field — as this did before —
+/// therefore misses real sub-agents, which is what let their rollouts list as
+/// importable root sessions and let their replayed history be counted as their
+/// own (see [`is_forked_thread_header`]).
+///
+/// A present-but-blank id is treated as absent: it names no parent, and a
+/// whitespace `parent_id` would still read as "this is a child" downstream.
+fn codex_parent_thread_id(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("parent_thread_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .or_else(|| {
+            payload
+                .pointer("/source/subagent/thread_spawn/parent_thread_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+        })
+        .map(ToOwned::to_owned)
+}
+
+/// Whether a transcript's opening record declares it a FORKED thread — codex
+/// 0.147's `fork_turns` sub-agent shape, where the child is a rollout of its own
+/// and the parent's history is copied into its head.
 ///
 /// That copy is the problem: the parent's own tool calls sit at the top of the
 /// child's file, indistinguishable at the record level from the child's, so
@@ -1791,11 +2657,27 @@ fn build_collab_wait_input(status: &serde_json::Map<String, serde_json::Value>) 
 /// still names the sub-agent and badges its thread id (both come from the
 /// PARENT's rollout); only the nested tool-call list is absent. The legacy
 /// `agent-<id>.jsonl` shape has no such prefix and is unaffected.
+///
+/// BOTH markers are required, because "is a sub-agent" and "replays the parent"
+/// are different things and only the second one may be refused. A parent thread
+/// id alone says a thread was spawned by another; `forked_from_id` is codex's
+/// own declaration that this rollout was seeded with that thread's history. On
+/// disk they split cleanly — of 46 sub-agent rollouts, the 23 carrying
+/// `forked_from_id` are exactly the 23 that also replay a second `session_meta`
+/// header, and the other 23 are ordinary children whose tool calls are their
+/// own. Refusing on the parent id alone silently blanks the capsule for those.
 fn is_forked_thread_header(value: &serde_json::Value) -> bool {
-    value.get("type").and_then(|t| t.as_str()) == Some("session_meta")
-        && value
-            .pointer("/payload/parent_thread_id")
-            .is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+    if value.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
+        return false;
+    }
+    let Some(payload) = value.get("payload") else {
+        return false;
+    };
+    codex_parent_thread_id(payload).is_some()
+        && payload
+            .get("forked_from_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| !id.trim().is_empty())
 }
 
 fn parse_codex_subagent_stats(
@@ -2046,14 +2928,15 @@ fn parse_codex_subagent_stats(
 impl CodexParser {
     fn parse_conversation_detail(
         &self,
-        path: &PathBuf,
+        path: &Path,
         conversation_id: &str,
     ) -> Result<ConversationDetail, ParseError> {
-        let file = fs::File::open(path)?;
-        let reader = BufReader::new(file);
+        let lines = self.rollout_lines(path)?;
 
         let mut messages = Vec::new();
         let mut cwd: Option<String> = None;
+        let mut parent_id: Option<String> = None;
+        let mut session_header_seen = false;
         let mut git_branch: Option<String> = None;
         let mut model: Option<String> = None;
         let mut title: Option<String> = None;
@@ -2137,6 +3020,17 @@ impl CodexParser {
         // streaming, this on reload).
         let mut spawn_agent_call_ids: HashSet<String> = HashSet::new();
         let mut agent_id_to_spawn_call_id: HashMap<String, String> = HashMap::new();
+        // `agent_path` ("/root/history_limits") → the thread id currently
+        // answering to it. Last write wins, which is exactly the pairing an
+        // inter-agent message needs: the child that replies is whichever one
+        // that path most recently named. A path CAN be reused (codex re-spawns
+        // under the same task name), so a first-wins map would misfile the
+        // second child's result onto the first child's capsule.
+        let mut agent_path_to_thread_id: HashMap<String, String> = HashMap::new();
+        // Terminal `SubAgentActivity` kinds by thread id (`completed` /
+        // `interrupted`). Stamped onto the launch capsule so it stops reading as
+        // "codex will never report this child again" once codex has.
+        let mut agent_terminal_kind: HashMap<String, String> = HashMap::new();
         // Result text used to FILL the execution capsule only as a fallback for
         // agents that were never returned by a wait (keyed by agent_id). Filled
         // from close_agent's `previous_status`.
@@ -2149,6 +3043,7 @@ impl CodexParser {
         // execution capsule as failed (live parity).
         let mut agent_errored: HashSet<String> = HashSet::new();
         let mut wait_agent_call_ids: HashSet<String> = HashSet::new();
+        let mut list_agents_call_ids: HashSet<String> = HashSet::new();
         let mut close_agent_call_ids: HashSet<String> = HashSet::new();
         let mut close_agent_targets: HashMap<String, String> = HashMap::new();
         let mut active_agent_count: u32 = 0;
@@ -2159,6 +3054,11 @@ impl CodexParser {
         // that message's blocks once it knows how many `text()` chunks came
         // back. See `parsers/codex_code_mode.rs`.
         let mut pending_exec_scripts: HashMap<String, (usize, CodeModeScript)> = HashMap::new();
+        // App-server persists each MCP call executed inside a code-mode script
+        // as a semantic `item_completed.McpToolCall`. Keep those authoritative
+        // ids/results with the sole open script; its output can then replace the
+        // wrapper even when several results were printed as one JSON chunk.
+        let mut completed_mcp_by_exec: HashMap<String, Vec<CompletedMcpCall>> = HashMap::new();
         // `exec_command` call_id → the command it ran, and the background shell
         // sessions that command's output announced (`session id → command`).
         // A later `wait` / `write_stdin` carries only the session id, so this is
@@ -2182,22 +3082,61 @@ impl CodexParser {
         // and as `response_item.image_generation_call`, sharing the same call_id/id.
         // Emit at most one ContentBlock::Image per id to avoid duplicate display.
         let mut emitted_image_ids: HashSet<String> = HashSet::new();
-        // Streaming reasoning buffer. Codex emits one `event_msg.agent_reasoning`
-        // per reasoning section, then groups the same sections into a single
-        // `response_item.reasoning.summary`. We buffer the per-section events and
-        // let the grouped summary supersede them (one 思考 card per turn, live
-        // parity); the buffer is only flushed on its own — as one joined Thinking
-        // block — when no grouped summary arrives (interrupted/older rollouts),
-        // so streaming reasoning is never lost. `pending_reasoning_ts` stamps the
-        // fallback block with the last buffered section's time.
+        // Streaming reasoning buffer, held open across a whole reasoning RUN —
+        // every section codex wrote before the next visible record (a tool call,
+        // a message, …). Live streams such a run as one growing thought, so
+        // history has to as well, and neither of codex's two on-disk records is
+        // that run on its own:
+        //   - `event_msg.agent_reasoning` — one per section;
+        //   - `response_item.reasoning.summary` — the sections of ONE model
+        //     response, grouped. A long run spans several responses, so codex
+        //     writes several of these back to back (up to 28 in real rollouts),
+        //     and emitting a card per record is what tore one thought into a
+        //     column of 思考 cards.
+        // So `grouped_reasoning` accumulates the settled text of the run while
+        // `pending_reasoning` holds the section events not yet restated by a
+        // grouped summary; the summary supersedes them (it is the same text,
+        // grouped) and joins the run. Both are flushed as ONE Thinking block
+        // when the run ends, so an interrupted rollout that never wrote its
+        // summary still keeps its streaming reasoning. `pending_reasoning_ts`
+        // stamps that block with the run's last reasoning record.
+        let mut grouped_reasoning: Vec<String> = Vec::new();
         let mut pending_reasoning: Vec<String> = Vec::new();
         let mut pending_reasoning_ts: Option<DateTime<Utc>> = None;
 
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
+        // Plan mode. `turn_context.collaboration_mode.mode` is the structured,
+        // per-turn record of which mode produced the turn, and its flip out of
+        // `plan` is the only in-band evidence that the user approved the plan
+        // (see the `user_message` arm).
+        //
+        // The two plan flags are deliberately separate. `pending_plan_twin` is
+        // a PAIRING slot — filled only by an `item_completed` announcement,
+        // claimed only by the next `<proposed_plan>` record — and conflating it
+        // with "a plan exists" would make two identical plan bodies collapse
+        // into one. `plan_rendered` is the approval guard, so a stray approval
+        // can never emit a decision marker with no plan above it.
+        let mut collaboration_mode_is_plan = false;
+        let mut plan_approval_expected = false;
+        let mut pending_plan_twin: Option<(usize, String)> = None;
+        let mut plan_rendered = false;
+
+        // `response_item.message` records held back until EOF, when their turn
+        // segment's canonical-channel coverage is known. See
+        // [`ResponseItemPromotion`] for why the gate is per-segment.
+        let mut promotion = ResponseItemPromotion::new();
+        let mut pending_promotions: Vec<PendingPromotedMessage> = Vec::new();
+        // Ordinals of the two in-loop decisions that promoted records can
+        // legitimately override, recorded so they can be replayed POSITIONALLY
+        // once the survivors are known — never "does a user exist anywhere",
+        // which would cancel a valid goal opener answered by a later prompt.
+        let mut first_goal_ordinal: Option<u64> = None;
+        let mut title_source_ordinal: Option<u64> = None;
+        // codex's own thread name outranks any prompt-derived title, and its arm
+        // assigns unconditionally (newest wins), so it needs its own flag rather
+        // than an ordinal comparison.
+        let mut title_from_thread_name = false;
+
+        for line in lines {
             if line.trim().is_empty() {
                 continue;
             }
@@ -2208,6 +3147,12 @@ impl CodexParser {
             };
 
             let msg_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+            // Fed EVERY record, before the parser's own handling: segment
+            // boundaries, canonical-channel coverage and compaction adjacency
+            // are all positional properties of the raw stream.
+            let record_ordinal =
+                promotion.note_record(msg_type, promotion_payload_type(msg_type, &value));
 
             if let Some(ts_str) = value.get("timestamp").and_then(|t| t.as_str()) {
                 if let Ok(ts) = ts_str.parse::<DateTime<Utc>>() {
@@ -2220,11 +3165,17 @@ impl CodexParser {
 
             match msg_type {
                 "session_meta" => {
-                    if let Some(payload) = value.get("payload") {
+                    // First header wins for every identity field — see the same
+                    // latch in `parse_jsonl_summary`: the parent header that
+                    // follows a forked child's own (replayed inline, or spliced
+                    // in by `rollout_lines`) carries the PARENT's cwd and branch.
+                    if let Some(payload) = value.get("payload").filter(|_| !session_header_seen) {
+                        session_header_seen = true;
                         cwd = payload
                             .get("cwd")
                             .and_then(|s| s.as_str())
                             .map(|s| s.to_string());
+                        parent_id = codex_parent_thread_id(payload);
                         git_branch = payload
                             .get("git")
                             .and_then(|g| g.get("branch"))
@@ -2242,6 +3193,28 @@ impl CodexParser {
                             .and_then(|m| m.as_str())
                             .map(|s| s.to_string());
                     }
+                    // Approving a plan ends Plan mode: codex opens the very next
+                    // turn with a non-`plan` collaboration mode and prompts
+                    // ITSELF with `CODEX_PLAN_APPROVAL_PROMPT`. Arm the one-shot
+                    // flag the `user_message` arm consumes. A rollout predating
+                    // Plan mode reports no mode at all and so never arms.
+                    //
+                    // Only the flip arms, and only re-entering `plan` disarms —
+                    // a REPEATED non-plan context must leave the arm standing.
+                    // Newer codex re-emits `turn_context` mid-turn (the same
+                    // reason `ResponseItemPromotion` prefers `task_started` for
+                    // segmentation), and rewriting the flag on every context
+                    // would let a second `default` context between the flip and
+                    // the prompt silently restore the bug this filter fixes.
+                    if let Some(mode) = turn_collaboration_mode(&value) {
+                        let is_plan = mode == "plan";
+                        if is_plan {
+                            plan_approval_expected = false;
+                        } else if collaboration_mode_is_plan {
+                            plan_approval_expected = true;
+                        }
+                        collaboration_mode_is_plan = is_plan;
+                    }
                     if let Some(ts) = parse_codex_timestamp(&value) {
                         push_turn_start(&mut turn_context_markers, ts);
                     }
@@ -2253,41 +3226,70 @@ impl CodexParser {
 
                         let timestamp = parse_codex_timestamp(&value).unwrap_or_else(Utc::now);
 
-                        // A new reasoning section keeps buffering; `token_count` is
-                        // metadata with no visible message and never splits a run.
-                        // Anything else closes an open reasoning run — flush any
-                        // buffered streaming reasoning that never got a grouped
-                        // summary so it isn't lost or reordered behind this event.
+                        // A new reasoning section keeps the run open; `token_count`
+                        // is metadata with no visible message and never splits one.
+                        // Anything else closes the run — emit the reasoning gathered
+                        // so far as one card, here, so it can't be reordered behind
+                        // this event.
                         if payload_type != "agent_reasoning" && payload_type != "token_count" {
                             flush_pending_reasoning(
                                 &mut messages,
+                                &mut grouped_reasoning,
                                 &mut pending_reasoning,
                                 pending_reasoning_ts,
                             );
                         }
 
-                        match payload_type {
-                            // codex 0.147 stopped returning the sub-agent's id
-                            // from `spawn_agent` (its output is just
-                            // `{"task_name":"/root/pnpm_build"}`). This event is
-                            // now the only place the parent's rollout names the
-                            // child thread, and it correlates back by carrying
-                            // the spawn's own `call_id` as `event_id`.
-                            "sub_agent_activity" => {
-                                let call_id = payload
-                                    .get("event_id")
-                                    .and_then(|v| v.as_str())
-                                    .filter(|id| spawn_agent_call_ids.contains(*id));
-                                let thread_id = payload
-                                    .get("agent_thread_id")
-                                    .and_then(|v| v.as_str())
-                                    .filter(|id| !id.is_empty());
-                                if let (Some(call_id), Some(thread_id)) = (call_id, thread_id) {
-                                    agent_id_to_spawn_call_id
-                                        .entry(thread_id.to_string())
-                                        .or_insert_with(|| call_id.to_string());
-                                }
+                        // codex 0.147 stopped returning the sub-agent's id from
+                        // `spawn_agent` (its output is empty, or just
+                        // `{"task_name":"/root/pnpm_build"}`). `SubAgentActivity`
+                        // is now the only place the parent's rollout names the
+                        // child thread, and it correlates back by carrying the
+                        // spawn's own `call_id`.
+                        //
+                        // Read BEFORE the match, not as an arm of it: 0.153.4
+                        // moved these records inside `item_completed`, whose arm
+                        // `continue`s on anything that is not a plan document.
+                        if let Some(activity) =
+                            codex_subagent_activity_record(payload_type, payload)
+                        {
+                            if let Some(path) = activity.agent_path {
+                                agent_path_to_thread_id
+                                    .insert(path.to_string(), activity.thread_id.to_string());
                             }
+                            // Only a launch names the capsule to attach to; a
+                            // terminal record carries a synthetic id of its own.
+                            if let Some(call_id) = activity
+                                .call_id
+                                .filter(|id| spawn_agent_call_ids.contains(*id))
+                            {
+                                agent_id_to_spawn_call_id
+                                    .entry(activity.thread_id.to_string())
+                                    .or_insert_with(|| call_id.to_string());
+                            }
+                            match activity.kind {
+                                "completed" | "interrupted" => {
+                                    agent_terminal_kind.insert(
+                                        activity.thread_id.to_string(),
+                                        activity.kind.to_string(),
+                                    );
+                                }
+                                // A terminal child can be brought back
+                                // (`resumeAgent` / `followup_task`), and it
+                                // announces that with a fresh `started`. Clear
+                                // the old outcome rather than leave the capsule
+                                // claiming a run that has since resumed. The
+                                // live path self-corrects the same way: a new
+                                // launch replaces the remembered input, which
+                                // carries no state key.
+                                "started" => {
+                                    agent_terminal_kind.remove(activity.thread_id);
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        match payload_type {
                             "task_started" => {
                                 if context_window_max_tokens.is_none() {
                                     context_window_max_tokens = payload
@@ -2308,7 +3310,43 @@ impl CodexParser {
                                     .and_then(|m| m.as_str())
                                     .unwrap_or("")
                                     .to_string();
+
+                                // Plan-mode approval, not a prompt. codex writes
+                                // its own follow-up as an ordinary user message,
+                                // structurally identical to typed input, so
+                                // rendering it splits ONE plan interaction into two
+                                // user turns (live keeps both halves inside a
+                                // single `session/prompt`). Both signals are
+                                // required — the mode flip this turn AND codex's
+                                // fixed wording — so a user who literally types
+                                // that sentence still gets their bubble.
+                                //
+                                // The decision is not dropped, it MOVES: the plan
+                                // call settles with codex-acp's own approval
+                                // wording, which is what renders the live
+                                // <PlanModeCard>'s "已同意" marker.
+                                //
+                                // Compared verbatim, NOT trimmed: codex writes
+                                // this sentence with no surrounding whitespace
+                                // (18/18 occurrences across the local corpus), so
+                                // trimming would only widen the filter onto text a
+                                // person could have typed.
+                                let approval_armed = std::mem::take(&mut plan_approval_expected);
+                                if approval_armed
+                                    && text == CODEX_PLAN_APPROVAL_PROMPT
+                                    && std::mem::take(&mut plan_rendered)
+                                {
+                                    push_plan_review_marker(&mut messages, timestamp);
+                                    continue;
+                                }
+
                                 let normalized = strip_blocked_resource_mentions(&text);
+                                if title.is_none() {
+                                    title = extract_codex_title_candidate(&normalized, true);
+                                    if title.is_some() {
+                                        title_source_ordinal = Some(record_ordinal);
+                                    }
+                                }
                                 let mut blocks: Vec<ContentBlock> = Vec::new();
                                 if !normalized.is_empty() {
                                     blocks.push(ContentBlock::Text { text: normalized });
@@ -2333,14 +3371,14 @@ impl CodexParser {
                                     }
                                 }
 
+                                if blocks.is_empty() && contains_only_internal_agent_routes(&text) {
+                                    continue;
+                                }
+
                                 if blocks.is_empty() {
                                     blocks.push(ContentBlock::Text {
                                         text: "Attached resources".to_string(),
                                     });
-                                }
-
-                                if title.is_none() {
-                                    title = extract_codex_title_candidate(&text, true);
                                 }
 
                                 if should_skip_duplicate_user_message(&messages, &blocks, timestamp)
@@ -2357,21 +3395,30 @@ impl CodexParser {
                                     duration_ms: None,
                                     model: None,
                                     completed_at: Some(timestamp),
+                                agent_message_id: None,
                                 });
                             }
                             "agent_message" => {
                                 // Parent narration is emitted even while a
                                 // sub-agent is active (active_agent_count > 0).
-                                // codex-acp 1.0.x writes the sub-agent's own
-                                // transcript to its `agent-<id>.jsonl`, NOT into
-                                // the parent rollout, so every agent_message here
-                                // is the parent's (verified across 180 real
-                                // rollouts: 0 sub-agent leaks). The old
+                                // Every `event_msg.agent_message` is the
+                                // parent's: a sub-agent's own work goes to a
+                                // transcript of its own, never into this channel
+                                // (verified across 180 real rollouts: 0
+                                // sub-agent leaks). The old
                                 // `active_agent_count == 0` guard wrongly dropped
                                 // the parent's between-capsule narration — and,
                                 // when no close_agent ran (active never returns to
                                 // 0), even the final answer. Images keep their own
                                 // guard (see image_generation arms).
+                                //
+                                // A sub-agent CAN speak into the parent's
+                                // rollout, but on a different channel: the
+                                // addressed `response_item.agent_message`
+                                // handled below. That one carries `author` /
+                                // `recipient` and a `message` ARRAY, so it
+                                // cannot be confused with this shape's bare
+                                // `message` string.
                                 let text = payload
                                     .get("message")
                                     .and_then(|m| m.as_str())
@@ -2386,6 +3433,7 @@ impl CodexParser {
                                     duration_ms: None,
                                     model: None,
                                     completed_at: Some(timestamp),
+                                agent_message_id: None,
                                 });
                             }
                             "thread_goal_updated" => {
@@ -2428,8 +3476,12 @@ impl CodexParser {
                                                 &marker.objective,
                                                 true,
                                             );
+                                            if title.is_some() {
+                                                title_source_ordinal = Some(record_ordinal);
+                                            }
                                         }
                                         first_goal_objective = Some(marker.objective.clone());
+                                        first_goal_ordinal = Some(record_ordinal);
                                     }
                                     // Occurrence id from the message index — unique
                                     // per goal event, stable across reparse, and
@@ -2461,6 +3513,7 @@ impl CodexParser {
                                         duration_ms: None,
                                         model: None,
                                         completed_at: Some(timestamp),
+                                    agent_message_id: None,
                                     });
                                 }
                             }
@@ -2483,17 +3536,87 @@ impl CodexParser {
                                     .filter(|n| !n.is_empty())
                                 {
                                     title = Some(truncate_str(name, 100));
+                                    title_from_thread_name = true;
                                 }
                             }
+                            "item_completed" => {
+                                if let Some(call) = completed_mcp_call(payload) {
+                                    let exec_id = if deferred_scripts.is_empty()
+                                        && pending_exec_scripts.len() == 1
+                                    {
+                                        pending_exec_scripts
+                                            .keys()
+                                            .next()
+                                            .expect("one pending exec")
+                                            .clone()
+                                    } else if pending_exec_scripts.is_empty() {
+                                        let mut deferred_exec_ids = deferred_scripts
+                                            .values()
+                                            .map(|script| script.call_id.as_str());
+                                        let Some(exec_id) = deferred_exec_ids.next() else {
+                                            continue;
+                                        };
+                                        if deferred_exec_ids.all(|id| id == exec_id) {
+                                            exec_id.to_string()
+                                        } else {
+                                            continue;
+                                        }
+                                    } else {
+                                        continue;
+                                    };
+                                    completed_mcp_by_exec
+                                        .entry(exec_id)
+                                        .or_default()
+                                        .push(call);
+                                    continue;
+                                }
+                                // Plan mode's finished plan document. This is the
+                                // ONLY place a plan turn speaks on the canonical
+                                // event channel — codex publishes the plan here
+                                // INSTEAD of as `agent_message` — so without this
+                                // arm the whole turn renders as nothing but its
+                                // reasoning (issue: plan card vanishes on reload).
+                                //
+                                // Re-wrapped in codex's own `<proposed_plan>` tags
+                                // so it lands on the exact adapter path the live
+                                // stream uses (`expandProposedPlanText` → plan
+                                // card). The assistant `response_item` twin, which
+                                // carries the same body PLUS any surrounding prose,
+                                // upgrades this message in place when it arrives.
+                                let Some(plan) = completed_plan_item_text(payload) else {
+                                    continue;
+                                };
+                                if active_agent_count > 0 {
+                                    continue;
+                                }
+                                messages.push(UnifiedMessage {
+                                    id: format!("assistant-plan-{}", messages.len()),
+                                    role: MessageRole::Assistant,
+                                    content: vec![ContentBlock::Text {
+                                        text: format!(
+                                            "{PROPOSED_PLAN_OPEN}\n{plan}\n{PROPOSED_PLAN_CLOSE}"
+                                        ),
+                                    }],
+                                    timestamp,
+                                    usage: None,
+                                    duration_ms: None,
+                                    model: None,
+                                    completed_at: Some(timestamp),
+                                    agent_message_id: None,
+                                });
+                                pending_plan_twin = Some((messages.len() - 1, plan.to_string()));
+                                plan_rendered = true;
+                            }
                             "agent_reasoning" => {
-                                // Buffer this streaming reasoning section. The grouped
+                                // Buffer this streaming reasoning section into the
+                                // open run. The grouped
                                 // `response_item.reasoning.summary` (parsed in the
                                 // `response_item` match below) normally arrives right
-                                // after the section events and supersedes the buffer,
-                                // so history shows ONE 思考 card per turn (live parity)
-                                // instead of one card per section. If no grouped
-                                // summary arrives (interrupted/older rollouts), the
-                                // buffer is flushed on its own and nothing is lost.
+                                // after the section events and supersedes the buffer
+                                // with the same text; either way the run renders as
+                                // ONE 思考 card (live parity) instead of one card per
+                                // section, and if no grouped summary arrives
+                                // (interrupted/older rollouts) nothing is lost.
                                 let text = payload
                                     .get("text")
                                     .and_then(|t| t.as_str())
@@ -2550,6 +3673,7 @@ impl CodexParser {
                                     duration_ms: None,
                                     model: None,
                                     completed_at: Some(timestamp),
+                                agent_message_id: None,
                                 });
                                 if !call_id.is_empty() {
                                     emitted_image_ids.insert(call_id);
@@ -2658,13 +3782,26 @@ impl CodexParser {
                                                 None => round,
                                             });
                                         }
-                                        if let (Some(pending), Some(last_msg)) = (
-                                            pending_round_usage.clone(),
+                                        // A `token_count` that lands INSIDE an open
+                                        // reasoning run reports what the response
+                                        // that produced that reasoning spent, and
+                                        // the run's card has not been emitted yet.
+                                        // Attaching now would bill the round to the
+                                        // previous turn, so let it keep waiting for
+                                        // the card the run is still gathering.
+                                        let last_assistant = if grouped_reasoning.is_empty()
+                                            && pending_reasoning.is_empty()
+                                        {
                                             messages
                                                 .iter_mut()
                                                 .rev()
-                                                .find(|m| matches!(m.role, MessageRole::Assistant)),
-                                        ) {
+                                                .find(|m| matches!(m.role, MessageRole::Assistant))
+                                        } else {
+                                            None
+                                        };
+                                        if let (Some(pending), Some(last_msg)) =
+                                            (pending_round_usage.clone(), last_assistant)
+                                        {
                                             last_msg.usage = Some(match last_msg.usage {
                                                 Some(ref existing) => {
                                                     codex_usage_add(existing, &pending)
@@ -2694,31 +3831,69 @@ impl CodexParser {
                             payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
                         let timestamp = parse_codex_timestamp(&value).unwrap_or_else(Utc::now);
 
-                        // A `reasoning` item resolves the buffered streaming sections
-                        // (handled in its arm). Any other response item closes an open
-                        // reasoning run — flush buffered streaming reasoning that never
-                        // got a grouped summary so it isn't lost or reordered.
+                        // A `reasoning` item joins the open run (handled in its arm).
+                        // Any other response item closes it — emit the reasoning
+                        // gathered so far as one card, here, so it can't be reordered
+                        // behind this item.
                         if payload_type != "reasoning" {
                             flush_pending_reasoning(
                                 &mut messages,
+                                &mut grouped_reasoning,
                                 &mut pending_reasoning,
                                 pending_reasoning_ts,
                             );
                         }
 
                         match payload_type {
+                            // A sub-agent reporting back. Distinct from the
+                            // `event_msg.agent_message` arm above (which is the
+                            // PARENT speaking, and carries a bare `message`
+                            // string): this one is addressed
+                            // `author` → `recipient` and wraps its body in
+                            // codex's inter-agent envelope.
+                            //
+                            // It has no `item_completed` twin — codex publishes
+                            // no ThreadItem for it — so codex-acp never sees it
+                            // and it cannot arrive live. The rollout is the only
+                            // place a child's report exists, which is why an
+                            // otherwise-complete team run used to show nothing
+                            // at all of what its sub-agents concluded.
+                            //
+                            // Not emitted as a message of its own: it belongs to
+                            // the child, not the parent's narration. It is filed
+                            // by thread id and the back-patch at the end of the
+                            // parse folds it into that child's launch capsule,
+                            // through the same `agent_fallback_results` channel
+                            // the legacy `close_agent` result uses.
+                            "agent_message" => {
+                                if let Some((author, body)) =
+                                    codex_inter_agent_final_answer(payload)
+                                {
+                                    if let Some(thread_id) = agent_path_to_thread_id.get(author) {
+                                        agent_fallback_results
+                                            .insert(thread_id.clone(), body);
+                                    }
+                                }
+                            }
                             "reasoning" => {
-                                // Codex records a reasoning turn as a `summary` array
-                                // of `{type:"summary_text", text}` parts — one part per
-                                // section — grouping the same sections the streaming
-                                // `event_msg.agent_reasoning` events carry one-by-one
-                                // (buffered in `pending_reasoning`). Join the parts into
-                                // ONE Thinking block (live parity: a single 思考 card
-                                // per turn) and discard the buffer it supersedes. An
-                                // empty summary (encrypted-only reasoning, the common
-                                // case) carries no surfaced text, so fall back to any
-                                // buffered streaming sections (interrupted/older
-                                // rollouts) and otherwise emit nothing.
+                                // Codex records one model response's reasoning as a
+                                // `summary` array of `{type:"summary_text", text}`
+                                // parts — one part per section — grouping the same
+                                // sections the streaming `event_msg.agent_reasoning`
+                                // events carry one-by-one (buffered in
+                                // `pending_reasoning`). So this item settles the
+                                // buffer, superseding it; it does NOT end the run,
+                                // because the next record may be one more of these
+                                // (a run spanning several model responses) and live
+                                // shows that as a single growing thought. The card
+                                // is emitted when something visible finally closes
+                                // the run.
+                                //
+                                // An empty summary (encrypted-only reasoning, the
+                                // common case) restates nothing, so it must not
+                                // clear the buffer — it only seals what is buffered
+                                // so far, keeping those sections out of reach of a
+                                // LATER summary that never covered them.
                                 let text = payload
                                     .get("summary")
                                     .and_then(|s| s.as_array())
@@ -2735,22 +3910,10 @@ impl CodexParser {
                                     .unwrap_or_default();
                                 if !text.is_empty() {
                                     pending_reasoning.clear();
-                                    messages.push(UnifiedMessage {
-                                        id: format!("thinking-{}", messages.len()),
-                                        role: MessageRole::Assistant,
-                                        content: vec![ContentBlock::Thinking { text }],
-                                        timestamp,
-                                        usage: None,
-                                        duration_ms: None,
-                                        model: None,
-                                        completed_at: Some(timestamp),
-                                    });
+                                    grouped_reasoning.push(text);
+                                    pending_reasoning_ts = Some(timestamp);
                                 } else {
-                                    flush_pending_reasoning(
-                                        &mut messages,
-                                        &mut pending_reasoning,
-                                        pending_reasoning_ts,
-                                    );
+                                    grouped_reasoning.append(&mut pending_reasoning);
                                 }
                             }
                             "function_call" | "custom_tool_call" => {
@@ -2859,11 +4022,17 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
+                                        agent_message_id: None,
                                         });
                                     }
                                     "wait_agent" => {
                                         if let Some(ref id) = tool_use_id {
                                             wait_agent_call_ids.insert(id.clone());
+                                        }
+                                    }
+                                    "list_agents" => {
+                                        if let Some(ref id) = tool_use_id {
+                                            list_agents_call_ids.insert(id.clone());
                                         }
                                     }
                                     "close_agent" => {
@@ -2921,6 +4090,7 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
+                                        agent_message_id: None,
                                         });
                                     }
                                     _ => {
@@ -2994,6 +4164,7 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
+                                        agent_message_id: None,
                                         });
                                     }
                                 }
@@ -3012,6 +4183,9 @@ impl CodexParser {
                                 let is_wait = tool_use_id
                                     .as_ref()
                                     .is_some_and(|id| wait_agent_call_ids.contains(id));
+                                let is_list = tool_use_id
+                                    .as_ref()
+                                    .is_some_and(|id| list_agents_call_ids.contains(id));
                                 let is_close = tool_use_id
                                     .as_ref()
                                     .is_some_and(|id| close_agent_call_ids.contains(id));
@@ -3041,14 +4215,26 @@ impl CodexParser {
                                             .collect(),
                                         note: collected.note,
                                     };
-                                    let (uses, results) = unwrap_code_mode_script(
-                                        &deferred.call_id,
-                                        &deferred.script,
-                                        &parsed,
-                                        payload,
-                                        &mut shell_sessions,
-                                        &mut poll_origins,
-                                    );
+                                    let semantic = (parsed.status == ScriptStatus::Completed)
+                                        .then(|| {
+                                            completed_mcp_by_exec.remove(&deferred.call_id)
+                                        })
+                                        .flatten();
+                                    let (uses, results) = semantic
+                                        .and_then(|calls| {
+                                            unwrap_completed_mcp_calls(&deferred.script, calls)
+                                        })
+                                        .map(|(uses, results)| (Some(uses), results))
+                                        .unwrap_or_else(|| {
+                                            unwrap_code_mode_script(
+                                                &deferred.call_id,
+                                                &deferred.script,
+                                                &parsed,
+                                                payload,
+                                                &mut shell_sessions,
+                                                &mut poll_origins,
+                                            )
+                                        });
                                     if let Some(uses) = uses {
                                         messages[deferred.use_index].content = uses;
                                     }
@@ -3069,14 +4255,24 @@ impl CodexParser {
                                 } else if let Some((message_index, script)) = pending_script {
                                     let call_id = tool_use_id.unwrap_or_default();
                                     let parsed = split_code_mode_output(payload.get("output"));
-                                    let (uses, results) = unwrap_code_mode_script(
-                                        &call_id,
-                                        &script,
-                                        &parsed,
-                                        payload,
-                                        &mut shell_sessions,
-                                        &mut poll_origins,
-                                    );
+                                    let semantic = (parsed.status == ScriptStatus::Completed)
+                                        .then(|| completed_mcp_by_exec.remove(&call_id))
+                                        .flatten();
+                                    let (uses, results) = semantic
+                                        .and_then(|calls| {
+                                            unwrap_completed_mcp_calls(&script, calls)
+                                        })
+                                        .map(|(uses, results)| (Some(uses), results))
+                                        .unwrap_or_else(|| {
+                                            unwrap_code_mode_script(
+                                                &call_id,
+                                                &script,
+                                                &parsed,
+                                                payload,
+                                                &mut shell_sessions,
+                                                &mut poll_origins,
+                                            )
+                                        });
                                     if let Some(uses) = uses {
                                         messages[message_index].content = uses;
                                     }
@@ -3103,6 +4299,7 @@ impl CodexParser {
                                         duration_ms: None,
                                         model: None,
                                         completed_at: Some(timestamp),
+                                    agent_message_id: None,
                                     });
                                 } else if is_spawn {
                                     if let Some(output_obj) = parse_codex_json_output(payload) {
@@ -3129,34 +4326,47 @@ impl CodexParser {
                                         duration_ms: None,
                                         model: None,
                                         completed_at: Some(timestamp),
+                                    agent_message_id: None,
                                     });
-                                } else if is_wait {
-                                    // Emit one `collab_agent` capsule per wait,
-                                    // routed through the same CollabAgentCard as
-                                    // the live wait capsule. Two output shapes —
-                                    // see `native_team_wait_input`.
+                                } else if is_wait || is_list {
+                                    // Emit one `collab_agent` capsule per wait or
+                                    // roster, routed through the same
+                                    // CollabAgentCard as the live capsule. Two
+                                    // wait output shapes — see
+                                    // `native_team_wait_input`.
+                                    //
+                                    // A roster deliberately does NOT mark its
+                                    // agents `agent_waited`: listing an agent is
+                                    // not collecting it, and suppressing the
+                                    // spawn capsule's own result on the strength
+                                    // of a `list_agents` the model happened to
+                                    // call would lose the report entirely.
                                     let capsule = parse_codex_json_output(payload).and_then(
-                                        |output_obj| match output_obj
-                                            .get("status")
-                                            .and_then(|s| s.as_object())
-                                        {
-                                            Some(status) => {
-                                                // Mark returned agents so the spawn
-                                                // capsule won't also show their
-                                                // result, and record per-agent error
-                                                // state so the execution capsule can
-                                                // render failed (live parity).
-                                                for (agent_id, value) in status {
-                                                    agent_waited.insert(agent_id.clone());
-                                                    let (st, _) = extract_wait_agent_status(value);
-                                                    if is_error_collab_status(&st) {
-                                                        agent_errored.insert(agent_id.clone());
-                                                    }
-                                                }
-                                                (!status.is_empty())
-                                                    .then(|| build_collab_wait_input(status))
+                                        |output_obj| {
+                                            if is_list {
+                                                return build_collab_list_input(&output_obj);
                                             }
-                                            None => native_team_wait_input(&output_obj),
+                                            match output_obj.get("status").and_then(|s| s.as_object())
+                                            {
+                                                Some(status) => {
+                                                    // Mark returned agents so the spawn
+                                                    // capsule won't also show their
+                                                    // result, and record per-agent error
+                                                    // state so the execution capsule can
+                                                    // render failed (live parity).
+                                                    for (agent_id, value) in status {
+                                                        agent_waited.insert(agent_id.clone());
+                                                        let (st, _) =
+                                                            extract_wait_agent_status(value);
+                                                        if is_error_collab_status(&st) {
+                                                            agent_errored.insert(agent_id.clone());
+                                                        }
+                                                    }
+                                                    (!status.is_empty())
+                                                        .then(|| build_collab_wait_input(status))
+                                                }
+                                                None => native_team_wait_input(&output_obj),
+                                            }
                                         },
                                     );
                                     if let Some((collab_input, is_error)) = capsule {
@@ -3175,6 +4385,7 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
+                                        agent_message_id: None,
                                         });
                                         messages.push(UnifiedMessage {
                                             id: format!("tool-result-{}", messages.len()),
@@ -3191,6 +4402,7 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
+                                        agent_message_id: None,
                                         });
                                     }
                                 } else if is_close {
@@ -3312,6 +4524,7 @@ impl CodexParser {
                                         duration_ms: None,
                                         model: None,
                                         completed_at: Some(timestamp),
+                                    agent_message_id: None,
                                     });
                                 }
                             }
@@ -3335,6 +4548,9 @@ impl CodexParser {
                                                     text.as_str(),
                                                     true,
                                                 );
+                                                if title.is_some() {
+                                                    title_source_ordinal = Some(record_ordinal);
+                                                }
                                             }
                                         }
 
@@ -3347,9 +4563,108 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
+                                        agent_message_id: None,
                                         });
+                                        continue;
                                     }
                                 }
+
+                                // Everything the arm above did not emit: text-only
+                                // users and EVERY assistant record. Normally these
+                                // are same-millisecond duplicates of the
+                                // `event_msg` channel and must stay dropped — but
+                                // in a rollout whose event channel never spoke for
+                                // this turn they are the only copy that exists.
+                                // Held back rather than pushed, because coverage is
+                                // not known until the segment (or the file) ends.
+                                let is_user = match role {
+                                    "user" => true,
+                                    "assistant" => false,
+                                    // `developer` / `system` / anything else is
+                                    // machinery, never a conversation turn.
+                                    _ => continue,
+                                };
+                                let Some(blocks) =
+                                    extract_response_item_message_blocks(payload, is_user)
+                                else {
+                                    continue;
+                                };
+                                // An image-only record has nothing for the
+                                // deny-lists (which are text rules) to judge.
+                                let text = first_text_block(&blocks).unwrap_or_default();
+
+                                // Plan mode's plan document, intercepted ahead of
+                                // the promotion gate. It must render even where the
+                                // event channel DID speak for this turn, so the
+                                // per-segment coverage rule (right for prose) is
+                                // simply the wrong test here.
+                                //
+                                // This record is the richer of the plan's two
+                                // copies: `item_completed` announces the body
+                                // alone, while this one keeps the prose codex
+                                // writes around the block. So when it IS the
+                                // pending announcement's twin, it takes that
+                                // message over rather than adding a second.
+                                //
+                                // The slot is consumed either way. Only an
+                                // announcement may fill it, and only the next plan
+                                // record may claim it — otherwise two plan turns
+                                // that happen to propose the SAME body (a legacy
+                                // rollout with no announcements, where codex
+                                // re-proposes an unchanged plan) would read as one
+                                // plan written twice, and the second turn would
+                                // render empty.
+                                if !is_user {
+                                    if let Some(body) = proposed_plan_body(&text) {
+                                        let twin = pending_plan_twin
+                                            .take()
+                                            .filter(|(_, seen)| seen == body)
+                                            .map(|(index, _)| index);
+                                        match twin.and_then(|index| messages.get_mut(index)) {
+                                            Some(existing) => existing.content = blocks,
+                                            None => {
+                                                messages.push(UnifiedMessage {
+                                                    id: format!("assistant-plan-{}", messages.len()),
+                                                    role: MessageRole::Assistant,
+                                                    content: blocks,
+                                                    timestamp,
+                                                    usage: None,
+                                                    duration_ms: None,
+                                                    model: None,
+                                                    completed_at: Some(timestamp),
+                                                    agent_message_id: None,
+                                                });
+                                            }
+                                        }
+                                        plan_rendered = true;
+                                        continue;
+                                    }
+                                }
+
+                                let promotable = if text.trim().is_empty() {
+                                    true
+                                } else if is_user {
+                                    is_promotable_user_text(&text)
+                                } else {
+                                    is_promotable_assistant_text(&text)
+                                };
+                                if !promotable {
+                                    continue;
+                                }
+
+                                let title_candidate = if is_user {
+                                    extract_codex_title_candidate(&text, true)
+                                } else {
+                                    None
+                                };
+                                promotion.push_candidate(record_ordinal, is_user);
+                                pending_promotions.push(PendingPromotedMessage {
+                                    insert_at: messages.len(),
+                                    is_user,
+                                    blocks,
+                                    timestamp,
+                                    title_candidate,
+                                });
                             }
                             "image_generation_call" => {
                                 // codex 0.129+ writes the same generated image as both an
@@ -3403,6 +4718,7 @@ impl CodexParser {
                                     duration_ms: None,
                                     model: None,
                                     completed_at: Some(timestamp),
+                                agent_message_id: None,
                                 });
                                 if !id.is_empty() {
                                     emitted_image_ids.insert(id);
@@ -3416,10 +4732,32 @@ impl CodexParser {
             }
         }
 
-        // Streaming reasoning at the very end of a truncated/interrupted rollout
-        // (the `agent_reasoning` events were written but the file ended before the
-        // grouped `response_item.reasoning` summary) — flush it so it isn't lost.
-        flush_pending_reasoning(&mut messages, &mut pending_reasoning, pending_reasoning_ts);
+        // A reasoning run the file ended on — either the last thing the session
+        // did, or a truncated/interrupted rollout whose `agent_reasoning` events
+        // were written before the grouped summary. Emit it so it isn't lost.
+        flush_pending_reasoning(
+            &mut messages,
+            &mut grouped_reasoning,
+            &mut pending_reasoning,
+            pending_reasoning_ts,
+        );
+
+        // A round still waiting for an assistant message to bill — the transcript
+        // ended before the next `token_count` could hand it to one (a run's card
+        // was only just flushed above, or the model went straight to a tool call
+        // and never spoke again). Bill it here rather than discard it.
+        if let (Some(pending), Some(last_msg)) = (
+            pending_round_usage.take(),
+            messages
+                .iter_mut()
+                .rev()
+                .find(|m| matches!(m.role, MessageRole::Assistant)),
+        ) {
+            last_msg.usage = Some(match last_msg.usage {
+                Some(ref existing) => codex_usage_add(existing, &pending),
+                None => pending,
+            });
+        }
 
         // Fill in subagent tool call stats (and, only as a fallback, the result)
         // on each spawn execution capsule.
@@ -3471,7 +4809,8 @@ impl CodexParser {
                         }
                         // Stamp the sub-agent's id onto the spawn execution capsule
                         // input so the card can render it (parity with the wait
-                        // capsule, whose agentsStates already carry the id).
+                        // capsule, whose agentsStates already carry the id), plus
+                        // the terminal state when codex reported one.
                         ContentBlock::ToolUse {
                             tool_use_id: Some(ref id),
                             ref tool_name,
@@ -3482,11 +4821,97 @@ impl CodexParser {
                                 *input_preview = Some(inject_agent_id_into_input(
                                     input_preview.as_deref(),
                                     agent_id,
+                                    agent_terminal_kind.get(agent_id).map(String::as_str),
                                 ));
                             }
                         }
                         _ => {}
                     }
+                }
+            }
+        }
+
+        // Promote the held-back `response_item.message` records, now that the
+        // whole file has been seen and every turn segment's canonical-channel
+        // coverage is known.
+        //
+        // Ordering matters and is load-bearing:
+        //   1. splice FIRST — `insert_at` indexes `messages` as it stood at EOF,
+        //      and both steps below mutate it;
+        //   2. then the `/goal` opener, which inserts at index 0;
+        //   3. then `fold_shell_session_polls`, which rebuilds all of its own
+        //      (message, block) indices from whatever vector it is handed.
+        let survivors = promotion.resolve();
+        let promoted_user_ordinal = promotion.first_surviving_user_ordinal(&survivors);
+        let mut kept: Vec<PendingPromotedMessage> = pending_promotions
+            .into_iter()
+            .zip(&survivors)
+            .filter(|(_, keep)| **keep)
+            .map(|(pending, _)| pending)
+            .collect();
+
+        // Resolved before the vector is drained by the splice below.
+        let promoted_title = kept
+            .iter()
+            .find(|pending| pending.is_user)
+            .and_then(|pending| pending.title_candidate.clone());
+
+        // Descending by insertion point so earlier indices stay valid — but
+        // GROUPED, because several records can share one `insert_at` (nothing
+        // was pushed between them) and splicing those one at a time in reverse
+        // would invert their transcript order.
+        while let Some(insert_at) = kept.last().map(|pending| pending.insert_at) {
+            let group_start = kept
+                .iter()
+                .rposition(|pending| pending.insert_at != insert_at)
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            let group: Vec<UnifiedMessage> = kept
+                .split_off(group_start)
+                .into_iter()
+                .enumerate()
+                .map(|(offset, pending)| UnifiedMessage {
+                    // Namespaced so a promoted record can never collide with a
+                    // `user-N` / `assistant-N` id minted inside the loop.
+                    id: format!("codex-ri-{insert_at}-{offset}"),
+                    role: if pending.is_user {
+                        MessageRole::User
+                    } else {
+                        MessageRole::Assistant
+                    },
+                    content: pending.blocks,
+                    timestamp: pending.timestamp,
+                    usage: None,
+                    duration_ms: None,
+                    model: None,
+                    completed_at: Some(pending.timestamp),
+                agent_message_id: None,
+                })
+                .collect();
+            messages.splice(insert_at..insert_at, group);
+        }
+
+        // A promoted user that PRECEDES the goal means the goal did not open the
+        // session after all — the same positional rule the in-loop code applies
+        // to native users. One that comes AFTER it (the "确认" reply shape) must
+        // leave the opener intact, which is why this compares ordinals rather
+        // than asking whether a user exists anywhere.
+        if let (Some(goal_ordinal), Some(user_ordinal)) =
+            (first_goal_ordinal, promoted_user_ordinal)
+        {
+            if user_ordinal < goal_ordinal {
+                goal_opens_session = false;
+            }
+        }
+
+        // Same precedence the in-loop claims follow: codex's own thread name
+        // always wins, otherwise the EARLIEST prompt-shaped source does.
+        if !title_from_thread_name {
+            if let (Some(user_ordinal), Some(candidate)) = (promoted_user_ordinal, promoted_title) {
+                if title.is_none()
+                    || title_source_ordinal.is_none_or(|current| user_ordinal < current)
+                {
+                    title = Some(candidate);
                 }
             }
         }
@@ -3516,6 +4941,7 @@ impl CodexParser {
                         duration_ms: None,
                         model: None,
                         completed_at: first_timestamp,
+                    agent_message_id: None,
                     },
                 );
             }
@@ -3558,7 +4984,7 @@ impl CodexParser {
             message_count: turns.len() as u32,
             model,
             git_branch,
-            parent_id: None,
+            parent_id,
             parent_tool_use_id: None,
             delegation_call_id: None,
         };
@@ -3863,20 +5289,30 @@ fn push_turn_start(turn_starts: &mut Vec<DateTime<Utc>>, ts: DateTime<Utc>) {
     }
 }
 
-/// Emit any buffered streaming `agent_reasoning` sections as a single Thinking
-/// message and clear the buffer. No-op when the buffer is empty. Used only as a
-/// fallback when the grouped `response_item.reasoning.summary` (which normally
-/// supersedes and clears the buffer) is absent — e.g. an interrupted rollout —
-/// so streaming reasoning is preserved as one 思考 card instead of being lost.
+/// Close an open reasoning run: emit everything it gathered as a single Thinking
+/// message and reset both buffers. No-op when the run is empty.
+///
+/// `grouped` is the settled text — the summaries codex wrote for each model
+/// response the run spanned — and `pending` the streaming sections no summary
+/// has restated yet (an interrupted rollout, or the tail of a run that is still
+/// being written). Joining the two in that order is the run in document order,
+/// which is the one 思考 card live shows for it.
 fn flush_pending_reasoning(
     messages: &mut Vec<UnifiedMessage>,
+    grouped: &mut Vec<String>,
     pending: &mut Vec<String>,
     ts: Option<DateTime<Utc>>,
 ) {
-    if pending.is_empty() {
+    if grouped.is_empty() && pending.is_empty() {
         return;
     }
-    let text = pending.join("\n\n");
+    let text = grouped
+        .iter()
+        .chain(pending.iter())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    grouped.clear();
     pending.clear();
     let timestamp = ts.unwrap_or_else(Utc::now);
     messages.push(UnifiedMessage {
@@ -3888,6 +5324,7 @@ fn flush_pending_reasoning(
         duration_ms: None,
         model: None,
         completed_at: Some(timestamp),
+    agent_message_id: None,
     });
 }
 
@@ -3923,6 +5360,168 @@ fn is_environment_context_message(input: &str) -> bool {
 /// on the summary path, whose title fallback doesn't gate on image blocks).
 fn is_codex_internal_context_message(input: &str) -> bool {
     input.trim_start().starts_with("<codex_internal_context")
+}
+
+/// Machine-authored `role: "user"` records that codex injects into the model's
+/// history but never shows as a prompt. They are unreachable on the canonical
+/// path (`event_msg.user_message` carries only what the human typed) and only
+/// become visible through [`ResponseItemPromotion`], so the list lives with the
+/// promotion logic rather than with the title helpers.
+///
+/// Derived from a census of every user-role `response_item.message` text in the
+/// local rollout corpus, not from guesswork: `<environment_context>` (1248),
+/// `<turn_aborted>` (152), `<codex_internal_context source="goal">` (52),
+/// `<subagent_notification>` (24), `<skill>` (10). The one untagged member is
+/// the correction codex injects when a model calls `apply_patch` through
+/// `exec_command` (34 occurrences) — matching English prose is admittedly
+/// brittle, but the failure mode is one stray user bubble in a rollout that
+/// would otherwise render nothing at all.
+const PROMOTED_USER_DENY_PREFIXES: &[&str] = &[
+    "<turn_aborted>",
+    "<subagent_notification",
+    "<skill",
+    "<user_instructions",
+    "<permissions instructions",
+    "<skills_instructions",
+    "Warning: apply_patch was requested via exec_command",
+];
+
+/// Whether a candidate user record is machine context rather than a prompt.
+fn is_promotable_user_text(input: &str) -> bool {
+    let trimmed = input.trim();
+    if trimmed.is_empty()
+        || is_agents_instruction_message(trimmed)
+        || is_environment_context_message(trimmed)
+        || is_codex_internal_context_message(trimmed)
+    {
+        return false;
+    }
+    !PROMOTED_USER_DENY_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+}
+
+/// Whether a candidate assistant record is renderable prose.
+///
+/// `<proposed_plan>` is codex's plan-mode payload. It is NOT prose and never
+/// rides the generic promotion path: the detail parser intercepts it in a
+/// dedicated arm (see [`proposed_plan_body`]) which renders it regardless of
+/// the segment's canonical-channel coverage, because a plan turn has no
+/// `agent_message` twin to be covered by in the first place. Keeping the deny
+/// here is what stops the two paths from both emitting the same plan.
+/// The compaction/handoff summary is excluded separately, by adjacency
+/// (see [`ResponseItemPromotion::note_record`]).
+fn is_promotable_assistant_text(input: &str) -> bool {
+    let trimmed = input.trim();
+    !trimmed.is_empty() && !trimmed.starts_with(PROPOSED_PLAN_OPEN)
+}
+
+/// codex Plan-mode markers. The plan document reaches the model's own history
+/// as an assistant `response_item` wrapped in these tags, optionally with prose
+/// before or after the block ("如果你希望调整…" follow-ups are common). The
+/// frontend adapter (`expandProposedPlanText`) already splits that shape into a
+/// plan card plus the surrounding text parts, so the parser hands the record
+/// over verbatim instead of reshaping it here.
+const PROPOSED_PLAN_OPEN: &str = "<proposed_plan>";
+const PROPOSED_PLAN_CLOSE: &str = "</proposed_plan>";
+
+/// The plan document inside a `<proposed_plan>` block, or `None` when `input`
+/// carries no such block.
+///
+/// Used to pair an assistant record with the `event_msg.item_completed`
+/// announcement of the SAME plan: codex writes every plan twice — once as a
+/// structured `Plan` item (body only) and once as this record (body plus any
+/// surrounding prose) — and only one of them may render. An unclosed block
+/// (the turn was interrupted mid-plan) yields everything after the opener.
+fn proposed_plan_body(input: &str) -> Option<&str> {
+    let opened = input.find(PROPOSED_PLAN_OPEN)? + PROPOSED_PLAN_OPEN.len();
+    let rest = &input[opened..];
+    let body = match rest.find(PROPOSED_PLAN_CLOSE) {
+        Some(closed) => &rest[..closed],
+        None => rest,
+    };
+    Some(body.trim())
+}
+
+/// The plan document announced by `event_msg.item_completed`, or `None` for
+/// every other completed item. codex's Plan-mode turn publishes its final
+/// answer here INSTEAD of on `event_msg.agent_message`, which is why a plan
+/// turn otherwise parses to nothing but its reasoning.
+fn completed_plan_item_text(payload: &serde_json::Value) -> Option<&str> {
+    let item = payload.get("item")?;
+    if item.get("type").and_then(|v| v.as_str()) != Some("Plan") {
+        return None;
+    }
+    let text = item.get("text").and_then(|v| v.as_str())?.trim();
+    (!text.is_empty()).then_some(text)
+}
+
+/// codex's own follow-up prompt after the user approves a plan. It is written
+/// to the rollout as an ordinary `user_message` — same fields, same empty
+/// `text_elements` as something the user typed — so the wording is the only
+/// per-record signal, and it is deliberately paired with the collaboration-mode
+/// flip below rather than trusted alone.
+const CODEX_PLAN_APPROVAL_PROMPT: &str = "Implement the approved plan.";
+
+/// codex-acp's wording for an approved plan review, echoed as the historical
+/// `plan_review` call's output so the card reports the same decision the live
+/// one does (`CODEX_PLAN_APPROVED_PREFIX` in `plan-mode-card.tsx`).
+const CODEX_PLAN_APPROVED_OUTPUT: &str = "User approved the plan.";
+
+/// Append the settled `plan_review` call that reports an approved plan.
+///
+/// Deliberately the same shape the LIVE path produces: codeg seeds codex-acp's
+/// unannounced plan-review call with `raw_input: None` (see
+/// `handle_permission_request`) because the plan is already in the transcript,
+/// and the frontend renders that input-less call as a bare decision marker. So
+/// history and live resolve to one `<PlanModeCard>` with no rendering change
+/// on either side.
+///
+/// Appended rather than inserted next to the plan: held `insert_at` positions
+/// in `pending_promotions` are indices into this very vector, and the approval
+/// belongs after the plan chronologically anyway.
+fn push_plan_review_marker(messages: &mut Vec<UnifiedMessage>, timestamp: DateTime<Utc>) {
+    let tool_use_id = format!("codex-plan-review-{}", messages.len());
+    messages.push(UnifiedMessage {
+        id: format!("assistant-plan-review-{}", messages.len()),
+        role: MessageRole::Assistant,
+        content: vec![
+            ContentBlock::ToolUse {
+                tool_use_id: Some(tool_use_id.clone()),
+                // Resolved verbatim by the historical adapter, which passes
+                // `block.tool_name` straight through to the renderer's
+                // underscore-preserving gate.
+                tool_name: "plan_review".to_string(),
+                input_preview: None,
+                status: None,
+                meta: None,
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: Some(tool_use_id),
+                output_preview: Some(CODEX_PLAN_APPROVED_OUTPUT.to_string()),
+                is_error: false,
+                agent_stats: None,
+                images: Vec::new(),
+            },
+        ],
+        timestamp,
+        usage: None,
+        duration_ms: None,
+        model: None,
+        completed_at: Some(timestamp),
+        agent_message_id: None,
+    });
+}
+
+/// This turn's collaboration mode, from `turn_context.collaboration_mode.mode`
+/// (`"plan"` while Plan mode is active). Absent on rollouts predating Plan
+/// mode, which is why every caller treats `None` as "not plan".
+fn turn_collaboration_mode(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("payload")?
+        .get("collaboration_mode")?
+        .get("mode")?
+        .as_str()
 }
 
 fn extract_codex_title_candidate(input: &str, fallback_attached: bool) -> Option<String> {
@@ -4043,6 +5642,424 @@ fn should_skip_duplicate_user_message(
     false
 }
 
+/// Content identity of a user turn, in the exact terms the DETAIL parser
+/// compares (`blocks_equal` over the blocks it would build for that record).
+///
+/// The summary parser must apply the same cross-channel dedup as
+/// [`should_skip_duplicate_user_message`] — codex writes the same prompt
+/// through both `event_msg` and `response_item` — but it is the LIGHTWEIGHT
+/// pass and must not materialize blocks (or decode images) to do it. This is
+/// the cheap stand-in: same text normalization, same image-parse predicate,
+/// same ordering, no allocation of the block vector itself.
+#[derive(Debug, PartialEq, Eq)]
+struct UserTurnFingerprint {
+    text: Option<String>,
+    images: Vec<(String, String)>,
+}
+
+impl UserTurnFingerprint {
+    /// Mirrors the detail parser's `event_msg`/`user_message` arm.
+    fn from_event_message(payload: &serde_json::Value) -> Self {
+        let text = strip_blocked_resource_mentions(
+            payload.get("message").and_then(|m| m.as_str()).unwrap_or(""),
+        );
+        let images = payload
+            .get("images")
+            .and_then(|v| v.as_array())
+            .map(|images| {
+                images
+                    .iter()
+                    .filter_map(|image| image.as_str())
+                    .filter_map(parse_data_uri_image)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self::new(text, images)
+    }
+
+    /// Mirrors [`extract_response_item_user_image_blocks`].
+    fn from_response_item(payload: &serde_json::Value) -> Self {
+        let mut text_parts: Vec<String> = Vec::new();
+        let mut images = Vec::new();
+        if let Some(content) = payload.get("content").and_then(|c| c.as_array()) {
+            for item in content {
+                match item.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                    "input_text" => {
+                        let Some(text) = item.get("text").and_then(|v| v.as_str()) else {
+                            continue;
+                        };
+                        if text.is_empty() || text.trim() == "<image>" {
+                            continue;
+                        }
+                        text_parts.push(text.to_string());
+                    }
+                    "input_image" => {
+                        if let Some(image) = parse_input_image_data_uri(item) {
+                            images.push(image);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Self::new(
+            strip_blocked_resource_mentions(&text_parts.join("\n")),
+            images,
+        )
+    }
+
+    fn new(text: String, images: Vec<(String, String)>) -> Self {
+        // The detail parser substitutes this placeholder when a user record
+        // would otherwise carry nothing, so two such records compare equal
+        // there and must compare equal here too.
+        let text = if text.is_empty() {
+            images.is_empty().then(|| "Attached resources".to_string())
+        } else {
+            Some(text)
+        };
+        Self { text, images }
+    }
+}
+
+/// Summary-side mirror of [`should_skip_duplicate_user_message`]: same 120s
+/// window, same reverse scan, same content equality. Prunes as it goes so the
+/// list stays bounded by the window rather than by the transcript length.
+fn skip_duplicate_user_record(
+    recent: &mut Vec<(DateTime<Utc>, UserTurnFingerprint)>,
+    fingerprint: UserTurnFingerprint,
+    timestamp: DateTime<Utc>,
+) -> bool {
+    const DUP_WINDOW_MS: i64 = 120_000;
+    while let Some((first, _)) = recent.first() {
+        if (timestamp - *first).num_milliseconds().abs() > DUP_WINDOW_MS {
+            recent.remove(0);
+        } else {
+            break;
+        }
+    }
+    if recent.iter().any(|(_, seen)| *seen == fingerprint) {
+        return true;
+    }
+    recent.push((timestamp, fingerprint));
+    false
+}
+
+/// Route-only ACP blocks are transport metadata, not canonical user coverage.
+/// Some codex-acp versions persist each text block as its own `user_message`;
+/// letting that record mark coverage would suppress a later visible
+/// `response_item` fallback in the same turn segment.
+fn promotion_payload_type<'a>(msg_type: &str, value: &'a serde_json::Value) -> &'a str {
+    let payload = value.get("payload");
+    let payload_type = payload
+        .and_then(|payload| payload.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if msg_type == "event_msg" && payload_type == "user_message" {
+        let route_only = payload
+            .and_then(|payload| payload.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(contains_only_internal_agent_routes);
+        let has_images = payload
+            .and_then(|payload| payload.get("images"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|images| !images.is_empty());
+        if route_only && !has_images {
+            return "";
+        }
+    }
+    payload_type
+}
+
+/// Canonical-channel coverage for one turn segment.
+#[derive(Debug, Default, Clone, Copy)]
+struct SegmentCoverage {
+    user: bool,
+    assistant: bool,
+}
+
+/// Bookkeeping for one held-back `response_item.message` record.
+#[derive(Debug, Clone, Copy)]
+struct PromotionCandidate {
+    /// Per-record counter. The ONLY safe key for "did this come before the
+    /// goal / before the title claim": several candidates can share one
+    /// insertion point in `messages`, so vector positions cannot order them.
+    ordinal: u64,
+    task_seg: usize,
+    ctx_seg: usize,
+    is_user: bool,
+    /// Set by the compaction-adjacency rule after the record was accepted.
+    denied: bool,
+}
+
+/// A held-back `response_item.message`, kept parallel to
+/// [`ResponseItemPromotion::candidates`] so one shared decision drives both.
+#[derive(Debug)]
+struct PendingPromotedMessage {
+    /// Where in `messages` this record would have been pushed. Valid only until
+    /// something else mutates `messages`, which is why the splice runs first in
+    /// the post-loop sequence.
+    insert_at: usize,
+    is_user: bool,
+    blocks: Vec<ContentBlock>,
+    timestamp: DateTime<Utc>,
+    /// Title this record would claim if it turns out to be the opening prompt.
+    /// `None` for assistants, and for a user whose text is not title-worthy.
+    title_candidate: Option<String>,
+}
+
+/// Decides which `response_item.payload.type == "message"` records may be
+/// promoted into the transcript.
+///
+/// # Why this exists
+///
+/// Every message codex writes to a rollout is recorded TWICE: once on the
+/// canonical event channel (`event_msg.user_message` / `event_msg.agent_message`)
+/// and once as a `response_item` for the model's own history. This parser has
+/// always read the event channel and ignored the `response_item` twin, which is
+/// correct — until a producer writes a rollout with no event channel at all
+/// (issue #452: a session created by an embedder that sets its own `CODEX_HOME`).
+/// Then the tool calls still parse from `response_item.function_call` while every
+/// user and assistant bubble vanishes, and the conversation renders as a bare
+/// "Used N tools".
+///
+/// # Why the gate is per-segment
+///
+/// The obvious rules both fail:
+///
+/// * *Per record, when no same-text twin exists* — 101 assistant records across
+///   60 files in the local corpus have no twin, and they are all `<proposed_plan>`
+///   blocks and compaction summaries, i.e. text codex deliberately keeps out of
+///   the chat. That rule regresses 60 existing conversations.
+/// * *Per file, when the event channel is absent anywhere* — this is inert on the
+///   corpus, but it evaporates the moment the user resumes the session in codeg:
+///   native `event_msg` records append to the SAME rollout, the gate flips off,
+///   and the whole imported prefix disappears again. That is exactly the workflow
+///   #452 reports.
+///
+/// So coverage is tracked per turn segment and per role: a `response_item`
+/// message is promoted only where the event channel never spoke for its role in
+/// its own turn. A resumed mixed file keeps the imported prefix AND the native
+/// suffix, each exactly once.
+///
+/// Verified inert: 0 promotions across all ~2.7k rollouts in the local corpus.
+#[derive(Debug)]
+struct ResponseItemPromotion {
+    ordinal: u64,
+    /// Coverage under each segmentation. Both are accumulated because which one
+    /// applies is only known at EOF (see [`Self::resolve`]).
+    task_segments: Vec<SegmentCoverage>,
+    ctx_segments: Vec<SegmentCoverage>,
+    saw_task_started: bool,
+    candidates: Vec<PromotionCandidate>,
+    /// Index of the assistant candidate that is still a compaction-summary
+    /// suspect — i.e. nothing but `token_count` has been seen since it.
+    compaction_watch: Option<usize>,
+}
+
+impl ResponseItemPromotion {
+    fn new() -> Self {
+        Self {
+            ordinal: 0,
+            task_segments: vec![SegmentCoverage::default()],
+            ctx_segments: vec![SegmentCoverage::default()],
+            saw_task_started: false,
+            candidates: Vec::new(),
+            compaction_watch: None,
+        }
+    }
+
+    /// Feed one parsed rollout record, BEFORE the parser's own handling of it.
+    /// Returns the record's ordinal.
+    fn note_record(&mut self, msg_type: &str, payload_type: &str) -> u64 {
+        self.ordinal += 1;
+
+        // Compaction adjacency. codex writes the pre-compaction handoff summary
+        // as an assistant message immediately followed by the `compacted`
+        // record, with at most a `token_count` between them. Denying by
+        // adjacency rather than "anywhere in this segment" matters: a rollout
+        // with no turn markers collapses into ONE segment, so a segment-wide
+        // rule would let a single compaction erase an entire imported prefix.
+        match (msg_type, payload_type) {
+            // Transparent — keeps the suspect under watch.
+            ("event_msg", "token_count") => {}
+            ("compacted", _) | ("event_msg", "context_compacted") => {
+                if let Some(index) = self.compaction_watch.take() {
+                    self.candidates[index].denied = true;
+                }
+            }
+            _ => self.compaction_watch = None,
+        }
+
+        // Segment boundaries. `task_started` fires exactly once per turn;
+        // `turn_context` is the weaker fallback because newer codex re-emits it
+        // MID-turn (same trade-off, same precedent as `backfill_turn_durations`).
+        if msg_type == "event_msg" && payload_type == "task_started" {
+            self.saw_task_started = true;
+            self.task_segments.push(SegmentCoverage::default());
+        } else if msg_type == "turn_context" {
+            self.ctx_segments.push(SegmentCoverage::default());
+        }
+
+        // Canonical-channel coverage — "did the event channel already speak for
+        // this role in this turn?".
+        //
+        // `thread_goal_updated` counts as USER input: newer codex consumes a
+        // typed `/goal <objective>` as a slash command and records it as this
+        // event INSTEAD of a `user_message`, and both parsers already synthesize
+        // the opening user turn from it. Without this, the `response_item` twin
+        // of that same prompt would be promoted alongside the synthesized turn
+        // and the opener would render twice.
+        //
+        // Deliberately not narrowed to an opening `create_goal` (which would
+        // mean threading the payload in and re-running `goal_marker`): a
+        // `goal: null` clear is ALSO something the user typed, and a
+        // terminal-status update is not, but suppressing a promotion after one
+        // needs a turn that carries a goal event yet no `user_message` — i.e. a
+        // rollout that HAS the event channel, which is exactly where promotion
+        // is not needed. Accepted, not overlooked.
+        //
+        // Notably absent: `item_completed`. It has no parsing arm here, so
+        // treating it as coverage would suppress a candidate and render nothing
+        // in its place.
+        let (user, assistant) = match (msg_type, payload_type) {
+            ("event_msg", "user_message") | ("event_msg", "thread_goal_updated") => (true, false),
+            ("event_msg", "agent_message") => (false, true),
+            _ => (false, false),
+        };
+        if user || assistant {
+            for segments in [&mut self.task_segments, &mut self.ctx_segments] {
+                if let Some(current) = segments.last_mut() {
+                    current.user |= user;
+                    current.assistant |= assistant;
+                }
+            }
+        }
+
+        self.ordinal
+    }
+
+    /// Register a record the caller has already accepted (role allowlisted,
+    /// deny-lists passed, blocks non-empty). Returns its candidate index, which
+    /// is also its index into the caller's own parallel payload vector.
+    fn push_candidate(&mut self, ordinal: u64, is_user: bool) -> usize {
+        let index = self.candidates.len();
+        self.candidates.push(PromotionCandidate {
+            ordinal,
+            task_seg: self.task_segments.len() - 1,
+            ctx_seg: self.ctx_segments.len() - 1,
+            is_user,
+            denied: false,
+        });
+        if !is_user {
+            self.compaction_watch = Some(index);
+        }
+        index
+    }
+
+    /// Which candidates survive, as a mask parallel to `candidates` (and to the
+    /// caller's payload vector). Callable only at EOF — the segmentation choice
+    /// depends on whether the whole file ever produced a `task_started`.
+    fn resolve(&self) -> Vec<bool> {
+        self.candidates
+            .iter()
+            .map(|candidate| {
+                if candidate.denied {
+                    return false;
+                }
+                let coverage = if self.saw_task_started {
+                    self.task_segments[candidate.task_seg]
+                } else {
+                    self.ctx_segments[candidate.ctx_seg]
+                };
+                if candidate.is_user {
+                    !coverage.user
+                } else {
+                    !coverage.assistant
+                }
+            })
+            .collect()
+    }
+
+    /// Ordinal of the earliest surviving user candidate, used to replay the
+    /// positional `/goal`-opener and title decisions the in-loop code made
+    /// before these records were known.
+    fn first_surviving_user_ordinal(&self, survivors: &[bool]) -> Option<u64> {
+        self.candidates
+            .iter()
+            .zip(survivors)
+            .filter(|(candidate, kept)| **kept && candidate.is_user)
+            .map(|(candidate, _)| candidate.ordinal)
+            .min()
+    }
+}
+
+/// Pull renderable blocks out of a `response_item.payload` of type `message`,
+/// deliberately WITHOUT keying on each content item's `type` tag.
+///
+/// codex's item vocabulary keeps growing upstream, and this path only ever runs
+/// for a rollout whose canonical channel is missing — the one situation where
+/// guessing the tag wrong costs the user the entire transcript. So `input_image`
+/// gets its handling and everything else carrying a string `text` is taken as
+/// text (`output_text`, `input_text`, `text`, `summary_text`, …); an item with
+/// neither is skipped rather than voiding the record.
+///
+/// `strip_blocked_resource_mentions` is applied to user text only. It collapses
+/// runs of whitespace, which is right for a typed prompt (and is what the
+/// `event_msg.user_message` arm does) but would mangle indentation in assistant
+/// markdown — the `event_msg.agent_message` arm passes its text through
+/// verbatim, and this must match it.
+fn extract_response_item_message_blocks(
+    payload: &serde_json::Value,
+    is_user: bool,
+) -> Option<Vec<ContentBlock>> {
+    let content = payload.get("content")?;
+
+    let mut blocks: Vec<ContentBlock> = Vec::new();
+    let mut text_parts: Vec<String> = Vec::new();
+
+    match content {
+        serde_json::Value::String(text) => text_parts.push(text.clone()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if item.get("type").and_then(|v| v.as_str()) == Some("input_image") {
+                    if let Some((mime_type, data)) = parse_input_image_data_uri(item) {
+                        blocks.push(ContentBlock::Image {
+                            data,
+                            mime_type,
+                            uri: None,
+                        });
+                    }
+                    continue;
+                }
+                let Some(text) = item.get("text").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if text.is_empty() || text.trim() == "<image>" {
+                    continue;
+                }
+                text_parts.push(text.to_string());
+            }
+        }
+        _ => return None,
+    }
+
+    let joined = text_parts.join("\n");
+    let text = if is_user {
+        strip_blocked_resource_mentions(&joined)
+    } else {
+        joined
+    };
+    if !text.trim().is_empty() {
+        blocks.insert(0, ContentBlock::Text { text });
+    }
+
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(blocks)
+    }
+}
+
 /// Whether a `response_item` user message carries an `input_image` — the exact
 /// condition under which [`extract_response_item_user_image_blocks`] yields a
 /// real user turn in the detail parser. The lightweight summary parser uses this
@@ -4117,7 +6134,8 @@ fn strip_blocked_resource_mentions(input: &str) -> String {
     let blocked_re = Regex::new(r"@([^\s@]+)\s*\[blocked[^\]]*\]").expect("valid blocked regex");
     let image_tag_re = Regex::new(r"(?i)</?image\s*/?>").expect("valid image tag regex");
     let collapsed_ws_re = Regex::new(r"[ \t]{2,}").expect("valid whitespace regex");
-    let text = blocked_re.replace_all(input, "").to_string();
+    let visible = strip_internal_agent_routes(input);
+    let text = blocked_re.replace_all(&visible, "").to_string();
     let text = image_tag_re.replace_all(&text, "").to_string();
     let text = collapsed_ws_re.replace_all(&text, " ").to_string();
     text.trim().to_string()
@@ -4142,6 +6160,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
+            agent_message_id: None,
             });
             i += 1;
         } else if matches!(msg.role, MessageRole::System) {
@@ -4154,6 +6173,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
+            agent_message_id: None,
             });
             i += 1;
         } else {
@@ -4194,6 +6214,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms,
                 model: turn_model,
                 completed_at,
+            agent_message_id: None,
             });
         }
     }
@@ -4204,12 +6225,197 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
 #[cfg(test)]
 mod tests {
 
+    /// codex-acp 1.8.0 forks BY REFERENCE: the child's rollout carries no
+    /// history, only `forked_from_id` + `forked_from_ordinal_exclusive`. Read
+    /// alone it parses to zero turns, which is what put "this session has no
+    /// messages" under every `[Fork] …` row. The parent's stream below the cut
+    /// has to be spliced in.
+    #[test]
+    fn a_by_reference_fork_inherits_the_parent_history_up_to_the_cut() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let sessions_dir = temp_dir.path().join("sessions");
+        let rollout_dir = sessions_dir.join("2026").join("09").join("02");
+        fs::create_dir_all(&rollout_dir).expect("create rollout dir");
+
+        let parent_id = "01a06222-7b39-7521-8ad1-e3d114374095";
+        let child_id = "01a06227-c220-7302-b0ee-6c296c1cacd1";
+
+        let user = |ord: u64, text: &str| {
+            serde_json::json!({
+                "timestamp": "2026-09-02T12:40:22Z",
+                "ordinal": ord,
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": text}
+            })
+            .to_string()
+        };
+
+        fs::write(
+            rollout_dir.join(format!("rollout-2026-09-02T20-40-22-{parent_id}.jsonl")),
+            format!(
+                "{}\n",
+                [
+                    serde_json::json!({
+                        "timestamp": "2026-09-02T12:40:22Z",
+                        "ordinal": 0,
+                        "type": "session_meta",
+                        "payload": {"id": parent_id, "cwd": "/tmp/work"}
+                    })
+                    .to_string(),
+                    user(1, "kept: before the cut"),
+                    // Past the cut — the fork point was chosen before this turn,
+                    // so the child must NOT inherit it.
+                    user(2, "dropped: after the cut"),
+                ]
+                .join("\n")
+            ),
+        )
+        .expect("write parent");
+
+        fs::write(
+            rollout_dir.join(format!("rollout-2026-09-02T20-46-07-{child_id}.jsonl")),
+            format!(
+                "{}\n",
+                [
+                    serde_json::json!({
+                        "timestamp": "2026-09-02T12:46:07Z",
+                        "ordinal": 2,
+                        "type": "session_meta",
+                        "payload": {
+                            "id": child_id,
+                            "cwd": "/tmp/work",
+                            "forked_from_id": parent_id,
+                            "forked_from_ordinal_exclusive": 2
+                        }
+                    })
+                    .to_string(),
+                    user(3, "the child's own turn"),
+                ]
+                .join("\n")
+            ),
+        )
+        .expect("write child");
+
+        let parser = CodexParser::with_base_dir(sessions_dir);
+        let detail = parser
+            .get_conversation(child_id)
+            .expect("forked conversation parses");
+        let texts: Vec<String> = detail
+            .turns
+            .iter()
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            texts,
+            vec![
+                "kept: before the cut".to_string(),
+                "the child's own turn".to_string(),
+            ],
+            "inherited history stops at the cut and the child's own turn follows"
+        );
+    }
+
+    /// The OLD fork shape replays the parent inline and carries no
+    /// `forked_from_ordinal_exclusive`. Splicing there would show every
+    /// inherited turn twice, so the pointer alone must not trigger it.
+    #[test]
+    fn an_inline_replayed_fork_is_not_spliced_again() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let sessions_dir = temp_dir.path().join("sessions");
+        let rollout_dir = sessions_dir.join("2026").join("04").join("17");
+        fs::create_dir_all(&rollout_dir).expect("create rollout dir");
+
+        let parent_id = "019d995a-347d-7072-a2ec-66646d41b05b";
+        let child_id = "019d995a-89cf-7190-8358-1ab96226c173";
+
+        let user = |text: &str| {
+            serde_json::json!({
+                "timestamp": "2026-04-17T10:52:20Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": text}
+            })
+            .to_string()
+        };
+
+        fs::write(
+            rollout_dir.join(format!("rollout-2026-04-17T10-52-00-{parent_id}.jsonl")),
+            format!(
+                "{}\n",
+                [
+                    serde_json::json!({
+                        "timestamp": "2026-04-17T10:52:00Z",
+                        "type": "session_meta",
+                        "payload": {"id": parent_id, "cwd": "/tmp/work"}
+                    })
+                    .to_string(),
+                    user("inherited once"),
+                ]
+                .join("\n")
+            ),
+        )
+        .expect("write parent");
+
+        // Child header, then the parent replayed inline, then its own turn —
+        // codex's own on-disk order for this shape.
+        fs::write(
+            rollout_dir.join(format!("rollout-2026-04-17T10-52-20-{child_id}.jsonl")),
+            format!(
+                "{}\n",
+                [
+                    serde_json::json!({
+                        "timestamp": "2026-04-17T10:52:20Z",
+                        "type": "session_meta",
+                        "payload": {
+                            "id": child_id,
+                            "cwd": "/tmp/work",
+                            "forked_from_id": parent_id
+                        }
+                    })
+                    .to_string(),
+                    serde_json::json!({
+                        "timestamp": "2026-04-17T10:52:00Z",
+                        "type": "session_meta",
+                        "payload": {"id": parent_id, "cwd": "/tmp/work"}
+                    })
+                    .to_string(),
+                    user("inherited once"),
+                    user("the child's own turn"),
+                ]
+                .join("\n")
+            ),
+        )
+        .expect("write child");
+
+        let parser = CodexParser::with_base_dir(sessions_dir);
+        let detail = parser
+            .get_conversation(child_id)
+            .expect("forked conversation parses");
+        let inherited = detail
+            .turns
+            .iter()
+            .flat_map(|t| t.blocks.iter())
+            .filter(|b| matches!(b, ContentBlock::Text { text } if text == "inherited once"))
+            .count();
+        assert_eq!(inherited, 1, "the inline replay must not be doubled");
+    }
+
     use std::collections::HashMap;
 
     use super::extract_codex_title_candidate;
     use super::extract_context_window_used_tokens_from_token_count_info;
     use super::extract_response_item_user_image_blocks;
     use super::extract_turn_usage_from_codex_usage;
+    use super::codex_parent_thread_id;
+    use super::completed_mcp_call;
+    use super::serialize_preview;
+    use super::truncate_str;
+    use super::BudgetedSink;
+    use super::MCP_RESULT_FALLBACK_CAP;
     use super::is_encrypted_envelope;
     use super::merge_codex_context_window_stats;
     use super::native_team_wait_input;
@@ -4217,7 +6423,11 @@ mod tests {
     use super::parse_codex_subagent_stats;
     use super::redact_encrypted_args;
     use super::resolve_codex_home_dir_from;
+    use super::trim_subagent_replay_prefix;
+    use super::CODEX_PLAN_APPROVAL_PROMPT;
+    use super::CODEX_PLAN_APPROVED_OUTPUT;
     use super::CODEX_SUBAGENT_LAUNCH_KEY;
+    use super::CODEX_SUBAGENT_STATE_KEY;
     use super::COLLAB_OP_KEY;
     use super::should_skip_duplicate_user_message;
     use super::strip_blocked_resource_mentions;
@@ -4227,6 +6437,7 @@ mod tests {
     use crate::models::{
         ContentBlock, MessageRole, MessageTurn, SessionStats, TurnRole, TurnUsage, UnifiedMessage,
     };
+    use crate::parsers::ConversationDetail;
     use chrono::{DateTime, Duration, Utc};
     use std::env;
     use std::fs;
@@ -4264,6 +6475,255 @@ mod tests {
         let index_path = codex_home.join("session_index.jsonl");
         let parser = CodexParser::with_base_dir(sessions_dir);
         (temp_dir, parser, index_path)
+    }
+
+    /// `fork_turns` copies the PARENT's history into the child's head, and that
+    /// copy carries the parent's own `session_meta` — on a real machine 23 of 46
+    /// sub-agent rollouts hold a second header. That header declares no parent
+    /// of its own, so reading `session_meta` last-record-wins clears the child's
+    /// `parent_id` and the rollout lists as an importable root again. The FIRST
+    /// header decides, exactly as `parse_codex_subagent_stats` already does via
+    /// its `checked_header` latch.
+    #[test]
+    fn replayed_parent_header_does_not_clear_the_child_parent_id() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let child = "01a0098a-7e8a-72d3-b7c0-2df130c84063";
+        let parent = "01a0098a-5c58-7000-8000-000000000001";
+        let lines = [
+            rollout_line(
+                "2026-08-16T15:47:46Z",
+                "session_meta",
+                serde_json::json!({
+                    "id": child,
+                    "cwd": "/tmp/demo",
+                    "source": {"subagent": {"thread_spawn": {"parent_thread_id": parent}}}
+                }),
+            ),
+            // The replayed parent header, verbatim as codex writes it.
+            rollout_line(
+                "2026-08-16T15:47:46Z",
+                "session_meta",
+                serde_json::json!({"id": parent, "cwd": "/tmp/demo"}),
+            ),
+            rollout_line(
+                "2026-08-16T15:47:47Z",
+                "event_msg",
+                serde_json::json!({"type": "user_message", "message": "child task"}),
+            ),
+        ];
+        fs::write(
+            temp_dir
+                .path()
+                .join(format!("rollout-2026-08-16T15-47-46-{child}.jsonl")),
+            format!("{}\n", lines.join("\n")),
+        )
+        .expect("write rollout");
+
+        let parser = CodexParser::with_base_dir(temp_dir.path().to_path_buf());
+        let summaries = parser.list_conversations().expect("list conversations");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].parent_id.as_deref(),
+            Some(parent),
+            "a replayed parent header must not clear the child's parent_id"
+        );
+
+        let detail = parser
+            .get_conversation(child)
+            .expect("load conversation detail");
+        assert_eq!(detail.summary.parent_id.as_deref(), Some(parent));
+    }
+
+    /// A by-reference fork keeps its history in the parent file, so
+    /// `rollout_lines` splices the parent's lines in — including the parent's
+    /// own `session_meta`. Reading identity last-record-wins then files the
+    /// CHILD's summary under the PARENT's id and cwd: two rollouts claiming one
+    /// id, which the conversation list dedups down to one and the fork
+    /// disappears. Every identity field latches on the first header, not just
+    /// `parent_id`.
+    #[test]
+    fn spliced_parent_header_does_not_steal_the_forked_child_identity() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let parent = "01a0626c-c601-78f1-a13d-2b26dd168501";
+        let child = "01a0626d-1e26-7853-8f86-02e0f57818a3";
+
+        let parent_lines = [
+            rollout_line(
+                "2026-09-02T14:00:00Z",
+                "session_meta",
+                serde_json::json!({
+                    "id": parent,
+                    "cwd": "/tmp/parent",
+                    "git": {"branch": "parent-branch"}
+                }),
+            ),
+            rollout_line(
+                "2026-09-02T14:00:01Z",
+                "event_msg",
+                serde_json::json!({"type": "user_message", "message": "round one"}),
+            ),
+        ];
+        fs::write(
+            temp_dir
+                .path()
+                .join(format!("rollout-2026-09-02T14-00-00-{parent}.jsonl")),
+            format!("{}\n", parent_lines.join("\n")),
+        )
+        .expect("write parent rollout");
+
+        // The child holds ONLY its header — the by-reference shape.
+        let child_lines = [rollout_line(
+            "2026-09-02T14:01:53Z",
+            "session_meta",
+            serde_json::json!({
+                "id": child,
+                "cwd": "/tmp/child",
+                "git": {"branch": "child-branch"},
+                "forked_from_id": parent,
+                "forked_from_ordinal_exclusive": 1
+            }),
+        )];
+        fs::write(
+            temp_dir
+                .path()
+                .join(format!("rollout-2026-09-02T14-01-53-{child}.jsonl")),
+            format!("{}\n", child_lines.join("\n")),
+        )
+        .expect("write child rollout");
+
+        let parser = CodexParser::with_base_dir(temp_dir.path().to_path_buf());
+        let summaries = parser.list_conversations().expect("list conversations");
+        let ids: Vec<&str> = summaries.iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            ids.contains(&child) && ids.contains(&parent),
+            "both the fork and its parent must list under their OWN ids, got {ids:?}"
+        );
+
+        let forked = summaries
+            .iter()
+            .find(|s| s.id == child)
+            .expect("the fork is listed");
+        assert_eq!(
+            forked.folder_path.as_deref(),
+            Some("/tmp/child"),
+            "the spliced parent header must not overwrite the fork's cwd"
+        );
+        assert_eq!(
+            forked.git_branch.as_deref(),
+            Some("child-branch"),
+            "the spliced parent header must not overwrite the fork's branch"
+        );
+
+        let detail = parser.get_conversation(child).expect("load fork detail");
+        assert_eq!(detail.summary.id, child);
+        assert_eq!(
+            detail.summary.folder_path.as_deref(),
+            Some("/tmp/child"),
+            "the spliced parent header must not overwrite the fork's cwd in detail"
+        );
+    }
+
+    /// Both on-disk sub-agent shapes must surface `parent_id`, because that is
+    /// the only thing keeping these rollouts out of the importer's root list
+    /// (`import_service::collect_local_summaries` drops `parent_id.is_some()`).
+    /// The STRUCTURED case is the one that matters most: it is the shape every
+    /// real sub-agent rollout carries, while the flat mirror only accompanies
+    /// it on some versions.
+    #[test]
+    fn native_parent_thread_is_preserved_in_list_and_detail() {
+        let parent = "019ff3f7-0000-7000-8000-000000000001";
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+
+        // Same parent id, two payload shapes, one directory — so a regression in
+        // either branch shows up as a listed root session.
+        let cases = [
+            (
+                "019ff3f7-937a-7671-b4f6-e404cb729d30",
+                serde_json::json!({ "parent_thread_id": format!(" {parent} ") }),
+            ),
+            (
+                "019ff3f7-937a-7671-b4f6-e404cb729d31",
+                serde_json::json!({
+                    "source": {"subagent": {"thread_spawn": {
+                        "parent_thread_id": parent,
+                        "depth": 1,
+                        "agent_nickname": "Gibbs",
+                        "agent_role": "worker"
+                    }}}
+                }),
+            ),
+        ];
+
+        for (conversation_id, extra) in &cases {
+            let mut payload = serde_json::json!({"id": conversation_id, "cwd": "/tmp/demo"});
+            let map = payload.as_object_mut().expect("payload object");
+            for (k, v) in extra.as_object().expect("extra object") {
+                map.insert(k.clone(), v.clone());
+            }
+            let lines = [
+                rollout_line("2026-08-28T10:00:00Z", "session_meta", payload),
+                rollout_line(
+                    "2026-08-28T10:00:01Z",
+                    "event_msg",
+                    serde_json::json!({"type": "user_message", "message": "child task"}),
+                ),
+            ];
+            fs::write(
+                temp_dir
+                    .path()
+                    .join(format!("rollout-2026-08-28T10-00-00-{conversation_id}.jsonl")),
+                format!("{}\n", lines.join("\n")),
+            )
+            .expect("write rollout");
+        }
+
+        let parser = CodexParser::with_base_dir(temp_dir.path().to_path_buf());
+        let summaries = parser.list_conversations().expect("list conversations");
+        assert_eq!(summaries.len(), cases.len());
+
+        for (conversation_id, _) in &cases {
+            let listed = summaries
+                .iter()
+                .find(|s| s.id == *conversation_id)
+                .unwrap_or_else(|| panic!("{conversation_id} listed"));
+            assert_eq!(
+                listed.parent_id.as_deref(),
+                Some(parent),
+                "{conversation_id} must report its parent so the importer skips it"
+            );
+
+            let detail = parser
+                .get_conversation(conversation_id)
+                .expect("load conversation detail");
+            assert_eq!(detail.summary.parent_id, listed.parent_id);
+        }
+    }
+
+    #[test]
+    fn parent_thread_falls_back_to_structured_source_and_rejects_blanks() {
+        let preferred = serde_json::json!({
+            "parent_thread_id": " root-parent ",
+            "source": {"subagent": {"thread_spawn": {"parent_thread_id": "nested-parent"}}}
+        });
+        assert_eq!(
+            codex_parent_thread_id(&preferred).as_deref(),
+            Some("root-parent")
+        );
+
+        let fallback = serde_json::json!({
+            "parent_thread_id": "  ",
+            "source": {"subagent": {"thread_spawn": {"parent_thread_id": " nested-parent "}}}
+        });
+        assert_eq!(
+            codex_parent_thread_id(&fallback).as_deref(),
+            Some("nested-parent")
+        );
+
+        let blank = serde_json::json!({
+            "parent_thread_id": " ",
+            "source": {"subagent": {"thread_spawn": {"parent_thread_id": "\t"}}}
+        });
+        assert_eq!(codex_parent_thread_id(&blank), None);
     }
 
     #[test]
@@ -4445,6 +6905,236 @@ mod tests {
     }
 
     #[test]
+    fn internal_agent_routes_never_surface_in_codex_history() {
+        use crate::acp::agent_mentions::append_agent_routes;
+        use crate::acp::types::PromptInputBlock;
+
+        let conversation_id = "agent-route-history";
+        let (_temp_dir, parser, _index_path) = write_index_title_fixture(conversation_id);
+        let rollout_path = parser
+            .base_dir
+            .join("2026")
+            .join("08")
+            .join("15")
+            .join(format!(
+                "rollout-2026-08-15T16-00-00-{conversation_id}.jsonl"
+            ));
+        let visible = "Ask [@Antigravity](codeg://agent/antigravity) to review";
+        let mut prompt = vec![PromptInputBlock::Text {
+            text: visible.into(),
+        }];
+        append_agent_routes(&mut prompt, true);
+        let routing = match &prompt[1] {
+            PromptInputBlock::Text { text } => text,
+            _ => unreachable!(),
+        };
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-08-15T08:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": conversation_id, "cwd": "/tmp/Temp"}
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-08-15T08:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": format!("{visible}\n{routing}")
+                }
+            })
+            .to_string(),
+            // Some adapter versions can persist separate ACP text blocks as
+            // separate records. A route-only record must not become a phantom
+            // "Attached resources" turn.
+            serde_json::json!({
+                "timestamp": "2026-08-15T08:00:01.100Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": routing}
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-08-15T08:00:02Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "Done"}
+            })
+            .to_string(),
+        ];
+        fs::write(&rollout_path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let summary = parser
+            .list_conversations()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == conversation_id)
+            .unwrap();
+        assert_eq!(summary.message_count, 2);
+        assert_eq!(summary.title.as_deref(), Some("Ask @Antigravity to review"));
+
+        let detail = parser.get_conversation(conversation_id).unwrap();
+        assert_eq!(detail.turns.len(), 2);
+        assert!(matches!(
+            detail.turns[0].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == visible
+        ));
+    }
+
+    #[test]
+    fn route_only_event_does_not_suppress_visible_response_item_fallback() {
+        use crate::acp::agent_mentions::append_agent_routes;
+        use crate::acp::types::PromptInputBlock;
+
+        let conversation_id = "agent-route-promotion";
+        let (_temp_dir, parser, _index_path) = write_index_title_fixture(conversation_id);
+        let rollout_path = parser
+            .base_dir
+            .join("2026")
+            .join("08")
+            .join("15")
+            .join(format!(
+                "rollout-2026-08-15T16-00-00-{conversation_id}.jsonl"
+            ));
+        let visible = "Ask [@Codex](codeg://agent/codex) to inspect this";
+        let mut prompt = vec![PromptInputBlock::Text {
+            text: visible.into(),
+        }];
+        append_agent_routes(&mut prompt, true);
+        let routing = match &prompt[1] {
+            PromptInputBlock::Text { text } => text,
+            _ => unreachable!(),
+        };
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-08-15T08:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": conversation_id, "cwd": "/tmp/Temp"}
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-08-15T08:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": routing}
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-08-15T08:00:01.100Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": visible}]
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-08-15T08:00:02Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "Done"}
+            })
+            .to_string(),
+        ];
+        fs::write(&rollout_path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let summary = parser
+            .list_conversations()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == conversation_id)
+            .unwrap();
+        assert_eq!(summary.message_count, 2);
+        assert_eq!(summary.title.as_deref(), Some("Ask @Codex to inspect this"));
+
+        let detail = parser.get_conversation(conversation_id).unwrap();
+        assert_eq!(detail.turns.len(), 2);
+        assert!(matches!(
+            detail.turns[0].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == visible
+        ));
+    }
+
+    #[test]
+    fn user_authored_agent_route_envelope_survives_summary_and_detail() {
+        let conversation_id = "user-agent-route-envelope";
+        let (_temp_dir, parser, _index_path) = write_index_title_fixture(conversation_id);
+        let rollout_path = parser
+            .base_dir
+            .join("2026")
+            .join("08")
+            .join("15")
+            .join(format!(
+                "rollout-2026-08-15T16-00-00-{conversation_id}.jsonl"
+            ));
+        let visible = "Explain \u{001e}<codeg_internal_agent_routes version=\"2\">user text</codeg_internal_agent_routes>\u{001e}";
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-08-15T08:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": conversation_id, "cwd": "/tmp/Temp"}
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-08-15T08:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": visible}
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-08-15T08:00:02Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "Done"}
+            })
+            .to_string(),
+        ];
+        fs::write(&rollout_path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let summary = parser
+            .list_conversations()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == conversation_id)
+            .unwrap();
+        assert_eq!(summary.message_count, 2);
+        assert!(summary
+            .title
+            .as_deref()
+            .is_some_and(|title| title.contains("codeg_internal_agent_routes")));
+
+        let detail = parser.get_conversation(conversation_id).unwrap();
+        assert!(matches!(
+            detail.turns[0].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == visible
+        ));
+    }
+
+    #[test]
+    fn internal_routes_are_removed_from_image_response_item_text() {
+        use crate::acp::agent_mentions::append_agent_routes;
+        use crate::acp::types::PromptInputBlock;
+
+        let visible = "Review this image [@Codex](codeg://agent/codex)";
+        let mut prompt = vec![PromptInputBlock::Text {
+            text: visible.into(),
+        }];
+        append_agent_routes(&mut prompt, true);
+        let routing = match &prompt[1] {
+            PromptInputBlock::Text { text } => text,
+            _ => unreachable!(),
+        };
+        let payload = serde_json::json!({
+            "content": [
+                {"type": "input_text", "text": format!("{visible}\n{routing}")},
+                {"type": "input_image", "image_url": "data:image/png;base64,QUJD"}
+            ]
+        });
+
+        let blocks = extract_response_item_user_image_blocks(&payload).unwrap();
+        assert!(matches!(
+            blocks.as_slice(),
+            [ContentBlock::Text { text }, ContentBlock::Image { .. }] if text == visible
+        ));
+    }
+
+    #[test]
     fn extracts_response_item_input_image_blocks() {
         let payload = serde_json::json!({
             "content": [
@@ -4493,6 +7183,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: Some(now),
+        agent_message_id: None,
         }];
 
         assert!(should_skip_duplicate_user_message(
@@ -5539,9 +8230,9 @@ mod tests {
             .expect("parse summary ok")
             .expect("summary present");
 
-        // Summary: agent_message (+1) + synthetic /goal opener (+1); title from the
-        // objective (the image-only user contributes no title).
-        assert_eq!(summary.message_count, 2);
+        // Summary: image user (+1) + agent_message (+1) + synthetic /goal opener
+        // (+1); title still comes from the objective.
+        assert_eq!(summary.message_count, 3);
         assert_eq!(summary.title.as_deref(), Some("Do the thing"));
 
         // Detail parity: title = objective, the leading "/goal …" opener precedes
@@ -5561,6 +8252,75 @@ mod tests {
             _ => None,
         });
         assert_eq!(opener_text, Some("/goal Do the thing"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_image_prompt_written_to_both_channels_counts_once() {
+        // codex writes the same prompt through `event_msg.user_message` AND
+        // `response_item`. The detail parser drops the second copy
+        // (`should_skip_duplicate_user_message`); the summary must too, or the
+        // sidebar count runs one ahead of the turns the conversation renders.
+        // No pre-existing fixture used the event channel's `images` array, so
+        // this shape was entirely untested.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time ok")
+            .as_nanos();
+        let path: PathBuf =
+            env::temp_dir().join(format!("codeg-codex-sumimg-bothchan-{nanos}.jsonl"));
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"si-both\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"look at this\",\"images\":[\"data:image/png;base64,AAAA\"]}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01.100Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"look at this\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,AAAA\"}]}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"ok\"}}\n"
+        );
+        fs::write(&path, content).expect("write test jsonl");
+
+        let parser = CodexParser::new();
+        let summary = parser
+            .parse_jsonl_summary(&path)
+            .expect("parse summary ok")
+            .expect("summary present");
+        let detail = parser
+            .parse_conversation_detail(&path, "si-both")
+            .expect("parse detail ok");
+
+        assert_eq!(detail.turns.len(), 2, "one user turn + one agent turn");
+        assert_eq!(summary.message_count, 2);
+        assert_eq!(summary.message_count, detail.summary.message_count);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn image_response_item_count_matches_detail_without_canonical_user_event() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time ok")
+            .as_nanos();
+        let path: PathBuf =
+            env::temp_dir().join(format!("codeg-codex-sumimg-parity-{nanos}.jsonl"));
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"si-parity\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"inspect this\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,AAAA\"}]}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"ok\"}}\n"
+        );
+        fs::write(&path, content).expect("write test jsonl");
+
+        let parser = CodexParser::new();
+        let summary = parser
+            .parse_jsonl_summary(&path)
+            .expect("parse summary ok")
+            .expect("summary present");
+        let detail = parser
+            .parse_conversation_detail(&path, "si-parity")
+            .expect("parse detail ok");
+
+        assert_eq!(summary.message_count, 2);
+        assert_eq!(detail.turns.len(), 2);
+        assert_eq!(summary.message_count, detail.summary.message_count);
 
         let _ = fs::remove_file(path);
     }
@@ -6016,12 +8776,12 @@ mod tests {
             .collect()
     }
 
-    /// Codex surfaces one reasoning turn twice: as per-section
+    /// Codex surfaces one model response's reasoning twice: as per-section
     /// `event_msg.agent_reasoning` events (one per `**Header**` section) AND as a
     /// single `response_item.reasoning` whose `summary` array groups the same
-    /// sections. History must render ONE 思考 card per turn (live parity), so the
-    /// grouped summary is parsed and the split events are ignored — never one card
-    /// per section.
+    /// sections. History must render ONE 思考 card (live parity), so the grouped
+    /// summary is parsed and the split events it restates are dropped — never one
+    /// card per section.
     #[test]
     fn reasoning_summary_groups_sections_into_single_thinking_block() {
         let lines = vec![
@@ -6219,6 +8979,278 @@ mod tests {
             thinking_texts(&detail),
             vec!["**Plan**\n\nthinking".to_string()]
         );
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// One `response_item.reasoning` covers ONE model response. A long think
+    /// spans several, so codex writes several of them back to back with nothing
+    /// visible in between (up to 28 in a real rollout) — and live streams that
+    /// as a single growing thought. History must too: the run is one 思考 card,
+    /// and only a visible record (here a tool call) starts the next one.
+    #[test]
+    fn consecutive_reasoning_items_merge_into_one_thinking_block() {
+        let lines = vec![
+            rollout_line(
+                "2026-09-02T08:40:00Z",
+                "event_msg",
+                serde_json::json!({"type": "user_message", "message": "继续"}),
+            ),
+            rollout_line(
+                "2026-09-02T08:42:00Z",
+                "event_msg",
+                serde_json::json!({"type": "agent_reasoning", "text": "**A**\n\nbody A"}),
+            ),
+            rollout_line(
+                "2026-09-02T08:42:01Z",
+                "event_msg",
+                serde_json::json!({"type": "agent_reasoning", "text": "**B**\n\nbody B"}),
+            ),
+            rollout_line(
+                "2026-09-02T08:42:02Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [
+                        {"type": "summary_text", "text": "**A**\n\nbody A"},
+                        {"type": "summary_text", "text": "**B**\n\nbody B"}
+                    ]
+                }),
+            ),
+            // Second model response, still nothing visible in between.
+            rollout_line(
+                "2026-09-02T08:42:03Z",
+                "event_msg",
+                serde_json::json!({"type": "agent_reasoning", "text": "**C**\n\nbody C"}),
+            ),
+            rollout_line(
+                "2026-09-02T08:42:04Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "reasoning",
+                    "id": "rs_2",
+                    "summary": [{"type": "summary_text", "text": "**C**\n\nbody C"}]
+                }),
+            ),
+            // A tool call closes the run — what follows is a NEW thought.
+            rollout_line(
+                "2026-09-02T08:42:05Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "function_call",
+                    "name": "shell",
+                    "call_id": "call_1",
+                    "arguments": "{\"command\":[\"ls\"]}"
+                }),
+            ),
+            rollout_line(
+                "2026-09-02T08:42:06Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "a.txt"
+                }),
+            ),
+            rollout_line(
+                "2026-09-02T08:42:07Z",
+                "event_msg",
+                serde_json::json!({"type": "agent_reasoning", "text": "**D**\n\nbody D"}),
+            ),
+            rollout_line(
+                "2026-09-02T08:42:08Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "reasoning",
+                    "id": "rs_3",
+                    "summary": [{"type": "summary_text", "text": "**D**\n\nbody D"}]
+                }),
+            ),
+            rollout_line(
+                "2026-09-02T08:42:09Z",
+                "event_msg",
+                serde_json::json!({"type": "agent_message", "message": "done"}),
+            ),
+        ];
+        let path = write_temp_rollout("reasoning-run", &lines);
+        let parser = CodexParser::new();
+        let detail = parser
+            .parse_conversation_detail(&path, "reasoning-run")
+            .expect("parse ok");
+
+        assert_eq!(
+            thinking_texts(&detail),
+            vec![
+                "**A**\n\nbody A\n\n**B**\n\nbody B\n\n**C**\n\nbody C".to_string(),
+                "**D**\n\nbody D".to_string(),
+            ],
+            "a run of reasoning items is ONE card; a tool call starts the next"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// An empty (encrypted-only) summary restates nothing, so it must not let a
+    /// LATER summary — which only ever covers the sections after it — take the
+    /// buffered sections before it down with the ones it supersedes.
+    #[test]
+    fn an_empty_reasoning_summary_mid_run_keeps_the_sections_before_it() {
+        let lines = vec![
+            rollout_line(
+                "2026-09-02T08:40:00Z",
+                "event_msg",
+                serde_json::json!({"type": "user_message", "message": "go"}),
+            ),
+            rollout_line(
+                "2026-09-02T08:42:00Z",
+                "event_msg",
+                serde_json::json!({"type": "agent_reasoning", "text": "**A**\n\nbody A"}),
+            ),
+            rollout_line(
+                "2026-09-02T08:42:01Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "reasoning",
+                    "id": "rs_enc",
+                    "summary": [],
+                    "encrypted_content": "gAAAredacted"
+                }),
+            ),
+            rollout_line(
+                "2026-09-02T08:42:02Z",
+                "event_msg",
+                serde_json::json!({"type": "agent_reasoning", "text": "**B**\n\nbody B"}),
+            ),
+            rollout_line(
+                "2026-09-02T08:42:03Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "reasoning",
+                    "id": "rs_2",
+                    "summary": [{"type": "summary_text", "text": "**B**\n\nbody B"}]
+                }),
+            ),
+            rollout_line(
+                "2026-09-02T08:42:04Z",
+                "event_msg",
+                serde_json::json!({"type": "agent_message", "message": "done"}),
+            ),
+        ];
+        let path = write_temp_rollout("reasoning-encrypted-mid", &lines);
+        let parser = CodexParser::new();
+        let detail = parser
+            .parse_conversation_detail(&path, "reasoning-encrypted-mid")
+            .expect("parse ok");
+
+        assert_eq!(
+            thinking_texts(&detail),
+            vec!["**A**\n\nbody A\n\n**B**\n\nbody B".to_string()],
+            "the section before an encrypted-only item must survive the next summary"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// A `token_count` that lands inside an open reasoning run reports what the
+    /// response that produced that reasoning spent. The run's card does not
+    /// exist yet, so the round must wait for it instead of being billed to the
+    /// turn before — which would move real spend onto an unrelated reply.
+    #[test]
+    fn a_token_count_inside_a_reasoning_run_bills_the_runs_own_card() {
+        let lines = vec![
+            rollout_line(
+                "2026-09-02T08:40:00Z",
+                "event_msg",
+                serde_json::json!({"type": "user_message", "message": "go"}),
+            ),
+            rollout_line(
+                "2026-09-02T08:41:00Z",
+                "event_msg",
+                serde_json::json!({"type": "agent_message", "message": "first"}),
+            ),
+            rollout_line(
+                "2026-09-02T08:41:01Z",
+                "event_msg",
+                serde_json::json!({"type": "token_count", "info": {
+                    "total_token_usage": {"input_tokens": 1000, "cached_input_tokens": 0, "output_tokens": 50}
+                }}),
+            ),
+            rollout_line(
+                "2026-09-02T08:42:00Z",
+                "event_msg",
+                serde_json::json!({"type": "agent_reasoning", "text": "**A**\n\nbody A"}),
+            ),
+            rollout_line(
+                "2026-09-02T08:42:01Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "**A**\n\nbody A"}]
+                }),
+            ),
+            // Mid-run: the response that wrote **A** reporting its own spend.
+            rollout_line(
+                "2026-09-02T08:42:02Z",
+                "event_msg",
+                serde_json::json!({"type": "token_count", "info": {
+                    "total_token_usage": {"input_tokens": 1600, "cached_input_tokens": 0, "output_tokens": 80}
+                }}),
+            ),
+            rollout_line(
+                "2026-09-02T08:42:03Z",
+                "event_msg",
+                serde_json::json!({"type": "agent_reasoning", "text": "**B**\n\nbody B"}),
+            ),
+            rollout_line(
+                "2026-09-02T08:42:04Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "reasoning",
+                    "id": "rs_2",
+                    "summary": [{"type": "summary_text", "text": "**B**\n\nbody B"}]
+                }),
+            ),
+        ];
+        let path = write_temp_rollout("reasoning-usage", &lines);
+        let parser = CodexParser::new();
+        let detail = parser
+            .parse_conversation_detail(&path, "reasoning-usage")
+            .expect("parse ok");
+
+        let usage_of = |wanted: &str| -> u64 {
+            detail
+                .turns
+                .iter()
+                .find(|t| {
+                    t.blocks.iter().any(|b| match (b, wanted) {
+                        (ContentBlock::Thinking { .. }, "thinking") => true,
+                        (ContentBlock::Text { text }, "first") => text == "first",
+                        _ => false,
+                    })
+                })
+                .and_then(|t| t.usage.as_ref())
+                .map(|u| {
+                    u.input_tokens
+                        + u.output_tokens
+                        + u.cache_creation_input_tokens
+                        + u.cache_read_input_tokens
+                })
+                .unwrap_or(0)
+        };
+
+        assert_eq!(
+            usage_of("first"),
+            1_050,
+            "the reply before the run keeps only its own round"
+        );
+        assert_eq!(
+            usage_of("thinking"),
+            630,
+            "the round spent inside the run belongs to the run's card"
+        );
+        assert_eq!(turn_usage_total(&detail), 1_680, "no round is lost");
 
         let _ = fs::remove_file(path);
     }
@@ -6808,6 +9840,366 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    /// The 0.153.4 team-of-agents wire, transcribed from a real rollout:
+    /// `SubAgentActivity` moved inside `item_completed`, `spawn_agent` returns
+    /// an EMPTY output, and the child reports back through an inter-agent
+    /// `agent_message` in the parent's own stream.
+    fn native_team_0153_lines(final_answer_type: &str, sealed: &str) -> Vec<String> {
+        vec![
+            rollout_line(
+                "2026-09-08T06:44:00Z",
+                "session_meta",
+                serde_json::json!({"id":"parent","cwd":"/tmp/demo"}),
+            ),
+            rollout_line(
+                "2026-09-08T06:44:31Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"function_call","call_id":"call_0sY5","name":"spawn_agent",
+                    "namespace":"collaboration",
+                    "arguments": serde_json::json!({
+                        "task_name":"history_limits","fork_turns":"all","message": sealed,
+                    }).to_string(),
+                }),
+            ),
+            rollout_line(
+                "2026-09-08T06:44:31Z",
+                "event_msg",
+                serde_json::json!({
+                    "type":"item_completed","thread_id":"parent",
+                    "item":{
+                        "type":"SubAgentActivity","id":"call_0sY5","kind":"started",
+                        "agent_thread_id":"01a07fc2-db62-78b3-9762-9cb2540216c2",
+                        "agent_path":"/root/history_limits",
+                    },
+                }),
+            ),
+            // 0.153.4 returns nothing at all from the spawn.
+            rollout_line(
+                "2026-09-08T06:44:32Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"function_call_output","call_id":"call_0sY5","output":"",
+                }),
+            ),
+            rollout_line(
+                "2026-09-08T07:10:36Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"agent_message","id":"amsg_1",
+                    "author":"/root/history_limits","recipient":"/root",
+                    "content":[
+                        {"type":"input_text","text": format!(
+                            "Message Type: {final_answer_type}\nTask name: /root\nSender: /root/history_limits\nPayload:\n历史与运行预算增强已完成。"
+                        )},
+                    ],
+                }),
+            ),
+            rollout_line(
+                "2026-09-08T07:10:37Z",
+                "event_msg",
+                serde_json::json!({
+                    "type":"item_completed","thread_id":"parent",
+                    "item":{
+                        "type":"SubAgentActivity",
+                        "id":"subagent-completed-01a07fc2-dbcd","kind":"completed",
+                        "agent_thread_id":"01a07fc2-db62-78b3-9762-9cb2540216c2",
+                        "agent_path":"/root/history_limits",
+                    },
+                }),
+            ),
+        ]
+    }
+
+    /// The spawn capsule's `(input JSON, result text)` for `call_0sY5`.
+    fn spawn_capsule(detail: &ConversationDetail) -> (serde_json::Value, Option<String>) {
+        let blocks: Vec<&ContentBlock> =
+            detail.turns.iter().flat_map(|t| t.blocks.iter()).collect();
+        let input = blocks
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::ToolUse {
+                    tool_use_id: Some(id),
+                    tool_name,
+                    input_preview,
+                    ..
+                } if id == "call_0sY5" && tool_name == "Agent" => input_preview.as_deref(),
+                _ => None,
+            })
+            .expect("spawn Agent capsule present");
+        let output = blocks.iter().find_map(|b| match b {
+            ContentBlock::ToolResult {
+                tool_use_id: Some(id),
+                output_preview,
+                ..
+            } if id == "call_0sY5" => Some(output_preview.clone()),
+            _ => None,
+        });
+        (
+            serde_json::from_str(input).expect("spawn input is JSON"),
+            output.flatten(),
+        )
+    }
+
+    #[test]
+    fn native_team_0153_reads_the_nested_subagent_activity() {
+        // 0.153.4 retired `event_msg.sub_agent_activity` for a `SubAgentActivity`
+        // nested in `item_completed`. Reading only the flat shape left every
+        // capsule of that release with no `agent_id`, so the badge the live
+        // stream showed vanished on reload and nothing could resolve the
+        // child's own rollout.
+        let sealed = format!("gAAAAAB{}", "qgWsi0g7gOInVU3UTzqL".repeat(30));
+        let path = write_temp_rollout("nativeteam0153", &native_team_0153_lines("MESSAGE", &sealed));
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "parent")
+            .expect("parse ok");
+        let (input, result) = spawn_capsule(&detail);
+
+        assert_eq!(
+            input.get("agent_id").and_then(|v| v.as_str()),
+            Some("01a07fc2-db62-78b3-9762-9cb2540216c2"),
+            "the nested SubAgentActivity carries the same spawn call_id the flat event did"
+        );
+        // The terminal record is a `completed` of its own, under a synthetic id
+        // that shares nothing with the launch but the thread id.
+        assert_eq!(
+            input.get(CODEX_SUBAGENT_STATE_KEY).and_then(|v| v.as_str()),
+            Some("completed")
+        );
+        // A non-terminal inter-agent message is sealed and says nothing, so it
+        // must not be mistaken for the child's report.
+        assert_eq!(
+            result, None,
+            "only FINAL_ANSWER carries a readable payload; MESSAGE is a Fernet blob"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_resumed_subagent_drops_its_previous_outcome() {
+        // codex can bring a finished child back (`resumeAgent` / `followup_task`)
+        // and announces it with a fresh `started`. The capsule must stop claiming
+        // the run that has since resumed.
+        let sealed = format!("gAAAAAB{}", "qgWsi0g7gOInVU3UTzqL".repeat(30));
+        let mut lines = native_team_0153_lines("MESSAGE", &sealed);
+        lines.push(rollout_line(
+            "2026-09-08T07:20:00Z",
+            "event_msg",
+            serde_json::json!({
+                "type":"item_completed","thread_id":"parent",
+                "item":{
+                    "type":"SubAgentActivity","id":"call_resume","kind":"started",
+                    "agent_thread_id":"01a07fc2-db62-78b3-9762-9cb2540216c2",
+                    "agent_path":"/root/history_limits",
+                },
+            }),
+        ));
+        let path = write_temp_rollout("nativeteamresume", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "parent")
+            .expect("parse ok");
+        let (input, _) = spawn_capsule(&detail);
+        assert_eq!(
+            input.get(CODEX_SUBAGENT_STATE_KEY),
+            None,
+            "a restarted child is running again, not completed"
+        );
+        // The launch marker and the badge survive the restart.
+        assert_eq!(
+            input.get("agent_id").and_then(|v| v.as_str()),
+            Some("01a07fc2-db62-78b3-9762-9cb2540216c2")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn native_team_final_answer_lands_on_the_spawn_capsule() {
+        // The child's report reaches the PARENT's rollout as an addressed
+        // `response_item.agent_message`, with no `item_completed` twin — so it
+        // never reaches ACP and the rollout is the only place it exists. It
+        // belongs to the child, so it is folded into that child's capsule
+        // rather than emitted as narration of the parent's own.
+        let sealed = format!("gAAAAAB{}", "qgWsi0g7gOInVU3UTzqL".repeat(30));
+        let path = write_temp_rollout(
+            "nativeteamfinal",
+            &native_team_0153_lines("FINAL_ANSWER", &sealed),
+        );
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "parent")
+            .expect("parse ok");
+        let (_, result) = spawn_capsule(&detail);
+        assert_eq!(result.as_deref(), Some("历史与运行预算增强已完成。"));
+
+        // …and not ALSO as an assistant message, which would show the report
+        // twice and attribute the child's words to the parent.
+        let assistant_texts: Vec<&str> = detail
+            .turns
+            .iter()
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !assistant_texts
+                .iter()
+                .any(|t| t.contains("历史与运行预算增强已完成")),
+            "the report is the capsule's, not a parent message: {assistant_texts:?}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn list_agents_becomes_a_collab_capsule_without_the_root_row() {
+        // `list_agents` returns a roster whose finished rows carry each child's
+        // ENTIRE report — with the native team there is no `close_agent` and the
+        // wait carries no text, so this is one of the few readable copies. It
+        // used to render as raw JSON on the generic tool card.
+        let lines = vec![
+            rollout_line(
+                "2026-09-08T07:11:00Z",
+                "session_meta",
+                serde_json::json!({"id":"parent","cwd":"/tmp/demo"}),
+            ),
+            rollout_line(
+                "2026-09-08T07:11:37Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"function_call","call_id":"call_h62v","name":"list_agents",
+                    "namespace":"collaboration","arguments":"{}",
+                }),
+            ),
+            rollout_line(
+                "2026-09-08T07:11:38Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"function_call_output","call_id":"call_h62v",
+                    "output": serde_json::json!({"agents":[
+                        {"agent_name":"/root","agent_status":"running"},
+                        {"agent_name":"/root/acceptance_fixture",
+                         "agent_status":{"completed":"只读分析已完成。"}},
+                        {"agent_name":"/root/query_core","agent_status":"running"},
+                    ]}).to_string(),
+                }),
+            ),
+        ];
+        let path = write_temp_rollout("listagents", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "parent")
+            .expect("parse ok");
+        let input = detail
+            .turns
+            .iter()
+            .flat_map(|t| t.blocks.iter())
+            .find_map(|b| match b {
+                ContentBlock::ToolUse {
+                    tool_name,
+                    input_preview,
+                    ..
+                } if tool_name == "collab_agent" => input_preview.as_deref(),
+                _ => None,
+            })
+            .expect("roster renders as a collab capsule, not a generic tool card");
+        let parsed: serde_json::Value = serde_json::from_str(input).expect("collab input is JSON");
+        assert_eq!(parsed.get(COLLAB_OP_KEY).and_then(|v| v.as_str()), Some("list"));
+        let states = parsed
+            .get("agentsStates")
+            .and_then(|v| v.as_object())
+            .expect("agentsStates present");
+        assert!(
+            !states.contains_key("/root"),
+            "the parent is not one of its own sub-agents: {states:?}"
+        );
+        assert_eq!(
+            states
+                .get("/root/acceptance_fixture")
+                .and_then(|a| a.get("message"))
+                .and_then(|v| v.as_str()),
+            Some("只读分析已完成。")
+        );
+        assert_eq!(
+            states
+                .get("/root/query_core")
+                .and_then(|a| a.get("status"))
+                .and_then(|v| v.as_str()),
+            Some("running")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn subagent_rollout_drops_the_replayed_parent_history() {
+        // A sub-agent rollout opens with however much of the parent's thread the
+        // spawn carried over. Those records are the PARENT's; without the cut,
+        // opening the child's session shows somebody else's conversation first.
+        let header = serde_json::json!({
+            "timestamp":"2026-09-08T06:44:31Z","ordinal":0,"type":"session_meta",
+            "payload":{
+                "id":"child","session_id":"parent","forked_from_id":"parent",
+                "parent_thread_id":"parent","cwd":"/tmp/demo",
+                "agent_path":"/root/history_limits","thread_source":"subagent",
+                "subagent_history_start_ordinal": 3,
+            },
+        })
+        .to_string();
+        let numbered = |ordinal: u64, text: &str| {
+            serde_json::json!({
+                "timestamp":"2026-09-08T06:44:32Z","ordinal":ordinal,"type":"response_item",
+                "payload":{"type":"message","role":"assistant",
+                           "content":[{"type":"output_text","text":text}]},
+            })
+            .to_string()
+        };
+        let lines = vec![
+            header.clone(),
+            // The parent's own header, replayed into the child's file.
+            serde_json::json!({
+                "timestamp":"2026-09-08T06:44:31Z","ordinal":1,"type":"session_meta",
+                "payload":{"id":"parent","cwd":"/tmp/demo"},
+            })
+            .to_string(),
+            numbered(2, "parent said this"),
+            numbered(3, "child said this"),
+        ];
+
+        let kept = trim_subagent_replay_prefix(lines);
+        assert_eq!(kept.len(), 2, "header + the child's own record: {kept:?}");
+        assert_eq!(kept[0], header, "the header declares the lineage — keep it");
+        assert!(kept[1].contains("child said this"));
+
+        // Without codex's own marker there is no exact cut, and guessing one
+        // would be worse than showing the file as it is.
+        let unmarked = vec![
+            serde_json::json!({
+                "timestamp":"2026-07-25T11:50:01Z","ordinal":0,"type":"session_meta",
+                "payload":{"id":"child","forked_from_id":"parent",
+                           "parent_thread_id":"parent","history_mode":"legacy"},
+            })
+            .to_string(),
+            numbered(2, "parent said this"),
+        ];
+        assert_eq!(trim_subagent_replay_prefix(unmarked.clone()), unmarked);
+
+        // A cut of 0 seeds nothing: the file is its own from the first record,
+        // and the header must not be spliced in on top of itself.
+        let unseeded = vec![
+            serde_json::json!({
+                "timestamp":"2026-09-08T06:44:31Z","ordinal":0,"type":"session_meta",
+                "payload":{"id":"child","forked_from_id":"parent",
+                           "parent_thread_id":"parent",
+                           "subagent_history_start_ordinal": 0},
+            })
+            .to_string(),
+            numbered(1, "child said this"),
+        ];
+        assert_eq!(trim_subagent_replay_prefix(unseeded.clone()), unseeded);
+    }
+
     #[test]
     fn legacy_collab_spawn_keeps_its_run_semantics() {
         // The pre-0.147 shape DOES get a wait/close capsule carrying the
@@ -7041,9 +10433,13 @@ mod tests {
     #[test]
     fn forked_child_transcript_yields_no_stats() {
         // A codex 0.147 sub-agent thread opens with its own `session_meta`
-        // (carrying `parent_thread_id`) and then replays the PARENT's history,
-        // tool calls included. Counting those would credit the child with the
-        // parent's work, so the whole file is refused.
+        // (carrying `parent_thread_id` AND `forked_from_id`) and then replays the
+        // PARENT's history, tool calls included. Counting those would credit the
+        // child with the parent's work, so the whole file is refused.
+        //
+        // `forked_from_id` is what makes it a replay, and on disk it is never
+        // absent from one: the 23 sub-agent rollouts that carry it are exactly
+        // the 23 that also hold the replayed second header below.
         let child = "01a0098a-7e8a-72d3-b7c0-2df130c84063";
         let dir = temp_session_dir("forked-child");
         // The lookup matches a rollout whose stem ends with the thread id,
@@ -7054,7 +10450,10 @@ mod tests {
                 rollout_line(
                     "2026-08-16T07:47:46Z",
                     "session_meta",
-                    serde_json::json!({"id":child,"parent_thread_id":"parent","cwd":"/tmp/demo"}),
+                    serde_json::json!({
+                        "id": child, "cwd": "/tmp/demo",
+                        "parent_thread_id": "parent", "forked_from_id": "parent"
+                    }),
                 ),
                 rollout_line(
                     "2026-08-16T07:47:46Z",
@@ -7077,6 +10476,84 @@ mod tests {
             parse_codex_subagent_stats(&dir, child).is_none(),
             "a forked child transcript must contribute no stats"
         );
+
+        // The same replay as codex actually writes it: the parent id lives under
+        // the structured subagent source and there is NO flat mirror. Matching
+        // only the flat field counted these files, crediting the child with the
+        // parent's replayed tool calls.
+        let structured = "019e88cb-ada0-7611-b7cf-25a6e3535722";
+        fs::write(
+            dir.join(format!("rollout-2026-06-02T22-45-10-{structured}.jsonl")),
+            [
+                rollout_line(
+                    "2026-06-02T22:45:10Z",
+                    "session_meta",
+                    serde_json::json!({
+                        "id": structured,
+                        "cwd": "/tmp/demo",
+                        "forked_from_id": "parent",
+                        "source": {"subagent": {"thread_spawn": {
+                            "parent_thread_id": "parent", "depth": 1, "agent_role": "explorer"
+                        }}}
+                    }),
+                ),
+                rollout_line(
+                    "2026-06-02T22:45:10Z",
+                    "session_meta",
+                    serde_json::json!({"id": "parent", "cwd": "/tmp/demo"}),
+                ),
+                rollout_line(
+                    "2026-06-02T22:45:11Z",
+                    "response_item",
+                    serde_json::json!({
+                        "type":"function_call","call_id":"parents_own","name":"exec_command",
+                        "arguments": serde_json::json!({"cmd":"git status"}).to_string(),
+                    }),
+                ),
+            ]
+            .join("\n"),
+        )
+        .expect("write structured forked child");
+        assert!(
+            parse_codex_subagent_stats(&dir, structured).is_none(),
+            "the structured subagent shape must be refused too"
+        );
+
+        // A spawned child that was NOT seeded with the parent's history: it has a
+        // parent thread id but no `forked_from_id` and no replayed header, so the
+        // tool calls in it are its own and MUST still be counted. Half the
+        // sub-agent rollouts on disk look like this; refusing them on the parent
+        // id alone blanks the capsule's tool list for real work.
+        let clean = "019d9929-6a00-7543-b045-172ebb06e5eb";
+        fs::write(
+            dir.join(format!("rollout-2026-04-17T01-58-42-{clean}.jsonl")),
+            [
+                rollout_line(
+                    "2026-04-17T01:58:42Z",
+                    "session_meta",
+                    serde_json::json!({
+                        "id": clean,
+                        "cwd": "/tmp/demo",
+                        "source": {"subagent": {"thread_spawn": {
+                            "parent_thread_id": "parent", "depth": 1, "agent_role": "worker"
+                        }}}
+                    }),
+                ),
+                rollout_line(
+                    "2026-04-17T01:58:43Z",
+                    "response_item",
+                    serde_json::json!({
+                        "type":"function_call","call_id":"its_own","name":"exec_command",
+                        "arguments": serde_json::json!({"cmd":"pnpm test"}).to_string(),
+                    }),
+                ),
+            ]
+            .join("\n"),
+        )
+        .expect("write clean child");
+        let clean_stats =
+            parse_codex_subagent_stats(&dir, clean).expect("a non-replayed child keeps its stats");
+        assert_eq!(clean_stats.tool_calls.len(), 1);
 
         // The legacy shape has no replayed prefix and still resolves.
         fs::write(
@@ -7130,6 +10607,27 @@ mod tests {
                     tool_name.clone(),
                     input_preview.clone(),
                 )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `(tool_use_id, status)` per ToolUse block. Separate from `tool_uses`
+    /// because only the semantic MCP cards carry a status at all — codex
+    /// leaves it `None` everywhere else (see `ContentBlock::ToolUse::status`).
+    fn tool_use_statuses(
+        detail: &crate::models::ConversationDetail,
+    ) -> Vec<(String, Option<String>)> {
+        detail
+            .turns
+            .iter()
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse {
+                    tool_use_id,
+                    status,
+                    ..
+                } => Some((tool_use_id.clone().unwrap_or_default(), status.clone())),
                 _ => None,
             })
             .collect()
@@ -7219,6 +10717,853 @@ mod tests {
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn completed_mcp_items_split_a_two_call_one_chunk_script() {
+        let script = concat!(
+            "const wd=\"/tmp\";const taskA=\"A\";const taskB=\"B\";",
+            "const [a,b]=await Promise.all([",
+            "tools.mcp__codeg_mcp__delegate_to_agent({agent_type:\"codex\",working_dir:wd,task:taskA}),",
+            "tools.mcp__codeg_mcp__delegate_to_agent({agent_type:\"codex\",working_dir:wd,task:taskB})",
+            "]);text(JSON.stringify({a,b}));"
+        );
+        assert!(
+            crate::parsers::codex_code_mode::parse_code_mode_script(script)
+                .calls
+                .is_none(),
+            "the real variable-argument shape cannot be statically evaluated"
+        );
+        let mut lines = code_mode_rollout(
+            script,
+            serde_json::json!([
+                {"type":"input_text","text":"Script completed\nWall time 0.2 seconds\nOutput:\n"},
+                {"type":"input_text","text":"{\"a\":{},\"b\":{}}"},
+            ]),
+        );
+        for (offset, (id, task_id, task)) in [
+            ("exec-b", "task-b", "B"),
+            ("exec-a", "task-a", "A"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            lines.insert(
+                2 + offset,
+                rollout_line(
+                    "2026-07-20T08:40:01Z",
+                    "event_msg",
+                    serde_json::json!({
+                        "type": "item_completed",
+                        "item": {
+                            "type": "McpToolCall",
+                            "id": id,
+                            "server": "codeg-mcp",
+                            "tool": "delegate_to_agent",
+                            "arguments": {"agent_type":"codex", "task":task},
+                            "status": "completed",
+                            "result": {
+                                "content": [{"type":"text", "text":format!(
+                                    "Delegation successful. task_id={task_id}."
+                                )}],
+                                "structuredContent": {"task_id":task_id, "status":"running"},
+                                "isError": false
+                            }
+                        }
+                    }),
+                ),
+            );
+        }
+
+        let detail = parse_lines(&lines, "code-mode-semantic-mcp");
+        let uses = tool_uses(&detail);
+        assert_eq!(
+            uses.iter()
+                .map(|(id, name, _)| (id.as_str(), name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("exec-b", "mcp__codeg_mcp__delegate_to_agent"),
+                ("exec-a", "mcp__codeg_mcp__delegate_to_agent"),
+            ],
+            "semantic items replace the outer script with real MCP cards"
+        );
+        assert_eq!(
+            uses[0].2.as_deref(),
+            Some(r#"{"agent_type":"codex","task":"B"}"#)
+        );
+        assert_eq!(
+            uses[1].2.as_deref(),
+            Some(r#"{"agent_type":"codex","task":"A"}"#)
+        );
+        assert_eq!(
+            tool_results(&detail)
+                .into_iter()
+                .map(|(id, output, _)| (id, output))
+                .collect::<Vec<_>>(),
+            vec![
+                ("exec-b".into(), Some("Delegation successful. task_id=task-b.".into())),
+                ("exec-a".into(), Some("Delegation successful. task_id=task-a.".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn mixed_native_collaboration_and_semantic_delegation_keep_their_identities() {
+        // Keep the upstream native team wire in the same rollout as both the
+        // initial MCP delegation and its continuation delegation. The records are
+        // deliberately interleaved: each semantic item must stay with its
+        // own code-mode script while the native spawn keeps its child session.
+        let sealed = format!("gAAAAAB{}", "qgWsi0g7nV3UTzqL".repeat(30));
+        let native = native_team_0153_lines("FINAL_ANSWER", &sealed);
+        let initial_script =
+            "const r = await tools.mcp__codeg_mcp__delegate_to_agent({agent_type:\"codex\",working_dir:\"/tmp/mcp-worker\",task:\"semantic initial\"});text(JSON.stringify(r));";
+        let continuation_script =
+            "const r = await tools.mcp__codeg_mcp__delegate_to_agent({agent_type:\"codex\",working_dir:\"/tmp/mcp-worker\",task:\"semantic followup\",continue_from_task_id:\"task-semantic-initial\"});text(JSON.stringify(r));";
+        let initial_status = serde_json::json!({
+            "task_id": "task-semantic-initial",
+            "child_conversation_id": 901,
+            "status": "running",
+        });
+        let continuation_status = serde_json::json!({
+            "task_id": "task-semantic-next",
+            "child_conversation_id": 901,
+            "status": "running",
+        });
+        let lines = vec![
+            native[0].clone(), // session_meta
+            rollout_line(
+                "2026-09-08T06:44:10Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "call_id": "exec-semantic-initial",
+                    "input": initial_script,
+                }),
+            ),
+            rollout_line(
+                "2026-09-08T06:44:11Z",
+                "event_msg",
+                serde_json::json!({
+                    "type": "item_completed",
+                    "item": {
+                        "type": "McpToolCall",
+                        "id": "mcp-semantic-initial",
+                        "server": "codeg-mcp",
+                        "tool": "delegate_to_agent",
+                        "arguments": {
+                            "agent_type": "codex",
+                            "working_dir": "/tmp/mcp-worker",
+                            "task": "semantic initial",
+                        },
+                        "status": "completed",
+                        "result": {
+                            "content": [{
+                                "type": "text",
+                                "text": format!(
+                                    "Delegation successful. task_id={}. child_conversation_id=901.",
+                                    initial_status["task_id"]
+                                        .as_str()
+                                        .expect("initial task id"),
+                                ),
+                            }],
+                            "structuredContent": initial_status,
+                            "isError": false,
+                        },
+                    },
+                }),
+            ),
+            native[1].clone(), // native spawn_agent
+            native[2].clone(), // native SubAgentActivity started
+            native[3].clone(), // native spawn result
+            rollout_line(
+                "2026-09-08T06:44:33Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "custom_tool_call_output",
+                    "call_id": "exec-semantic-initial",
+                    "output": [
+                        {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                        {"type": "input_text", "text": initial_status.to_string()},
+                    ],
+                }),
+            ),
+            rollout_line(
+                "2026-09-08T06:44:34Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "call_id": "exec-semantic-continuation",
+                    "input": continuation_script,
+                }),
+            ),
+            rollout_line(
+                "2026-09-08T06:44:35Z",
+                "event_msg",
+                serde_json::json!({
+                    "type": "item_completed",
+                    "item": {
+                        "type": "McpToolCall",
+                        "id": "mcp-semantic-continuation",
+                        "server": "codeg-mcp",
+                        "tool": "delegate_to_agent",
+                        "arguments": {
+                            "agent_type": "codex",
+                            "working_dir": "/tmp/mcp-worker",
+                            "task": "semantic followup",
+                            "continue_from_task_id": "task-semantic-initial",
+                        },
+                        "status": "completed",
+                        "result": {
+                            "content": [{
+                                "type": "text",
+                                "text": format!(
+                                    "Delegation successful. task_id={}. child_conversation_id=901.",
+                                    continuation_status["task_id"]
+                                        .as_str()
+                                        .expect("continuation task id"),
+                                ),
+                            }],
+                            "structuredContent": continuation_status,
+                            "isError": false,
+                        },
+                    },
+                }),
+            ),
+            native[4].clone(), // native agent_message result
+            rollout_line(
+                "2026-09-08T06:44:36Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "custom_tool_call_output",
+                    "call_id": "exec-semantic-continuation",
+                    "output": [
+                        {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                        {"type": "input_text", "text": continuation_status.to_string()},
+                    ],
+                }),
+            ),
+            native[5].clone(), // native SubAgentActivity completed
+        ];
+
+        let detail = parse_lines(&lines, "mixed-native-semantic-delegation");
+        let uses = tool_uses(&detail);
+        let semantic_uses: Vec<_> = uses
+            .iter()
+            .filter(|(id, _, _)| id.starts_with("mcp-semantic-"))
+            .map(|(id, name, input)| (id.as_str(), name.as_str(), input.as_deref()))
+            .collect();
+        assert_eq!(
+            semantic_uses,
+            vec![
+                (
+                    "mcp-semantic-initial",
+                    "mcp__codeg_mcp__delegate_to_agent",
+                    Some(
+                        r#"{"agent_type":"codex","task":"semantic initial","working_dir":"/tmp/mcp-worker"}"#,
+                    ),
+                ),
+                (
+                    "mcp-semantic-continuation",
+                    "mcp__codeg_mcp__delegate_to_agent",
+                    Some(
+                        r#"{"agent_type":"codex","continue_from_task_id":"task-semantic-initial","task":"semantic followup","working_dir":"/tmp/mcp-worker"}"#,
+                    ),
+                ),
+            ],
+            "semantic MCP cards keep their own item ids, tool names, and inputs"
+        );
+        assert!(
+            !uses
+                .iter()
+                .any(|(id, name, _)| id.starts_with("exec-semantic-") || name == "exec"),
+            "completed semantic scripts must not remain as generic exec cards: {uses:?}"
+        );
+
+        let semantic_results: Vec<_> = tool_results(&detail)
+            .into_iter()
+            .filter(|(id, _, _)| id.starts_with("mcp-semantic-"))
+            .collect();
+        assert_eq!(
+            semantic_results,
+            vec![
+                (
+                    "mcp-semantic-initial".to_string(),
+                    Some(
+                        "Delegation successful. task_id=task-semantic-initial. child_conversation_id=901."
+                            .to_string(),
+                    ),
+                    false,
+                ),
+                (
+                    "mcp-semantic-continuation".to_string(),
+                    Some(
+                        "Delegation successful. task_id=task-semantic-next. child_conversation_id=901."
+                            .to_string(),
+                    ),
+                    false,
+                ),
+            ],
+            "each semantic result stays on its matching MCP card"
+        );
+
+        let (native_input, native_result) = spawn_capsule(&detail);
+        assert_eq!(
+            native_input.get("agent_id").and_then(|value| value.as_str()),
+            Some("01a07fc2-db62-78b3-9762-9cb2540216c2"),
+            "native activity must keep its own child session id"
+        );
+        assert_eq!(
+            native_result.as_deref(),
+            Some("历史与运行预算增强已完成。"),
+            "native agent_message must stay attached to the native spawn"
+        );
+    }
+
+    #[test]
+    fn a_deferred_scripts_late_mcp_item_cannot_bind_to_the_next_script() {
+        let script = "const r=await tools.mcp__codeg_mcp__delegate_to_agent({agent_type:\"codex\",task:\"A\"});text(JSON.stringify(r));";
+        let mut lines = code_mode_rollout(
+            script,
+            serde_json::json!("Script running with cell ID 34\nWall time 30.0 seconds\nOutput:\n"),
+        );
+        lines.push(rollout_line(
+            "2026-07-20T08:40:03Z",
+            "response_item",
+            serde_json::json!({
+                "type":"custom_tool_call", "name":"exec", "call_id":"call_b",
+                "input":script.replace("task:\"A\"", "task:\"B\"")
+            }),
+        ));
+        lines.push(rollout_line(
+            "2026-07-20T08:40:04Z",
+            "event_msg",
+            serde_json::json!({
+                "type":"item_completed",
+                "item": {
+                    "type":"McpToolCall", "id":"exec-from-a", "server":"codeg-mcp",
+                    "tool":"delegate_to_agent", "arguments":{"task":"A"},
+                    "status":"completed", "result":{"content":[], "isError":false}
+                }
+            }),
+        ));
+        lines.push(rollout_line(
+            "2026-07-20T08:40:05Z",
+            "response_item",
+            serde_json::json!({
+                "type":"custom_tool_call_output", "call_id":"call_b",
+                "output":"Script completed\nWall time 0.1 seconds\nOutput:\nB"
+            }),
+        ));
+
+        let ids: Vec<String> = tool_uses(&parse_lines(&lines, "deferred-mcp-boundary"))
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        assert_eq!(ids, ["call_1", "call_b"]);
+    }
+
+    /// A refused MCP call still lets the SCRIPT finish, so the wrapper's own
+    /// `Script completed` says nothing about the call inside it. The card has to
+    /// settle on the semantic item's outcome or it contradicts the result block
+    /// written beside it. Shape taken verbatim from a real rollout: codeg-mcp
+    /// refuses a `delegate_to_agent` past the delegation depth limit.
+    #[test]
+    fn a_failed_semantic_mcp_item_settles_its_card_as_failed() {
+        let script = concat!(
+            "const dir=\"/tmp/w\";",
+            "const res=await tools.mcp__codeg_mcp__delegate_to_agent({agent_type:\"codex\",working_dir:dir,task:t});",
+            "text(res.content[0].text);"
+        );
+        let mut lines = code_mode_rollout(
+            script,
+            serde_json::json!([
+                {"type":"input_text","text":"Script completed\nWall time 0.0 seconds\nOutput:\n"},
+                {"type":"input_text","text":"depth limit exceeded (2 >= 2)"},
+            ]),
+        );
+        lines.insert(
+            2,
+            rollout_line(
+                "2026-07-20T08:40:01Z",
+                "event_msg",
+                serde_json::json!({
+                    "type": "item_completed",
+                    "item": {
+                        "type": "McpToolCall",
+                        "id": "exec-depth-limit",
+                        "server": "codeg-mcp",
+                        "tool": "delegate_to_agent",
+                        "arguments": {"agent_type":"codex", "working_dir":"/tmp/w"},
+                        "status": "failed",
+                        "result": {
+                            "content": [{"type":"text", "text":"depth limit exceeded (2 >= 2)"}],
+                            "structuredContent": {"error_code":"depth_limit", "status":"failed"},
+                            "isError": true
+                        }
+                    }
+                }),
+            ),
+        );
+
+        let detail = parse_lines(&lines, "semantic-mcp-failed");
+        assert_eq!(
+            tool_use_statuses(&detail),
+            vec![("exec-depth-limit".to_string(), Some("failed".to_string()))],
+            "the card must report the call's own outcome, not the wrapper's"
+        );
+        assert_eq!(
+            tool_results(&detail),
+            vec![(
+                "exec-depth-limit".to_string(),
+                Some("depth limit exceeded (2 >= 2)".to_string()),
+                true,
+            )]
+        );
+    }
+
+    /// A tool whose SUCCESSFUL answer merely reads like a failure — it wraps a
+    /// command and prints its exit code, or opens with `Error:` — must not be
+    /// painted as a failed call. The record says `isError: false` outright, and
+    /// an authoritative field beats the text heuristic that exists only because
+    /// a script card has none.
+    #[test]
+    fn an_explicit_success_survives_output_text_that_reads_like_an_error() {
+        let script = concat!(
+            "const cmd=\"pnpm build\";",
+            "const r=await tools.mcp__shell_srv__run({cmd});",
+            "text(r.content[0].text);"
+        );
+        let mut lines = code_mode_rollout(
+            script,
+            serde_json::json!([
+                {"type":"input_text","text":"Script completed\nWall time 0.2 seconds\nOutput:\n"},
+                {"type":"input_text","text":"Error: 2 problems\nexit code: 1"},
+            ]),
+        );
+        lines.insert(
+            2,
+            rollout_line(
+                "2026-07-20T08:40:01Z",
+                "event_msg",
+                serde_json::json!({
+                    "type": "item_completed",
+                    "item": {
+                        "type": "McpToolCall",
+                        "id": "exec-lint",
+                        "server": "shell-srv",
+                        "tool": "run",
+                        "arguments": {"cmd":"pnpm build"},
+                        "status": "completed",
+                        "result": {
+                            "content": [{"type":"text", "text":"Error: 2 problems\nexit code: 1"}],
+                            "isError": false
+                        }
+                    }
+                }),
+            ),
+        );
+
+        let detail = parse_lines(&lines, "semantic-mcp-noisy-success");
+        assert_eq!(
+            tool_use_statuses(&detail),
+            vec![("exec-lint".to_string(), Some("completed".to_string()))]
+        );
+        assert_eq!(
+            tool_results(&detail),
+            vec![(
+                "exec-lint".to_string(),
+                Some("Error: 2 problems\nexit code: 1".to_string()),
+                false,
+            )],
+            "the record's own isError is the outcome, not what the output reads like"
+        );
+    }
+
+    /// The semantic path throws the wrapper's printed output away, so a result
+    /// that carries no text of its own must still be given something to say —
+    /// otherwise a completed call reloads as a card with an empty body where
+    /// the script card used to show the run.
+    #[test]
+    fn a_textless_semantic_result_still_says_something() {
+        let script = "const shot=await tools.mcp__shot_srv__capture({url:target});text(\"captured\");";
+        let mut lines = code_mode_rollout(
+            script,
+            serde_json::json!([
+                {"type":"input_text","text":"Script completed\nWall time 0.4 seconds\nOutput:\n"},
+                {"type":"input_text","text":"captured"},
+            ]),
+        );
+        lines.insert(
+            2,
+            rollout_line(
+                "2026-07-20T08:40:01Z",
+                "event_msg",
+                serde_json::json!({
+                    "type": "item_completed",
+                    "item": {
+                        "type": "McpToolCall",
+                        "id": "exec-shot",
+                        "server": "shot-srv",
+                        "tool": "capture",
+                        "arguments": {"url":"https://example.test"},
+                        "status": "completed",
+                        "result": {
+                            "content": [{"type":"image", "data":"iVBORw0KGgo=", "mimeType":"image/png"}],
+                            "isError": false
+                        }
+                    }
+                }),
+            ),
+        );
+
+        let detail = parse_lines(&lines, "semantic-mcp-textless");
+        let results = tool_results(&detail);
+        assert_eq!(results.len(), 1, "one card: {results:?}");
+        let (id, output, is_error) = &results[0];
+        assert_eq!(id, "exec-shot");
+        assert!(!is_error, "an image-only answer is not a failure");
+        assert!(
+            output.as_deref().is_some_and(|text| text.contains("image")),
+            "a textless result must still carry its content: {output:?}"
+        );
+    }
+
+    /// The guard that keeps every correlation honest: a script that mixes an
+    /// MCP call with a shell call publishes only ONE semantic item, so the
+    /// items cannot be zipped onto the call sites. Real shape — a status poll
+    /// racing a `write_stdin` — from a rollout on disk. The script card (or its
+    /// static decomposition) has to keep the turn rather than let the lone item
+    /// claim a site it may not own.
+    #[test]
+    fn a_script_mixing_mcp_and_shell_calls_keeps_its_static_reading() {
+        let lines_with_item = |item: bool| {
+            let mut lines = code_mode_rollout(
+                concat!(
+                    "const rs = await Promise.all([\n",
+                    "  tools.mcp__codeg_mcp__get_delegation_status({task_ids:[\"t1\"],wait_ms:30000}),\n",
+                    "  tools.write_stdin({session_id:480,chars:\"y\\n\"}),\n",
+                    "]);\ntext(JSON.stringify(rs));"
+                ),
+                serde_json::json!([
+                    {"type":"input_text","text":"Script completed\nWall time 30.0 seconds\nOutput:\n"},
+                    {"type":"input_text","text":"[{\"tasks\":[]},{}]"},
+                ]),
+            );
+            if item {
+                lines.insert(
+                    2,
+                    rollout_line(
+                        "2026-07-20T08:40:01Z",
+                        "event_msg",
+                        serde_json::json!({
+                            "type": "item_completed",
+                            "item": {
+                                "type": "McpToolCall",
+                                "id": "exec-poll",
+                                "server": "codeg-mcp",
+                                "tool": "get_delegation_status",
+                                "arguments": {"task_ids":["t1"], "wall_ms":30000},
+                                "status": "completed",
+                                "result": {"content":[{"type":"text","text":"{\"tasks\":[]}"}], "isError":false}
+                            }
+                        }),
+                    ),
+                );
+            }
+            let detail = parse_lines(
+                &lines,
+                if item { "mixed-with-item" } else { "mixed-baseline" },
+            );
+            (tool_uses(&detail), tool_results(&detail))
+        };
+
+        let with_item = lines_with_item(true);
+        assert!(
+            !with_item.0.iter().any(|(id, _, _)| id == "exec-poll"),
+            "one item cannot cover two call sites: {with_item:?}"
+        );
+        assert_eq!(
+            with_item,
+            lines_with_item(false),
+            "an uncorrelatable item must leave the script's own reading untouched"
+        );
+    }
+
+    /// A script that threw keeps its own card even when its one MCP call did
+    /// publish a semantic item. The wrapper's `Script error:` text is the whole
+    /// story of that turn — which line threw, and after which call — and the
+    /// semantic path DISCARDS it. The count gate cannot stand in for this: a
+    /// script can throw after its last call answered, leaving exactly as many
+    /// items as call sites.
+    #[test]
+    fn a_thrown_script_keeps_its_own_card_over_a_matching_semantic_item() {
+        let script = concat!(
+            "const r=await tools.mcp__codeg_mcp__task_progress({message:m});",
+            "text(r.content[0].text.toUpperCase());"
+        );
+        let mut lines = code_mode_rollout(
+            script,
+            serde_json::json!([
+                {"type":"input_text","text":"Script failed\nWall time 0.1 seconds\nOutput:\n"},
+                {"type":"input_text","text":"Script error:\nTypeError: Cannot read properties of undefined"},
+            ]),
+        );
+        lines.insert(
+            2,
+            rollout_line(
+                "2026-07-20T08:40:01Z",
+                "event_msg",
+                serde_json::json!({
+                    "type": "item_completed",
+                    "item": {
+                        "type": "McpToolCall",
+                        "id": "exec-progress",
+                        "server": "codeg-mcp",
+                        "tool": "task_progress",
+                        "arguments": {"message":"halfway"},
+                        "status": "completed",
+                        "result": {"content":[{"type":"text","text":"recorded"}], "isError":false},
+                    },
+                }),
+            ),
+        );
+
+        let detail = parse_lines(&lines, "semantic-mcp-thrown-script");
+        assert!(
+            !tool_uses(&detail)
+                .iter()
+                .any(|(id, _, _)| id == "exec-progress"),
+            "a thrown script must not be replaced by the call that did answer"
+        );
+        let results = tool_results(&detail);
+        assert_eq!(results.len(), 1, "one card: {results:?}");
+        assert!(results[0].2, "a thrown script still renders as an error");
+        assert!(
+            results[0]
+                .1
+                .as_deref()
+                .is_some_and(|text| text.contains("TypeError")),
+            "the thrown script's own error must survive: {:?}",
+            results[0].1
+        );
+    }
+
+    /// The sink is what makes a preview bounded: it has to STOP the writer, not
+    /// grow to fit it. Without the refusal, `serde_json` would keep handing it
+    /// the rest of a base64 blob.
+    #[test]
+    fn a_budgeted_sink_stops_at_its_budget() {
+        use std::io::Write;
+        let mut sink = BudgetedSink {
+            buf: Vec::new(),
+            budget: 8,
+        };
+        assert!(sink.write_all(&[b'x'; 5]).is_ok(), "room for the first write");
+        assert!(
+            sink.write_all(&[b'x'; 100]).is_err(),
+            "a write past the budget must fail so serialization aborts"
+        );
+        assert_eq!(sink.buf.len(), 8, "and never buffer more than the budget");
+    }
+
+    /// Reading a value through a budget must be INDISTINGUISHABLE from
+    /// serializing the whole thing and cutting it — otherwise the bound is a
+    /// behavior change wearing a performance fix's clothes. The cases that can
+    /// tell them apart: a value that fits, one landing exactly on the cap, one
+    /// far past it, and one whose characters are multi-byte, where the byte cut
+    /// lands mid-character and decoding leaves a replacement char behind.
+    #[test]
+    fn a_budgeted_preview_reads_exactly_like_an_unbounded_one() {
+        for (name, value) in [
+            ("a small object", serde_json::json!({"a": 1, "b": [true, null]})),
+            ("empty", serde_json::json!({})),
+            ("exactly the cap", serde_json::json!("x".repeat(3998))),
+            ("one past the cap", serde_json::json!("x".repeat(3999))),
+            (
+                "a base64 blob",
+                serde_json::json!([{"type":"image","mimeType":"image/png","data":"A".repeat(500_000)}]),
+            ),
+            ("multi-byte text", serde_json::json!("汉".repeat(6000))),
+        ] {
+            let whole = serde_json::to_string(&value).expect("serialize");
+            assert_eq!(
+                serialize_preview(&value, MCP_RESULT_FALLBACK_CAP),
+                Some(truncate_str(&whole, MCP_RESULT_FALLBACK_CAP)),
+                "{name}"
+            );
+        }
+    }
+
+    /// The marker search reads a block's own outcome fields and stops there.
+    /// Walking on into `data` would read the PAYLOAD — the base64 the cap
+    /// refuses to copy, which the text heuristic would then lowercase into a
+    /// second copy of itself. This pins the VERDICT that follows from that (a
+    /// payload reading like an error is still just bytes); what it cannot see
+    /// is the cost, so the reasoning lives on `blocks_report_failure`.
+    ///
+    /// (Under the cap nothing is cut, so the ordinary preview path parses the
+    /// whole thing exactly as it always has — that is not this arm's business.)
+    #[test]
+    fn an_oversized_block_payload_is_never_read_as_an_outcome() {
+        let call = completed_mcp_call(&serde_json::json!({
+            "item": {
+                "type": "McpToolCall", "id": "i", "server": "s", "tool": "t",
+                "result": {
+                    "content": [{
+                        "type": "image",
+                        "mimeType": "image/png",
+                        "data": format!("error: {}", "A".repeat(MCP_RESULT_FALLBACK_CAP * 2)),
+                    }],
+                },
+            }
+        }))
+        .expect("well-formed item");
+        assert!(
+            call.output_preview
+                .as_deref()
+                .is_some_and(|text| text.ends_with("...")),
+            "the payload is past the cap, so the preview is cut"
+        );
+        assert!(!call.is_error, "a payload is bytes, not a verdict");
+    }
+
+    /// The block fallback IS truncated, so its outcome must not be read back
+    /// out of the cut string — the blocks themselves decide. Same failure as
+    /// the structured case: parse a truncated document and you get nothing,
+    /// and nothing reads as success.
+    #[test]
+    fn a_long_block_failure_survives_its_own_truncation() {
+        let call = completed_mcp_call(&serde_json::json!({
+            "item": {
+                "type": "McpToolCall", "id": "i", "server": "s", "tool": "t",
+                "result": {
+                    "content": [{
+                        "type": "resource",
+                        "padding": "p".repeat(MCP_RESULT_FALLBACK_CAP * 2),
+                        "status": "failed",
+                    }],
+                },
+            }
+        }))
+        .expect("well-formed item");
+        assert!(
+            call.output_preview
+                .as_deref()
+                .is_some_and(|text| text.ends_with("...")),
+            "the card's copy is still cut: {:?}",
+            call.output_preview.as_deref().map(str::len)
+        );
+        assert!(
+            call.is_error,
+            "a failure reported inside the blocks survives the cut"
+        );
+    }
+
+    /// Why the structured answer is the one preview that is NOT truncated: it
+    /// is read twice. The card shows it, and the error heuristic re-parses it
+    /// — a preview opening with `{` is parsed back into JSON and searched for
+    /// a failed `status`. Cut that JSON and the parse fails silently, and a
+    /// call that reported failure settles GREEN. The padding is what makes the
+    /// record longer than any cap worth applying, and it sorts before `status`
+    /// so a cut would take the status with it.
+    #[test]
+    fn a_long_structured_failure_is_not_cut_into_a_success() {
+        let call = completed_mcp_call(&serde_json::json!({
+            "item": {
+                "type": "McpToolCall", "id": "i", "server": "s", "tool": "t",
+                "result": {
+                    "content": [],
+                    "structuredContent": {
+                        "padding": "p".repeat(MCP_RESULT_FALLBACK_CAP * 2),
+                        "status": "failed",
+                    },
+                },
+            }
+        }))
+        .expect("well-formed item");
+        assert!(
+            call.output_preview
+                .as_deref()
+                .is_some_and(|text| serde_json::from_str::<serde_json::Value>(text).is_ok()),
+            "a structured answer must reach the heuristic still parseable"
+        );
+        assert!(
+            call.is_error,
+            "a record that states nothing but reports a failed structured status is a failure"
+        );
+    }
+
+    /// The outcome precedence, stated once against the fields themselves rather
+    /// than through four rollouts: a stated failure outranks a stated success,
+    /// a stated success outranks output text that merely reads like a failure,
+    /// and the text heuristic still decides a record that states nothing.
+    #[test]
+    fn a_semantic_records_stated_outcome_outranks_its_output_text() {
+        let is_error = |status: Option<&str>, result: serde_json::Value| {
+            let mut item = serde_json::json!({
+                "type": "McpToolCall", "id": "i", "server": "s", "tool": "t",
+            });
+            if let Some(status) = status {
+                item["status"] = status.into();
+            }
+            if !result.is_null() {
+                item["result"] = result;
+            }
+            completed_mcp_call(&serde_json::json!({ "item": item }))
+                .expect("well-formed item")
+                .is_error
+        };
+        // Output a successful tool can legitimately return: a wrapped command's
+        // own complaint. `infer_output_text_is_error` reads it as a failure.
+        let noisy = serde_json::json!({
+            "content": [{"type":"text", "text":"Error: 2 problems\nexit code: 1"}]
+        });
+        let flagged = |flag: bool| {
+            let mut result = noisy.clone();
+            result["isError"] = flag.into();
+            result
+        };
+
+        assert!(
+            is_error(None, noisy.clone()),
+            "a record that states nothing leaves the text to decide"
+        );
+        assert!(
+            !is_error(Some("completed"), noisy.clone()),
+            "a stated success outranks output that merely reads like a failure"
+        );
+        assert!(
+            !is_error(None, flagged(false)),
+            "isError alone is enough to state that success"
+        );
+        assert!(
+            is_error(Some("completed"), flagged(true)),
+            "a stated failure outranks a stated success"
+        );
+        assert!(
+            is_error(Some("failed"), flagged(false)),
+            "and does so whichever field states it"
+        );
+        assert!(
+            !is_error(
+                Some("completed"),
+                serde_json::json!({"content":[{"type":"text","text":"fine"}], "isError":false}),
+            ),
+            "quiet output with nothing wrong stays clean"
+        );
+        assert!(
+            completed_mcp_call(&serde_json::json!({
+                "item": {
+                    "type":"McpToolCall", "id":"i", "server":"s", "tool":"t",
+                    "status":"completed", "error":"connection refused", "result": null,
+                }
+            }))
+            .expect("well-formed item")
+            .is_error,
+            "a transport error is stated too, even beside a completed status"
+        );
     }
 
     #[test]
@@ -8228,6 +12573,75 @@ mod tests {
     }
 
     #[test]
+    fn a_deferred_script_completed_mcp_item_replaces_its_wrapper_card() {
+        let script = concat!(
+            "const task=\"t1\";",
+            "const r=await tools.mcp__codeg_mcp__get_delegation_status({task_ids:[task],wait_ms:60000});",
+            "text(JSON.stringify(r));"
+        );
+        let mut lines = code_mode_rollout(
+            script,
+            serde_json::json!("Script running with cell ID 34\nWall time 11.0 seconds\nOutput:\n"),
+        );
+        lines.push(rollout_line(
+            "2026-07-20T08:40:03Z",
+            "event_msg",
+            serde_json::json!({
+                "type": "item_completed",
+                "item": {
+                    "type": "McpToolCall",
+                    "id": "mcp-deferred-status",
+                    "server": "codeg-mcp",
+                    "tool": "get_delegation_status",
+                    "arguments": {"task_ids":["t1"], "wait_ms":60000},
+                    "result": {
+                        "content": [{"type":"text", "text":"status: running"}],
+                        "isError": false,
+                    },
+                },
+            }),
+        ));
+        lines.push(rollout_line(
+            "2026-07-20T08:40:04Z",
+            "response_item",
+            serde_json::json!({
+                "type": "function_call",
+                "name": "wait",
+                "call_id": "wait-deferred",
+                "arguments": "{\"cell_id\":\"34\",\"yield_time_ms\":60000}",
+            }),
+        ));
+        lines.push(rollout_line(
+            "2026-07-20T08:41:04Z",
+            "response_item",
+            serde_json::json!({
+                "type": "function_call_output",
+                "call_id": "wait-deferred",
+                "output": "Script completed\nWall time 60.0 seconds\nOutput:\n{}",
+            }),
+        ));
+
+        let detail = parse_lines(&lines, "deferred-semantic-mcp");
+        assert_eq!(
+            tool_uses(&detail),
+            vec![ (
+                "mcp-deferred-status".into(),
+                "mcp__codeg_mcp__get_delegation_status".into(),
+                Some(r#"{"task_ids":["t1"],"wait_ms":60000}"#.into()),
+            ) ],
+            "the completed semantic item replaces the parked script card"
+        );
+        assert_eq!(
+            tool_results(&detail),
+            vec![(
+                "mcp-deferred-status".into(),
+                Some("status: running".into()),
+                false,
+            )]
+        );
+    }
+
+    #[test]
     fn a_deferred_scripts_result_lands_on_its_own_card() {
         let lines = deferred_script_rollout(serde_json::json!([
             {"type": "input_text", "text": "Script completed\nWall time 44.5 seconds\nOutput:\n"},
@@ -8645,5 +13059,706 @@ mod tests {
         );
         // No table label to show, so the chip has nothing to say.
         assert!(tool_metas(&detail).iter().all(|m| m.get("label").is_none()));
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // `response_item.message` promotion — issue #452
+    //
+    // A rollout written by a producer that never emits the `event_msg` channel
+    // (an embedder driving codex under its own `CODEX_HOME`) used to render as
+    // a bare "Used N tools": the tool calls parse from `response_item`, every
+    // user and assistant bubble did not. These tests pin BOTH directions — the
+    // recovery, and the silence on every rollout that already has the canonical
+    // channel.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// `(role, first text block)` per turn, the shape most of these assertions
+    /// want. Tool-only turns come back with `None`. The role is stringified
+    /// because `TurnRole` is not `PartialEq` and a production model should not
+    /// grow a derive to serve a test.
+    fn turn_texts(detail: &crate::models::ConversationDetail) -> Vec<(&'static str, Option<String>)> {
+        detail
+            .turns
+            .iter()
+            .map(|turn| {
+                let role = match turn.role {
+                    TurnRole::User => "user",
+                    TurnRole::Assistant => "assistant",
+                    TurnRole::System => "system",
+                };
+                (
+                    role,
+                    turn.blocks.iter().find_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    }),
+                )
+            })
+            .collect()
+    }
+
+    fn summary_of(label: &str, content: &str) -> crate::models::ConversationSummary {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time ok")
+            .as_nanos();
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-{label}-{nanos}.jsonl"));
+        fs::write(&path, content).expect("write test jsonl");
+        let summary = CodexParser::new()
+            .parse_jsonl_summary(&path)
+            .expect("parse summary ok")
+            .expect("summary present");
+        let _ = fs::remove_file(path);
+        summary
+    }
+
+    /// The reported rollout shape: `session_meta` + `turn_context` + nothing but
+    /// `response_item`s. Every text bubble here is the ONLY copy in the file.
+    const ORCA_ONLY: &str = concat!(
+        "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"orca-1\",\"cwd\":\"/tmp/demo\"}}\n",
+        "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.1-codex\"}}\n",
+        "{\"timestamp\":\"2026-03-01T10:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"developer\",\"content\":[{\"type\":\"input_text\",\"text\":\"<permissions instructions>be careful</permissions instructions>\"}]}}\n",
+        "{\"timestamp\":\"2026-03-01T10:00:03Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"<environment_context>\\n  <cwd>/tmp/demo</cwd>\\n</environment_context>\"}]}}\n",
+        "{\"timestamp\":\"2026-03-01T10:00:04Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"summarize the build script\"}]}}\n",
+        "{\"timestamp\":\"2026-03-01T10:00:05Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"shell\",\"call_id\":\"c1\",\"arguments\":\"{\\\"command\\\":[\\\"cat\\\",\\\"build.sh\\\"]}\"}}\n",
+        "{\"timestamp\":\"2026-03-01T10:00:06Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"c1\",\"output\":\"#!/bin/sh\\nmake\"}}\n",
+        "{\"timestamp\":\"2026-03-01T10:00:07Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"commentary\",\"content\":[{\"type\":\"output_text\",\"text\":\"Reading it now.\"}]}}\n",
+        "{\"timestamp\":\"2026-03-01T10:00:08Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"final_answer\",\"content\":[{\"type\":\"output_text\",\"text\":\"It just runs make.\"}]}}\n"
+    );
+
+    #[test]
+    fn event_msg_less_rollout_recovers_user_and_assistant_text() {
+        let detail = parse_rollout("orca-only", ORCA_ONLY, "orca-1");
+
+        assert_eq!(
+            turn_texts(&detail),
+            vec![
+                ("user", Some("summarize the build script".into())),
+                // The tool call and its output fold into one assistant turn,
+                // which is what used to be the WHOLE transcript.
+                ("assistant", None),
+                ("assistant", Some("Reading it now.".into())),
+                ("assistant", Some("It just runs make.".into())),
+            ],
+            "both `phase` values render as assistant text, and the tool turn \
+             keeps its position between the prompt and the reply"
+        );
+        assert_eq!(
+            detail.summary.title.as_deref(),
+            Some("summarize the build script"),
+            "the promoted prompt supplies the title the event channel would have"
+        );
+    }
+
+    #[test]
+    fn event_msg_less_rollout_summary_matches_the_detail() {
+        // Summary/detail parity is what keeps the sidebar entry, the import
+        // picker row and the opened conversation telling the same story.
+        let summary = summary_of("orca-only-sum", ORCA_ONLY);
+
+        assert_eq!(summary.title.as_deref(), Some("summarize the build script"));
+        assert_eq!(
+            summary.message_count, 3,
+            "one prompt + two assistant messages; the envelopes and the \
+             developer record are not turns"
+        );
+    }
+
+    #[test]
+    fn canonical_channel_suppresses_the_response_item_twin() {
+        // THE anti-duplication test. A normal codex rollout records every
+        // message twice — `event_msg` first for the assistant, `response_item`
+        // first for the user — and only one copy may render.
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"twin-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:02Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.1-codex\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:03Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"ping\"}]}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:04Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"ping\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:05Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"pong\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:06Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"pong\"}]}}\n"
+        );
+        let detail = parse_rollout("twin", content, "twin-1");
+
+        assert_eq!(
+            turn_texts(&detail),
+            vec![
+                ("user", Some("ping".into())),
+                ("assistant", Some("pong".into())),
+            ]
+        );
+        assert_eq!(summary_of("twin-sum", content).message_count, 2);
+    }
+
+    #[test]
+    fn a_resumed_mixed_rollout_keeps_both_halves_exactly_once() {
+        // The reported workflow: the session is created elsewhere, then resumed
+        // in codeg — which appends NATIVE `event_msg` turns to the SAME file.
+        // A whole-file gate would drop the imported prefix the moment that
+        // happened; the per-segment gate keeps it.
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"mixed-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"imported prompt\"}]}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"imported reply\"}]}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:10Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:11Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"native prompt\"}]}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:12Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"native prompt\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:13Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"native reply\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:14Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"native reply\"}]}}\n"
+        );
+        let detail = parse_rollout("mixed", content, "mixed-1");
+
+        assert_eq!(
+            turn_texts(&detail),
+            vec![
+                ("user", Some("imported prompt".into())),
+                ("assistant", Some("imported reply".into())),
+                ("user", Some("native prompt".into())),
+                ("assistant", Some("native reply".into())),
+            ],
+            "the imported prefix survives and the native suffix is not doubled"
+        );
+        assert_eq!(detail.summary.title.as_deref(), Some("imported prompt"));
+        assert_eq!(summary_of("mixed-sum", content).message_count, 4);
+    }
+
+    #[test]
+    fn compaction_summary_is_denied_by_adjacency_not_by_segment() {
+        // codex writes the pre-compaction handoff as an assistant message
+        // immediately before the `compacted` record (a `token_count` may sit
+        // between). Only THAT message is machine text — a segment-wide rule
+        // would reject every assistant message in a marker-less imported prefix
+        // and re-break #452 for any compacted session.
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"comp-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"before compaction\"}]}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"real reply before\"}]}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:03Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Handoff summary:\\n\\nCurrent state: …\"}]}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:04Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{}}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:05Z\",\"type\":\"compacted\",\"payload\":{}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:06Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"real reply after\"}]}}\n"
+        );
+        let detail = parse_rollout("compaction", content, "comp-1");
+
+        assert_eq!(
+            turn_texts(&detail),
+            vec![
+                ("user", Some("before compaction".into())),
+                ("assistant", Some("real reply before".into())),
+                ("assistant", Some("real reply after".into())),
+            ],
+            "only the handoff summary is suppressed"
+        );
+    }
+
+    #[test]
+    fn machine_authored_records_never_become_turns() {
+        // Every class below is real: counted across the local rollout corpus,
+        // or (for `developer`) present in every single session.
+        let mut lines = String::from(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"deny-1\",\"cwd\":\"/tmp/demo\"}}\n",
+        );
+        for (index, text) in [
+            "# AGENTS.md instructions for /tmp/demo\n\n<INSTRUCTIONS>\nhi\n</INSTRUCTIONS>",
+            "<environment_context>\n  <cwd>/tmp/demo</cwd>\n</environment_context>",
+            "<codex_internal_context source=\"goal\">Continue working</codex_internal_context>",
+            "<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>",
+            "<subagent_notification>agent 3 finished</subagent_notification>",
+            "<skill name=\"pptx\">use this</skill>",
+            "Warning: apply_patch was requested via exec_command. Use the apply_patch tool instead.",
+        ]
+        .iter()
+        .enumerate()
+        {
+            lines.push_str(&format!(
+                "{{\"timestamp\":\"2026-03-01T10:01:{:02}Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":{}}}]}}}}\n",
+                index,
+                serde_json::to_string(text).expect("encode")
+            ));
+        }
+        // NB: `<proposed_plan>` is NOT in this list. It is the agent's answer,
+        // not machinery, and renders through its own arm — see
+        // `plan_document_renders_from_either_of_its_two_copies`.
+        //
+        // …and a real message, so the test can tell "filtered everything" from
+        // "parsed nothing".
+        lines.push_str("{\"timestamp\":\"2026-03-01T10:03:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"a real answer\"}]}}\n");
+
+        let detail = parse_rollout("deny", &lines, "deny-1");
+        assert_eq!(
+            turn_texts(&detail),
+            vec![("assistant", Some("a real answer".into()))]
+        );
+        assert_eq!(summary_of("deny-sum", &lines).message_count, 1);
+        assert_eq!(detail.summary.title, None, "no envelope may become a title");
+    }
+
+    /// One Plan-mode turn, in the two shapes the corpus actually contains:
+    /// older codex writes only the `<proposed_plan>` assistant record, newer
+    /// codex announces `item_completed { item.type = "Plan" }` first and then
+    /// writes the same plan again as that record.
+    fn plan_turn(announce: bool, assistant_record: Option<&str>) -> String {
+        let mut lines = String::from(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"plan-1\",\"cwd\":\"/tmp/demo\"}}\n",
+        );
+        lines.push_str("{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5-codex\",\"collaboration_mode\":{\"mode\":\"plan\"}}}\n");
+        lines.push_str("{\"timestamp\":\"2026-03-01T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"列个计划\"}}\n");
+        if announce {
+            lines.push_str("{\"timestamp\":\"2026-03-01T10:00:03Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"Plan\",\"id\":\"turn-plan\",\"text\":\"# Plan\\n\\n- step one\"}}}\n");
+        }
+        if let Some(text) = assistant_record {
+            lines.push_str(&format!(
+                "{{\"timestamp\":\"2026-03-01T10:00:04Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":{}}}]}}}}\n",
+                serde_json::to_string(text).expect("encode")
+            ));
+        }
+        lines
+    }
+
+    #[test]
+    fn plan_document_renders_from_either_of_its_two_copies() {
+        // The regression: a Plan turn publishes its answer as `item_completed`
+        // INSTEAD of `agent_message`, so a parser that reads only the event
+        // channel and denies the `<proposed_plan>` record renders the turn as
+        // nothing but its reasoning — the plan card vanishes on reload.
+        let tagged = "<proposed_plan>\n# Plan\n\n- step one\n</proposed_plan>";
+
+        for (label, announce, record) in [
+            ("announce-only", true, None),
+            ("record-only", false, Some(tagged)),
+            ("both", true, Some(tagged)),
+        ] {
+            let content = plan_turn(announce, record);
+            let detail = parse_rollout(label, &content, "plan-1");
+            assert_eq!(
+                turn_texts(&detail),
+                vec![
+                    ("user", Some("列个计划".into())),
+                    ("assistant", Some(tagged.into())),
+                ],
+                "{label}: the plan renders exactly once, in codex's own tags"
+            );
+            assert_eq!(
+                summary_of(&format!("{label}-sum"), &content).message_count,
+                2,
+                "{label}: and counts exactly once for the sidebar"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_record_keeps_the_prose_codex_writes_around_the_block() {
+        // The `item_completed` announcement carries the plan body ALONE, while
+        // the assistant record carries the same body plus any follow-up prose
+        // ("如果你希望调整…" is codex's habit). Rendering the announcement and
+        // dropping the record would silently lose that prose, so the record
+        // takes the announcement's message over rather than adding a second.
+        let record = "<proposed_plan>\n# Plan\n\n- step one\n</proposed_plan>\n\n如果你希望调整，告诉我。";
+        let content = plan_turn(true, Some(record));
+        let detail = parse_rollout("plan-prose", &content, "plan-1");
+
+        assert_eq!(
+            turn_texts(&detail),
+            vec![
+                ("user", Some("列个计划".into())),
+                ("assistant", Some(record.into())),
+            ],
+            "one plan turn, carrying the trailing prose"
+        );
+    }
+
+    /// A full approve-the-plan sequence: the plan turn, codex's flip out of
+    /// Plan mode, and the follow-up prompt it writes to itself. `repeat_context`
+    /// re-emits the post-flip `turn_context`, which newer codex does mid-turn.
+    fn approved_plan_rollout_with(
+        prompt: &str,
+        flip_out_of_plan: bool,
+        repeat_context: bool,
+    ) -> String {
+        let mut lines = plan_turn(
+            true,
+            Some("<proposed_plan>\n# Plan\n\n- step one\n</proposed_plan>"),
+        );
+        let mode = if flip_out_of_plan { "default" } else { "plan" };
+        lines.push_str(&format!(
+            "{{\"timestamp\":\"2026-03-01T10:00:05Z\",\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-5-codex\",\"collaboration_mode\":{{\"mode\":\"{mode}\"}}}}}}\n"
+        ));
+        if repeat_context {
+            lines.push_str(&format!(
+                "{{\"timestamp\":\"2026-03-01T10:00:05Z\",\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-5-codex\",\"collaboration_mode\":{{\"mode\":\"{mode}\"}}}}}}\n"
+            ));
+        }
+        lines.push_str(&format!(
+            "{{\"timestamp\":\"2026-03-01T10:00:06Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":{}}}}}\n",
+            serde_json::to_string(prompt).expect("encode")
+        ));
+        lines.push_str("{\"timestamp\":\"2026-03-01T10:00:07Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"开始实施。\"}}\n");
+        lines
+    }
+
+    fn approved_plan_rollout(prompt: &str, flip_out_of_plan: bool) -> String {
+        approved_plan_rollout_with(prompt, flip_out_of_plan, false)
+    }
+
+    #[test]
+    fn approving_a_plan_settles_the_card_instead_of_faking_a_user_turn() {
+        // codex writes its own post-approval prompt as an ordinary
+        // `user_message`, structurally identical to typed input. Rendering it
+        // splits ONE plan interaction into two, which is not what the live
+        // stream shows — there the approval and the implementation share a
+        // single `session/prompt`.
+        let content = approved_plan_rollout(CODEX_PLAN_APPROVAL_PROMPT, true);
+        let detail = parse_rollout("plan-approved", &content, "plan-1");
+
+        assert_eq!(
+            turn_texts(&detail)
+                .iter()
+                .filter(|(role, _)| *role == "user")
+                .count(),
+            1,
+            "the only user turn is the one the user actually typed"
+        );
+
+        let decision: Vec<(&str, Option<&str>)> = detail
+            .turns
+            .iter()
+            .flat_map(|turn| turn.blocks.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { tool_name, .. } => Some((tool_name.as_str(), None)),
+                ContentBlock::ToolResult { output_preview, .. } => {
+                    Some(("<result>", output_preview.as_deref()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            decision,
+            vec![
+                ("plan_review", None),
+                ("<result>", Some(CODEX_PLAN_APPROVED_OUTPUT)),
+            ],
+            "the decision moves onto a settled plan_review call — the same \
+             shape the live permission gate produces"
+        );
+        assert_eq!(
+            summary_of("plan-approved-sum", &content).message_count,
+            3,
+            "prompt + plan + reply; the synthetic approval is not a message"
+        );
+    }
+
+    #[test]
+    fn a_typed_approval_sentence_is_still_the_users_own_turn() {
+        // The wording alone must never be enough: without the mode flip out of
+        // `plan`, this is someone typing codex's sentence and it keeps its
+        // bubble. (Both halves of the gate are load-bearing — the flip has no
+        // per-record marker, the wording has no context.)
+        let content = approved_plan_rollout(CODEX_PLAN_APPROVAL_PROMPT, false);
+        let detail = parse_rollout("plan-typed", &content, "plan-1");
+
+        assert!(
+            turn_texts(&detail)
+                .iter()
+                .any(|(role, text)| *role == "user"
+                    && text.as_deref() == Some(CODEX_PLAN_APPROVAL_PROMPT)),
+            "no mode flip, so nothing marks this as codex's own prompt"
+        );
+
+        // …and the flip alone is not enough either: a different sentence in the
+        // post-approval turn is a real prompt.
+        let other = approved_plan_rollout("先别做，改一下第二步", true);
+        let detail = parse_rollout("plan-other", &other, "plan-1");
+        assert!(
+            turn_texts(&detail)
+                .iter()
+                .any(|(role, text)| *role == "user"
+                    && text.as_deref() == Some("先别做，改一下第二步")),
+            "the flip only arms the filter; the wording still has to match"
+        );
+
+        // Whitespace variants are somebody typing, not codex: the sentinel is
+        // written with no surrounding whitespace in every corpus occurrence, so
+        // the comparison is verbatim and a padded copy keeps its bubble.
+        for padded in [
+            "Implement the approved plan. ",
+            " Implement the approved plan.",
+            "Implement the approved plan.\n",
+        ] {
+            let content = approved_plan_rollout(padded, true);
+            let detail = parse_rollout("plan-padded", &content, "plan-1");
+            assert!(
+                turn_texts(&detail)
+                    .iter()
+                    .any(|(role, text)| *role == "user" && text.is_some()),
+                "{padded:?} is user-typed text, not codex's own prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_post_flip_turn_context_does_not_disarm_the_filter() {
+        // Newer codex re-emits `turn_context` mid-turn. If the arm were rewritten
+        // on every context instead of only on a transition, a second `default`
+        // context landing between the flip and codex's own prompt would disarm
+        // the filter and put the approval back in the timeline as a user bubble.
+        let content = approved_plan_rollout_with(CODEX_PLAN_APPROVAL_PROMPT, true, true);
+        let detail = parse_rollout("plan-repeat-ctx", &content, "plan-1");
+
+        assert_eq!(
+            turn_texts(&detail)
+                .iter()
+                .filter(|(role, _)| *role == "user")
+                .count(),
+            1,
+            "the repeated context must not resurrect the synthetic prompt"
+        );
+        assert_eq!(
+            summary_of("plan-repeat-ctx-sum", &content).message_count,
+            3,
+            "and the summary must agree"
+        );
+    }
+
+    #[test]
+    fn two_plan_turns_proposing_the_same_body_stay_two_plans() {
+        // The pairing slot belongs to ONE announcement→record pair. Treating it
+        // as "the last plan seen" would make a legacy rollout (no
+        // `item_completed` records) that re-proposes an unchanged plan collapse
+        // into a single plan, and the second turn would render empty — the very
+        // bug this whole change exists to fix.
+        let plan = "<proposed_plan>\n# Plan\n\n- step one\n</proposed_plan>";
+        let record = |ts: &str| {
+            format!(
+                "{{\"timestamp\":\"{ts}\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":{}}}]}}}}\n",
+                serde_json::to_string(plan).expect("encode")
+            )
+        };
+        let mut content = String::from(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"twice-1\",\"cwd\":\"/tmp/demo\"}}\n",
+        );
+        content.push_str("{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"列个计划\"}}\n");
+        content.push_str(&record("2026-03-01T10:00:02Z"));
+        content.push_str("{\"timestamp\":\"2026-03-01T10:00:03Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"再来一遍\"}}\n");
+        content.push_str(&record("2026-03-01T10:00:04Z"));
+
+        let detail = parse_rollout("plan-twice", &content, "twice-1");
+        assert_eq!(
+            turn_texts(&detail),
+            vec![
+                ("user", Some("列个计划".into())),
+                ("assistant", Some(plan.into())),
+                ("user", Some("再来一遍".into())),
+                ("assistant", Some(plan.into())),
+            ],
+            "both plan turns render"
+        );
+        assert_eq!(
+            summary_of("plan-twice-sum", &content).message_count,
+            4,
+            "and both are counted"
+        );
+    }
+
+    #[test]
+    fn a_promoted_user_after_a_goal_leaves_the_opener_intact() {
+        // The `/goal` opener is decided POSITIONALLY. A promoted user that
+        // arrives after the goal is the reply to it, not the prompt that opened
+        // the session, so the synthetic opener must survive.
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"gp-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":{\"objective\":\"Ship the page\",\"status\":\"active\"}}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:02Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.1-codex\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:03Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"确认\"}]}}\n"
+        );
+        let detail = parse_rollout("goal-after", content, "gp-1");
+
+        let users: Vec<Option<String>> = turn_texts(&detail)
+            .into_iter()
+            .filter(|(role, _)| *role == "user")
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(
+            users,
+            vec![Some("/goal Ship the page".into()), Some("确认".into())]
+        );
+        assert_eq!(
+            detail.summary.title.as_deref(),
+            Some("Ship the page"),
+            "the goal opened the session, so it keeps the title"
+        );
+        assert_eq!(summary_of("goal-after-sum", content).message_count, 2);
+    }
+
+    #[test]
+    fn a_goal_covers_the_user_channel_for_its_own_turn() {
+        // A typed `/goal <objective>` IS user input; newer codex records it as
+        // `thread_goal_updated` INSTEAD of a `user_message` and both parsers
+        // synthesize the opening turn from it. So the `response_item` twin of
+        // that same prompt must not ALSO be promoted — in either order — or the
+        // opener renders twice. (The goal-then-user order is pinned separately
+        // by `goal_with_text_only_response_item_titles_from_objective_in_both_paths`.)
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"gb-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"/goal Ship the page\"}]}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":{\"objective\":\"Ship the page\",\"status\":\"active\"}}}\n"
+        );
+        let detail = parse_rollout("goal-before", content, "gb-1");
+
+        let users: Vec<Option<String>> = turn_texts(&detail)
+            .into_iter()
+            .filter(|(role, _)| *role == "user")
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(users, vec![Some("/goal Ship the page".into())]);
+        assert_eq!(detail.summary.title.as_deref(), Some("Ship the page"));
+        assert_eq!(summary_of("goal-before-sum", content).message_count, 1);
+    }
+
+    #[test]
+    fn a_promoted_user_in_an_earlier_turn_cancels_the_opener_and_wins_the_title() {
+        // The mixed-file shape: an imported prefix with no event channel, then a
+        // native turn that opens a `/goal`. The goal did NOT open the session —
+        // a real prompt precedes it — so no synthetic opener is added and the
+        // earlier prompt outranks the objective for the title. This is what the
+        // ordinal comparison exists for: "is there a user anywhere" would answer
+        // the same for the reply-to-a-goal shape, which must keep its opener.
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"gb2-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"build me a page\"}]}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"on it\"}]}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:10Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:11Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":{\"objective\":\"Ship the page\",\"status\":\"active\"}}}\n"
+        );
+        let detail = parse_rollout("goal-later-turn", content, "gb2-1");
+
+        assert_eq!(
+            turn_texts(&detail),
+            vec![
+                ("user", Some("build me a page".into())),
+                ("assistant", Some("on it".into())),
+                // The goal card itself — no synthetic `/goal …` user turn.
+                ("assistant", None),
+            ]
+        );
+        assert_eq!(detail.summary.title.as_deref(), Some("build me a page"));
+
+        let summary = summary_of("goal-later-turn-sum", content);
+        assert_eq!(summary.title.as_deref(), Some("build me a page"));
+        assert_eq!(summary.message_count, 2, "no synthetic opener is counted");
+    }
+
+    #[test]
+    fn a_native_thread_name_outranks_a_promoted_prompt() {
+        // codex's own thread name is the strongest title source and its arm
+        // assigns unconditionally, so it needs a flag rather than an ordinal.
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"tn-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"the raw prompt\"}]}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_name_updated\",\"thread_name\":\"Curated name\"}}\n"
+        );
+        let detail = parse_rollout("thread-name", content, "tn-1");
+
+        assert_eq!(detail.summary.title.as_deref(), Some("Curated name"));
+        assert_eq!(
+            summary_of("thread-name-sum", content).title.as_deref(),
+            Some("Curated name")
+        );
+    }
+
+    #[test]
+    fn consecutive_promotions_land_in_place_and_keep_their_order() {
+        // Several candidates share one insertion point when nothing was pushed
+        // between them. The splice walks insertion points in DESCENDING order,
+        // so a same-index group has to go back as a GROUP — one at a time would
+        // reverse it.
+        //
+        // The tool calls on either side are what give this teeth: they make the
+        // insertion point interior, so appending the promotions at the end and
+        // splicing them one by one BOTH produce a different transcript.
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"ord-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"shell\",\"call_id\":\"before\",\"arguments\":\"{\\\"command\\\":[\\\"echo\\\",\\\"before\\\"]}\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"before\",\"output\":\"before\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:03Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\"}]}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:04Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"second\"}]}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:05Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"third\"}]}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:06Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"shell\",\"call_id\":\"after\",\"arguments\":\"{\\\"command\\\":[\\\"echo\\\",\\\"after\\\"]}\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:07Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"after\",\"output\":\"after\"}}\n"
+        );
+        let detail = parse_rollout("order", content, "ord-1");
+
+        assert_eq!(
+            turn_texts(&detail),
+            vec![
+                ("assistant", None),
+                ("assistant", Some("first".into())),
+                ("assistant", Some("second".into())),
+                ("assistant", Some("third".into())),
+                ("assistant", None),
+            ],
+            "the group lands between the two tool turns, in source order"
+        );
+    }
+
+    #[test]
+    fn an_image_bearing_user_still_takes_the_dedicated_path() {
+        // Image users are pushed in-loop, unconditionally, because the canonical
+        // channel never carries the image. The promotion path must not emit a
+        // second, text-only copy of the same record.
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"img-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"what is this\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,QUJD\"}]}}\n"
+        );
+        let detail = parse_rollout("image", content, "img-1");
+
+        assert_eq!(detail.turns.len(), 1);
+        assert!(matches!(detail.turns[0].role, TurnRole::User));
+        assert!(
+            detail.turns[0]
+                .blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image { .. })),
+            "the image survives"
+        );
+        assert_eq!(
+            turn_texts(&detail)[0].1.as_deref(),
+            Some("what is this"),
+            "and its text is not duplicated into a second turn"
+        );
+    }
+
+    #[test]
+    fn promoted_assistant_text_keeps_its_whitespace() {
+        // The `event_msg.agent_message` arm stores its text verbatim, while the
+        // user arms run `strip_blocked_resource_mentions` (which collapses runs
+        // of spaces — right for a typed prompt, ruinous for indented markdown).
+        // Promotion has to match each of them, not pick one.
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"ws-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"```sh\\n    indented\\n```\"}]}}\n"
+        );
+        let detail = parse_rollout("whitespace", content, "ws-1");
+
+        assert_eq!(
+            turn_texts(&detail)[0].1.as_deref(),
+            Some("```sh\n    indented\n```")
+        );
+    }
+
+    #[test]
+    fn an_unknown_content_tag_is_still_read_as_text() {
+        // codex's item vocabulary keeps growing upstream, and this path only
+        // runs where guessing wrong costs the user the whole transcript — so the
+        // extractor keys on the presence of `text`, not on the tag.
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"tag-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"some_future_tag\",\"text\":\"still readable\"},{\"type\":\"opaque\",\"blob\":1}]}}\n"
+        );
+        let detail = parse_rollout("future-tag", content, "tag-1");
+
+        assert_eq!(
+            turn_texts(&detail),
+            vec![("assistant", Some("still readable".into()))]
+        );
     }
 }

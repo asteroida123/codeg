@@ -48,6 +48,11 @@ pub struct WorkTaskInfo {
     pub additions: Option<i32>,
     pub deletions: Option<i32>,
     pub merge_commit: Option<String>,
+    /// How a `done` task ended: 'merged' | 'delivered_pr' |
+    /// 'accepted_without_merge'. `None` on live tasks and on rows that
+    /// finished before the column existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_kind: Option<String>,
     /// `WorkTaskPreflight` snapshot (acceptance red/green light), if a
     /// preflight command ran for this review.
     pub preflight: Option<serde_json::Value>,
@@ -62,10 +67,27 @@ pub struct WorkTaskInfo {
     /// Planned start of a to-do task (`None` = no plan). Cleared the moment the
     /// task is claimed, by the scheduler or by hand.
     pub scheduled_at: Option<DateTime<Utc>>,
-    /// Latest `agent_progress` milestone (filled by `list` for live tasks only
-    /// — the card's realtime progress line).
+    /// Forge provenance ('forge_issue' | 'forge_pr'); `None` = not forge-sourced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<String>,
+    /// Canonical source key (`forge::source_key` output), for board deep-links.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_key: Option<String>,
+    /// Source snapshot (URL, title, account id …), parsed from the row's JSON.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_meta: Option<serde_json::Value>,
+    /// Latest `agent_progress` milestone OF THIS GENERATION (filled by `list`
+    /// for live tasks only — the card's realtime progress line). Scoped by
+    /// `run_seq`: a retry, a follow-up and a merge each start a new one, and
+    /// the previous round's last milestone is not this round's news.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_progress: Option<String>,
+    /// This generation is parked on its pre-prompt context compaction — the
+    /// agent is working, but on shrinking the session rather than on the task.
+    /// Filled by `list` alongside `latest_progress`, and the only thing that
+    /// explains a card sitting in `preparing`/`merging` for minutes.
+    #[serde(default)]
+    pub compacting: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
@@ -86,11 +108,29 @@ pub struct WorkTaskEventInfo {
 
 /// Create/update payload — the editor loads the whole task and saves it back
 /// wholesale (title + captured composer config).
+///
+/// Deliberately has NO source field: forge provenance can only be minted by
+/// the forge trigger command (which validates repo ownership and builds the
+/// untrusted-data envelope server-side). A client-supplied draft must never be
+/// able to forge it — the service takes provenance as a separate internal
+/// parameter instead.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkTaskDraft {
     pub folder_id: i32,
     pub title: String,
     pub config: serde_json::Value,
+}
+
+/// Internal-only forge provenance handed to `work_task_service::create` by the
+/// trigger command. Not a wire type: it never appears in any request DTO.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkTaskSource {
+    /// 'forge_issue' | 'forge_pr'
+    pub kind: String,
+    /// Canonical key from `forge::source_key` — recomputed server-side.
+    pub key: String,
+    /// `ForgeSourceMeta` as JSON (URL, title, account id, PR head/base …).
+    pub meta: serde_json::Value,
 }
 
 /// Wire DTO for a saved task template: a display name plus the title seed and
@@ -134,7 +174,18 @@ pub struct WorkTaskConfig {
     pub config_values: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub label_snapshot: Option<serde_json::Value>,
+    /// What the task's original work order produces. `Some("report")` marks a
+    /// task whose first turn delivers findings in the reply rather than code
+    /// changes (forge "plan first" / "review only" scenarios);
+    /// the engine swaps the worktree guard's commit licence to match. `None`
+    /// or an unrecognized value reads as a normal change-producing task — a
+    /// config written by a newer build must still launch here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliverable: Option<String>,
 }
+
+/// The one recognized [`WorkTaskConfig::deliverable`] value.
+pub const DELIVERABLE_REPORT: &str = "report";
 
 /// Per-folder defaults stored in `work_task_settings.config`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +239,21 @@ pub struct WorkTaskFolderSettings {
     /// starts (deps install, env seeding). Not re-run on reused worktrees.
     #[serde(default)]
     pub init_command: Option<String>,
+    /// Context-window occupancy (percent, 0–100) at or above which a launch
+    /// that RESUMES the task's session compacts before it prompts: the engine
+    /// sends [`Self::compact_command`], waits for that turn to finish, and only
+    /// then sends the round's own message. `0` (the default) disables the whole
+    /// check — nothing is measured and no extra turn is ever sent.
+    ///
+    /// Only resumed launches (retry / follow-up / merge) are eligible: a fresh
+    /// session starts empty, so there is nothing to compact.
+    #[serde(default)]
+    pub auto_compact_percent: i32,
+    /// The command sent to compact, verbatim (e.g. `/compact`). Blank/`None`
+    /// resolves per agent — see `work_task::compact::resolve_compact_command`
+    /// — which is why this is an override rather than a required setting.
+    #[serde(default)]
+    pub compact_command: Option<String>,
     /// User-authored instructions appended *after* the built-in prompt of a
     /// launch stage — project conventions or personal preferences the standard
     /// wording can't cover. Keys are the stage identifiers the engine already
@@ -214,6 +280,8 @@ impl Default for WorkTaskFolderSettings {
             preflight_command_id: None,
             preflight_command: None,
             init_command: None,
+            auto_compact_percent: 0,
+            compact_command: None,
             stage_prompts: Default::default(),
         }
     }
@@ -290,18 +358,51 @@ fn default_true() -> bool {
     true
 }
 
-/// The merge intent persisted (as JSON in `work_task.merge_state`) in the same
-/// transaction as the review→merging CAS. The merge itself is performed by the
-/// agent in its session; the engine settles from git truth against
-/// `pre_merge_head` (base advanced + work content contained), never from the
-/// agent's word.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// What a `merging` row is actually doing. The status is shared because both
+/// operations are "in flight, not cancelable, settles by itself"; everything
+/// past that differs, so recovery must read this before it touches any
+/// operation-specific field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkTaskMergeOp {
+    /// Land on the base branch, driven by the agent in its session. The
+    /// historical (and still default) meaning of `merging`, which is why
+    /// `#[default]` sits here: every merge state written before this field
+    /// existed is a land.
+    #[default]
+    Land,
+    /// Push the work branch to the source forge and open/adopt a pull request.
+    /// Executed deterministically by the engine — no agent, no session.
+    DeliverPr,
+}
+
+/// The in-flight intent persisted (as JSON in `work_task.merge_state`) in the
+/// same transaction as the review→merging CAS.
+///
+/// For `op = Land` the merge is performed by the agent in its session and the
+/// engine settles from git truth against `pre_merge_head` (base advanced + work
+/// content contained), never from the agent's word.
+///
+/// For `op = DeliverPr` the engine does the work itself and settles from the
+/// forge's answer, anchored on `expected_head`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkTaskMergeState {
-    /// Project-folder HEAD right before the merge generation was dispatched.
+    /// Which operation is in flight. Absent in every row written before
+    /// delivery existed — those are all lands, which is what the default says.
+    #[serde(default)]
+    pub op: WorkTaskMergeOp,
+    /// Land only: project-folder HEAD right before the merge generation was
+    /// dispatched. Empty on a delivery, which never touches the base branch —
+    /// and an empty value can never be mistaken for a real HEAD, so a
+    /// misrouted delivery reads as "did not land" and bounces to review.
+    #[serde(default)]
     pub pre_merge_head: String,
-    /// The commit message the agent is told to use ("" when auto-generated).
+    /// Land only: the commit message the agent is told to use ("" when
+    /// auto-generated).
+    #[serde(default)]
     pub message: String,
-    /// "squash" | "merge"
+    /// Land only: "squash" | "merge"
+    #[serde(default)]
     pub strategy: String,
     /// Whether the user asked to delete the worktree after landing — persisted
     /// so crash recovery can honor the choice when it back-fills `done`.
@@ -310,6 +411,26 @@ pub struct WorkTaskMergeState {
     /// The agent writes the commit message itself (`message` is empty then).
     #[serde(default)]
     pub auto_message: bool,
+    /// Land only: free-form instructions the user typed for THIS landing (how
+    /// to resolve conflicts, what else to touch on the way). Persisted with the
+    /// rest of the dispatch so a merge generation relaunched from this row is
+    /// told the same thing the first one was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// Delivery only: the branch name pushed to the source repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_branch: Option<String>,
+    /// Delivery only: the work-branch commit OID recorded BEFORE the push —
+    /// the anchor crash recovery matches a pull request against. Without it,
+    /// recovery could adopt a same-named branch's unrelated PR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_head: Option<String>,
+    /// Delivery only: the title the user gave the pull request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_title: Option<String>,
+    /// Delivery only: open the pull request as a draft.
+    #[serde(default)]
+    pub draft: bool,
 }
 
 /// A merge the user asked for while the folder's one merge slot was busy,
@@ -324,6 +445,11 @@ pub struct WorkTaskQueuedMerge {
     pub message: Option<String>,
     #[serde(default)]
     pub delete_worktree: bool,
+    /// Extra instructions for the merge agent, kept with the parked intent so a
+    /// merge that waited its turn lands under the same directions the user gave
+    /// when they queued it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
     /// When the task took its place in line — the pump's ordering key, kept
     /// across a re-queue so changing the options doesn't jump the line.
     pub queued_at: DateTime<Utc>,
@@ -368,8 +494,13 @@ mod tests {
             "max_concurrent": 3,
             "merge_strategy": "merge",
             "delete_worktree_default": false,
-            "init_command": "pnpm install"
+            "init_command": "pnpm install",
+            "forge_writeback": true
         }"#;
+        // `forge_writeback` above is a RETIRED key: the write-back choice moved
+        // onto each task's own source metadata (the trigger dialog asks per work
+        // item). A folder configured while it existed must still decode, and the
+        // stale value must not resurrect itself anywhere.
         let settings: WorkTaskFolderSettings =
             serde_json::from_str(legacy).expect("legacy settings decode");
         assert!(settings.stage_prompts.is_empty());

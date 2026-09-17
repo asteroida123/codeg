@@ -136,6 +136,7 @@ import {
   OpenCodeConnectDialog,
   OpenCodeCustomProviderDialog,
 } from "@/components/settings/opencode-connect-dialog"
+import { OpenCodeBehaviorSection } from "@/components/settings/opencode-behavior-section"
 import { OpenCodePermissionsSection } from "@/components/settings/opencode-permissions-section"
 import { AgentDiagnosticsDialog } from "@/components/settings/agent-diagnostics-dialog"
 import {
@@ -152,14 +153,20 @@ import { toErrorMessage } from "@/lib/app-error"
 import { getInstallErrorHintKey } from "@/lib/agent-install-error"
 import { useAgentInstallStream } from "@/hooks/use-agent-install-stream"
 import { OpencodePluginsModal } from "./opencode-plugins-modal"
+import {
+  ANTIGRAVITY_ENV_KEYS,
+  AntigravityConfigPanel,
+} from "./antigravity-config-panel"
 import { CodeBuddyConfigPanel } from "./codebuddy-config-panel"
 import { CursorConfigPanel } from "./cursor-config-panel"
 import {
   DEEPSEEK_PANEL_ENV_KEYS,
   DeepSeekConfigPanel,
 } from "./deepseek-config-panel"
+import { DeepSeekModelListEditor } from "./deepseek-model-list-editor"
 import { KimiCodeConfigPanel } from "./kimi-code-config-panel"
 import { PiConfigPanel } from "./pi-config-panel"
+import { QoderConfigPanel } from "./qoder-config-panel"
 
 interface AgentCheckState {
   result?: PreflightResult
@@ -191,9 +198,11 @@ interface AgentDraft {
   codexAuthMode: CodexAuthMode
   codexModelProvider: string
   codexProviderOptions: string[]
-  codexReasoningEffort: CodexReasoningEffort
   codexSupportsWebsockets: boolean
   codexSkills: boolean
+  /** `[features].default_mode_request_user_input` — see
+   * {@link CODEX_DEFAULT_MODE_REQUEST_USER_INPUT_KEY}. */
+  codexDefaultModeRequestUserInput: boolean
   codexServiceTierFast: boolean
   /** Sandbox / approval group — the thread defaults codex applies to turns it
    * starts itself (`/goal`, `/review`, `/compact`). Held as plain draft state
@@ -223,7 +232,6 @@ interface AgentDraft {
   claudeCustomModelOption: string
   claudeCustomModelOptionName: string
   claudeCustomModelOptionDescription: string
-  claudeEffortLevel: ClaudeEffortLevel
   // Claude Code hardening toggles (native config `env`). `claudeSendAttributionHeader`
   // → CLAUDE_CODE_ATTRIBUTION_HEADER (on="1"/off="0"), default off (don't send).
   // `claudeDisableNonessentialTraffic` → CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC,
@@ -542,6 +550,56 @@ export function setHostToolsAgentMode(
   })
 }
 
+/**
+ * Per-agent `env_json` key that opts an npx agent into installing the
+ * package's `latest` npm dist-tag instead of the maintainer-reviewed pin.
+ * Same storage as pi's runtime override and the host-tools knob above. The
+ * backend reads it at install/upgrade time only: a launch always runs whatever
+ * is installed, nothing polls npm in the background, and a failed latest
+ * install falls back to the pinned version with a note in the install log.
+ */
+const ADAPTER_CHANNEL_ENV = "CODEG_ADAPTER_CHANNEL"
+const ADAPTER_CHANNEL_LATEST = "latest"
+
+export type AdapterChannel = "pinned" | "latest"
+
+/**
+ * Which adapter channel an env draft selects. Anything other than the exact
+ * (trimmed) `latest` sentinel reads as pinned, matching the Rust reader
+ * (`adapter_channel_is_latest`), which treats the pin as the only default.
+ */
+export function adapterChannelFromEnvText(envText: string): AdapterChannel {
+  return parseEnvText(envText)[ADAPTER_CHANNEL_ENV]?.trim() ===
+    ADAPTER_CHANNEL_LATEST
+    ? "latest"
+    : "pinned"
+}
+
+/** [`adapterChannelFromEnvText`] over the saved env map the backend reports. */
+export function adapterChannelFromEnv(
+  env: Record<string, string>
+): AdapterChannel {
+  return env[ADAPTER_CHANNEL_ENV]?.trim() === ADAPTER_CHANNEL_LATEST
+    ? "latest"
+    : "pinned"
+}
+
+/**
+ * Select the adapter channel in an env draft. Pinned DELETES the key: unlike
+ * the host-tools knob there is no process-env second layer that could make
+ * "absent" mean something else, so absent is unambiguously the pinned default
+ * on both sides, and the raw editor stays free of a key that only restates it.
+ */
+export function setAdapterChannel(
+  envText: string,
+  channel: AdapterChannel
+): string {
+  return patchEnvText(envText, {
+    [ADAPTER_CHANNEL_ENV]:
+      channel === "latest" ? ADAPTER_CHANNEL_LATEST : undefined,
+  })
+}
+
 interface ImportantEnvKeys {
   apiBaseUrl: string[]
   apiKey: string[]
@@ -576,32 +634,6 @@ const CLAUDE_ENV_FLAG_OFF = "0"
 const CLAUDE_SEND_ATTRIBUTION_HEADER_DEFAULT = false
 const CLAUDE_DISABLE_NONESSENTIAL_TRAFFIC_DEFAULT = true
 
-const CLAUDE_EFFORT_LEVEL_CONFIG_KEY = "effortLevel"
-
-type ClaudeEffortLevel = "" | "low" | "medium" | "high" | "xhigh"
-
-const CLAUDE_EFFORT_LEVEL_VALUES: ReadonlyArray<
-  Exclude<ClaudeEffortLevel, "">
-> = ["low", "medium", "high", "xhigh"]
-
-function normalizeClaudeEffortLevel(value: unknown): ClaudeEffortLevel {
-  if (typeof value !== "string") return ""
-  const normalized = value.trim().toLowerCase()
-  // Upstream claude-agent-acp >=0.37 exposes the sentinel string "default";
-  // collapse it to "" so our UI's "默认/Default" placeholder stays
-  // canonical regardless of which side wrote the config.
-  if (normalized === "" || normalized === "default") return ""
-  if (
-    normalized === "low" ||
-    normalized === "medium" ||
-    normalized === "high" ||
-    normalized === "xhigh"
-  ) {
-    return normalized
-  }
-  return ""
-}
-
 const GEMINI_AUTH_MODES = [
   "custom",
   "login_google",
@@ -633,19 +665,74 @@ const OPENCLAW_ENV_KEYS = {
   sessionKey: "OPENCLAW_SESSION_KEY",
 } as const
 
-const CLINE_PROVIDERS = [
+/** Cline provider ids, as the CLI's own registry keys them (`cline auth -p`).
+ *
+ * `openai-compatible` is NOT interchangeable with `openai`: the `auth`
+ * subcommand aliases the latter, but the ACP path does not, so an `openai`
+ * selection reaches `session/new` as an unknown provider with an empty model
+ * list. The backend's `normalize_cline_provider_id` maps the legacy value on
+ * read so an existing config still lands on the right row here. */
+/** Cline's own sign-in providers, labelled as its registry labels them. Their
+ * credential is an OAuth token cline obtains through a device-code flow and
+ * stores itself, so this panel shows the command that starts it rather than a
+ * key field — and the backend neither overwrites those entries nor exports
+ * `CLINE_PROVIDER`/`CLINE_API_KEY` for them (see `cline_provider_is_agent_managed`). */
+const CLINE_SIGNIN_PROVIDERS = [
+  { value: "cline", label: "Cline Usage-Billing" },
+  { value: "cline-pass", label: "ClinePass" },
+  { value: "openai-codex", label: "OpenAI ChatGPT Subscription" },
+] as const
+
+/** Bring-your-own providers this panel can actually configure — every one is
+ * authenticated by a single API key, which is all the three fields below can
+ * express.
+ *
+ * Deliberately a subset of cline's ~50-provider registry. AWS Bedrock and GCP
+ * Vertex used to be listed and never worked: cline authenticates them with
+ * `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_REGION` and
+ * `GOOGLE_VERTEX_PROJECT`/`GOOGLE_VERTEX_LOCATION`/`GOOGLE_APPLICATION_CREDENTIALS`
+ * respectively, none of which a lone `apiKey` string can carry. They are
+ * reachable through `cline auth bedrock`, and an entry made that way is read
+ * back and preserved here rather than clobbered.
+ *
+ * `openai-compatible` is NOT interchangeable with `openai`: the `auth`
+ * subcommand aliases the latter, but the ACP path does not, so an `openai`
+ * selection reaches `session/new` as an unknown provider with an empty model
+ * list. The backend's `normalize_cline_provider_id` maps the legacy value on
+ * read so an existing config still lands on the right row here. */
+const CLINE_BYO_PROVIDERS = [
   { value: "anthropic", label: "Anthropic" },
   { value: "openai-native", label: "OpenAI" },
-  { value: "openai", label: "OpenAI Compatible" },
+  { value: "openai-compatible", label: "OpenAI Compatible" },
   { value: "openrouter", label: "OpenRouter" },
   { value: "gemini", label: "Gemini" },
   { value: "deepseek", label: "DeepSeek" },
-  { value: "bedrock", label: "AWS Bedrock" },
-  { value: "vertex", label: "GCP Vertex" },
   { value: "ollama", label: "Ollama" },
+  { value: "lmstudio", label: "LM Studio" },
 ] as const
 
-type ClineProvider = (typeof CLINE_PROVIDERS)[number]["value"]
+type ClineProvider =
+  | (typeof CLINE_SIGNIN_PROVIDERS)[number]["value"]
+  | (typeof CLINE_BYO_PROVIDERS)[number]["value"]
+  // A provider configured outside codeg (`cline auth bedrock`, a registry id
+  // this list does not carry) still has to select a row, or saving from this
+  // panel would silently retarget the user's store at whatever the dropdown
+  // fell back to.
+  | (string & {})
+
+/** Whether cline owns this provider's credential (OAuth), rather than codeg.
+ *  Mirrors the backend `cline_provider_is_agent_managed`. */
+function isClineSignInProvider(provider: string): boolean {
+  return CLINE_SIGNIN_PROVIDERS.some((p) => p.value === provider)
+}
+
+/** The terminal command that starts (or repairs) a sign-in. cline drives a
+ *  device-code flow: it prints a code and an `authkit.cline.bot/device` URL and
+ *  waits for the browser half, which is why this is a command to run rather
+ *  than a button to press. */
+function clineAuthCommand(provider: string): string {
+  return `cline auth ${provider}`
+}
 
 type ClaudeModelKey = keyof typeof CLAUDE_MODEL_ENV_KEYS
 type ImportantConfigKey = "apiBaseUrl" | "apiKey" | "model" | ClaudeModelKey
@@ -949,7 +1036,6 @@ function extractImportantConfigValues(
   claudeCustomModelOption: string
   claudeCustomModelOptionName: string
   claudeCustomModelOptionDescription: string
-  claudeEffortLevel: ClaudeEffortLevel
   claudeSendAttributionHeader: boolean
   claudeDisableNonessentialTraffic: boolean
   configError: string | null
@@ -995,11 +1081,6 @@ function extractImportantConfigValues(
     CLAUDE_MODEL_ENV_KEYS.claudeCustomModelOptionDescription,
   ])
 
-  const claudeEffortLevel: ClaudeEffortLevel =
-    agentType === "claude_code"
-      ? normalizeClaudeEffortLevel(config[CLAUDE_EFFORT_LEVEL_CONFIG_KEY])
-      : ""
-
   // Present in env → on iff value is "1"; absent → the toggle's default.
   const attributionRaw = findEnvValue(mergedEnv, [
     CLAUDE_ATTRIBUTION_HEADER_ENV_KEY,
@@ -1039,7 +1120,6 @@ function extractImportantConfigValues(
       agentType === "claude_code" ? claudeCustomModelOptionName : "",
     claudeCustomModelOptionDescription:
       agentType === "claude_code" ? claudeCustomModelOptionDescription : "",
-    claudeEffortLevel,
     claudeSendAttributionHeader,
     claudeDisableNonessentialTraffic,
     configError: parseResult.error,
@@ -1139,13 +1219,22 @@ interface ClineImportantValues {
   baseUrl: string
 }
 
+/** Mirrors the backend `normalize_cline_provider_id`, so a legacy `"openai"`
+ * typed into the advanced JSON editor still selects a row instead of leaving the
+ * provider dropdown blank. */
+function normalizeClineProvider(provider: string): ClineProvider {
+  return provider === "openai" ? "openai-compatible" : provider
+}
+
 function extractClineImportantValues(configText: string): ClineImportantValues {
   const parseResult = parseConfigJsonText(configText)
   const config = parseResult.config
   return {
-    provider: (typeof config.apiProvider === "string" && config.apiProvider
-      ? config.apiProvider
-      : "anthropic") as ClineProvider,
+    provider: normalizeClineProvider(
+      typeof config.apiProvider === "string" && config.apiProvider
+        ? config.apiProvider
+        : "anthropic"
+    ),
     apiKey: typeof config.apiKey === "string" ? config.apiKey : "",
     model: typeof config.model === "string" ? config.model : "",
     baseUrl: typeof config.apiBaseUrl === "string" ? config.apiBaseUrl : "",
@@ -1609,14 +1698,14 @@ function OpenCodeModelCombobox({
                         {model.reasoning && (
                           <Badge
                             variant="outline"
-                            className="px-1 text-[9px] font-normal"
+                            className="px-1 text-[0.5625rem] font-normal"
                           >
                             {acpText("openCode.reasoningBadge", "reasoning")}
                           </Badge>
                         )}
                         {contextLabel && (
                           <span
-                            className="text-[10px] text-muted-foreground"
+                            className="text-3xs text-muted-foreground"
                             title={acpText(
                               "openCode.contextWindow",
                               "Context window"
@@ -1769,12 +1858,12 @@ function ensureOpenCodeProviderNpm(configText: string): string {
 interface CodexTomlImportantValues {
   model: string
   modelProvider: string
-  modelReasoningEffort: CodexReasoningEffort
   providerNames: string[]
   providerBaseUrls: Record<string, string>
   providerSupportsWebsockets: Record<string, boolean>
   featureResponsesWebsocketsV2: boolean
   featureSkills: boolean
+  featureDefaultModeRequestUserInput: boolean
   serviceTierFast: boolean
 }
 
@@ -1783,14 +1872,37 @@ interface CodexImportantValues {
   apiKey: string | null
   model: string
   modelProvider: string
-  reasoningEffort: CodexReasoningEffort
   providerOptions: string[]
   supportsWebsockets: boolean
   skills: boolean
+  defaultModeRequestUserInput: boolean
   serviceTierFast: boolean
 }
 
 const CODEX_DEFAULT_MODEL_PROVIDER = "codeg"
+
+/**
+ * `[features]` flag that lets codex call its `request_user_input` tool in the
+ * DEFAULT collaboration mode.
+ *
+ * Upstream, `ModeKind::allows_request_user_input()` is true for `Plan` only
+ * (codex-rs/protocol/src/config_types.rs), and
+ * `request_user_input_available_modes()` widens it to `Default` exactly when
+ * this feature is on (codex-rs/tools/src/tool_config.rs). Without it a
+ * default-mode turn that reaches for the tool is refused with
+ * "request_user_input is unavailable in Default mode" — i.e. codeg's question
+ * cards only ever appear in Plan mode (openai/codex#24750).
+ *
+ * Stage is `UnderDevelopment` and `default_enabled` is false
+ * (codex-rs/features/src/lib.rs), so it has no `/experimental` menu entry and
+ * config.toml is the only way to turn it on. Verified against codex-cli 0.147.0
+ * — the version codeg's pinned codex-acp 1.4.0 depends on — with
+ * `codex features list`: absent ⇒ false, `= true` ⇒ true. Unknown keys under
+ * `[features]` are ignored rather than rejected (also verified), so writing it
+ * is safe on a codex build that predates the flag.
+ */
+const CODEX_DEFAULT_MODE_REQUEST_USER_INPUT_KEY =
+  "default_mode_request_user_input"
 
 /**
  * Header codex reads to decide whether a provider authenticates through the
@@ -1805,37 +1917,6 @@ const CODEX_AUTH_MODES = [
   "model_provider",
 ] as const
 type CodexAuthMode = (typeof CODEX_AUTH_MODES)[number]
-
-type CodexReasoningEffort = "low" | "medium" | "high" | "xhigh"
-
-const CODEX_REASONING_EFFORT_OPTIONS: ReadonlyArray<{
-  value: CodexReasoningEffort
-  label: string
-  description: string
-}> = [
-  {
-    value: "low",
-    label: "Low",
-    description: "Fast responses with lighter reasoning",
-  },
-  {
-    value: "medium",
-    label: "Medium",
-    description: "Balances speed and reasoning depth for everyday tasks",
-  },
-  {
-    value: "high",
-    label: "High",
-    description: "Greater reasoning depth for complex problems",
-  },
-  {
-    value: "xhigh",
-    label: "Extra High",
-    description: "Extra high reasoning depth for complex problems",
-  },
-]
-
-const CODEX_DEFAULT_REASONING_EFFORT: CodexReasoningEffort = "high"
 
 /** The draft value meaning "leave the key out of config.toml", i.e. let codex
  * apply its own default. */
@@ -1920,6 +2001,44 @@ function firstRelativeWritableRoot(text: string): string | null {
  * group live rather than greying out the very knobs the fallback uses. */
 function codexWorkspaceWriteApplies(mode: CodexSandboxModeChoice): boolean {
   return mode === "workspace-write" || mode === CODEX_SANDBOX_UNSET
+}
+
+/**
+ * Whether `default_permissions` leaves `sandbox_mode` able to seed the ACP
+ * session's starting approval preset. False when it shadows the root keys:
+ * codex then resolves everything through that profile, and
+ * `codex_initial_agent_mode` (commands/acp.rs) declines to map a shadowed
+ * config at all — so no preset is injected and the adapter's own default stands.
+ *
+ * This is the shadowing gate specifically, not a complete "will a preset be
+ * seeded" predicate: an unshadowed but UNSET `sandbox_mode` also maps to
+ * `None`. The unset case needs no gate here, because the copy this guards is
+ * about what the selected mode does and the select already reads "not set".
+ *
+ * Every claim the panel makes about the seeded preset has to be gated on this,
+ * or it describes an injection that never happens. `sandboxShadowedWarning`
+ * above already explains the shadowing itself.
+ */
+export function codexSandboxSeedsAcpPreset(shadowed: boolean): boolean {
+  return !shadowed
+}
+
+/**
+ * Whether to warn that the ACP adapter cannot honor a read-only sandbox.
+ *
+ * Fires exactly when codeg will inject the `read-only` preset, because the
+ * warning's second half promises that every escalation reaches the user — true
+ * of that preset on codex-acp ≥1.7.0 (`approvalsReviewer: "user"`), and false
+ * of the `agent` default a shadowed config falls back to (`auto_review`, where
+ * a model forwards only what it judges unsafe). Showing it for a shadowed
+ * config would pair "your sandbox key is ignored" with "you will be asked about
+ * everything" — the second being a guarantee codeg is not making.
+ */
+export function showsCodexReadOnlyAcpWarning(
+  mode: CodexSandboxModeChoice,
+  shadowed: boolean
+): boolean {
+  return mode === "read-only" && codexSandboxSeedsAcpPreset(shadowed)
 }
 
 /** The draft slice the sandbox payload is derived from. */
@@ -2034,21 +2153,6 @@ export function codexSandboxSaveConfig(
   return Object.keys(patch).length > 0 ? patch : undefined
 }
 
-function normalizeCodexReasoningEffort(
-  value: string
-): CodexReasoningEffort | null {
-  const normalized = value.trim().toLowerCase()
-  if (
-    normalized === "low" ||
-    normalized === "medium" ||
-    normalized === "high" ||
-    normalized === "xhigh"
-  ) {
-    return normalized
-  }
-  return null
-}
-
 function buildCodexProviderOptions(
   activeProvider: string,
   providerNames: string[]
@@ -2149,37 +2253,37 @@ function extractCodexTomlImportantValues(
   const providerNames = new Set<string>()
   let model = ""
   let modelProvider = ""
-  let modelReasoningEffort: CodexReasoningEffort =
-    CODEX_DEFAULT_REASONING_EFFORT
   let featureResponsesWebsocketsV2 = false
   let featureSkills = false
+  let featureDefaultModeRequestUserInput = false
   let serviceTierFast = false
   let currentProviderSection: string | null = null
   let inFeaturesSection = false
+  // Still above the first section header, i.e. in the implicit root table —
+  // the only place a dotted `features.x` key actually means `[features].x`.
+  let inRootTable = true
 
   for (const rawLine of configTomlText.split(/\r?\n/)) {
     const line = rawLine.trim()
     if (!line || line.startsWith("#")) continue
 
-    const sectionMatch = line.match(
-      /^\[\s*model_providers\.([A-Za-z0-9_-]+)\s*\]$/
-    )
-    if (sectionMatch) {
-      currentProviderSection = sectionMatch[1]
-      inFeaturesSection = false
-      if (currentProviderSection.trim()) {
-        providerNames.add(currentProviderSection.trim())
+    // Section tracking goes through the same header predicate the writer uses,
+    // so the two never disagree about where a table begins. A header carrying
+    // a trailing comment (`[features] # flags`) is a header.
+    const headerName = tomlSectionHeaderName(rawLine)
+    if (isTomlSectionHeader(rawLine)) {
+      inRootTable = false
+      const providerName = headerName?.match(
+        /^model_providers\.([A-Za-z0-9_-]+)$/
+      )?.[1]
+      if (providerName) {
+        currentProviderSection = providerName
+        inFeaturesSection = false
+        providerNames.add(providerName)
+      } else {
+        currentProviderSection = null
+        inFeaturesSection = headerName === "features"
       }
-      continue
-    }
-    if (line.match(/^\[\s*features\s*\]$/)) {
-      inFeaturesSection = true
-      currentProviderSection = null
-      continue
-    }
-    if (line.startsWith("[") && line.endsWith("]")) {
-      currentProviderSection = null
-      inFeaturesSection = false
       continue
     }
 
@@ -2191,12 +2295,6 @@ function extractCodexTomlImportantValues(
       }
       if (assignment.key === "model_provider") {
         modelProvider = assignment.value
-        continue
-      }
-      if (assignment.key === "model_reasoning_effort") {
-        modelReasoningEffort =
-          normalizeCodexReasoningEffort(assignment.value) ??
-          CODEX_DEFAULT_REASONING_EFFORT
         continue
       }
       if (
@@ -2231,6 +2329,13 @@ function extractCodexTomlImportantValues(
         featureSkills = boolAssignment.value
         continue
       }
+      if (
+        inFeaturesSection &&
+        boolAssignment.key === CODEX_DEFAULT_MODE_REQUEST_USER_INPUT_KEY
+      ) {
+        featureDefaultModeRequestUserInput = boolAssignment.value
+        continue
+      }
       const dottedProviderWebsocketMatch = boolAssignment.key.match(
         /^model_providers\.([A-Za-z0-9_-]+)\.supports_websockets$/
       )
@@ -2240,13 +2345,29 @@ function extractCodexTomlImportantValues(
         providerSupportsWebsockets[providerName] = boolAssignment.value
         continue
       }
-      if (boolAssignment.key === "features.responses_websockets_v2") {
-        featureResponsesWebsocketsV2 = boolAssignment.value
-        continue
-      }
-      if (boolAssignment.key === "features.skills") {
-        featureSkills = boolAssignment.value
-        continue
+      // The three dotted `features.*` spellings below are ROOT-scoped on
+      // purpose. Inside `[model_providers.codeg]` the same text means
+      // `model_providers.codeg.features.…` — a key codex ignores — and the
+      // writer only ever touches the root spelling. Reading a nested one would
+      // show a value no save could clear, and (for the websocket flag, which
+      // the writer re-derives on every patch) would promote a provider-local
+      // key into a global `[features]` flag behind the user's back.
+      if (inRootTable) {
+        if (boolAssignment.key === "features.responses_websockets_v2") {
+          featureResponsesWebsocketsV2 = boolAssignment.value
+          continue
+        }
+        if (boolAssignment.key === "features.skills") {
+          featureSkills = boolAssignment.value
+          continue
+        }
+        if (
+          boolAssignment.key ===
+          `features.${CODEX_DEFAULT_MODE_REQUEST_USER_INPUT_KEY}`
+        ) {
+          featureDefaultModeRequestUserInput = boolAssignment.value
+          continue
+        }
       }
     }
 
@@ -2289,12 +2410,12 @@ function extractCodexTomlImportantValues(
   return {
     model,
     modelProvider,
-    modelReasoningEffort,
     providerNames: Array.from(providerNames),
     providerBaseUrls,
     providerSupportsWebsockets,
     featureResponsesWebsocketsV2,
     featureSkills,
+    featureDefaultModeRequestUserInput,
     serviceTierFast,
   }
 }
@@ -2363,7 +2484,10 @@ function hasCodexChatgptTokens(authJsonText: string): boolean {
   return false
 }
 
-function extractCodexImportantValues(
+/** Exported so tests can assert the reader and
+ * {@link patchCodexConfigTomlText} agree on every key — the two halves are what
+ * make a toggle round-trip through config.toml instead of snapping back. */
+export function extractCodexImportantValues(
   authJsonText: string,
   configTomlText: string
 ): CodexImportantValues {
@@ -2396,13 +2520,13 @@ function extractCodexImportantValues(
         : null,
     model: toml.model,
     modelProvider: activeProvider,
-    reasoningEffort: toml.modelReasoningEffort,
     providerOptions: buildCodexProviderOptions(
       activeProvider,
       toml.providerNames
     ),
     supportsWebsockets: providerSupportsWebsockets,
     skills: toml.featureSkills,
+    defaultModeRequestUserInput: toml.featureDefaultModeRequestUserInput,
     serviceTierFast: toml.serviceTierFast,
   }
 }
@@ -2411,9 +2535,32 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
 
+/**
+ * Whether a line opens a new TOML table — `[table]` or `[[array]]` — allowing
+ * the trailing comment TOML permits after a header. Matching `[x]` exactly
+ * (what these helpers used to do) makes `[features] # flags` invisible, which
+ * is not a cosmetic miss: the scanner then keeps treating the lines below it as
+ * root-table keys, so an upsert appends a SECOND `[features]` and the file
+ * stops parsing.
+ */
+function isTomlSectionHeader(rawLine: string): boolean {
+  const line = rawLine.trim()
+  return line.startsWith("[") && /^\[.*\]\s*(?:#.*)?$/.test(line)
+}
+
+/**
+ * The table name from a `[table]` header, or null for anything else —
+ * including `[[array]]`, which is not a plain table. Surrounding whitespace is
+ * insignificant in TOML (`[ features ]` names `features`), so it is trimmed.
+ */
+function tomlSectionHeaderName(rawLine: string): string | null {
+  const match = rawLine.trim().match(/^\[([^[\]]*)\]\s*(?:#.*)?$/)
+  return match ? match[1].trim() : null
+}
+
 function findTomlRootEndIndex(lines: string[]): number {
   for (let i = 0; i < lines.length; i += 1) {
-    if (/^\[.*\]$/.test(lines[i].trim())) return i
+    if (isTomlSectionHeader(lines[i])) return i
   }
   return lines.length
 }
@@ -2431,10 +2578,6 @@ function preferredTomlRootInsertionIndex(lines: string[], key: string): number {
   if (key === "model") {
     const providerIndex = findTomlRootAssignmentIndex(lines, "model_provider")
     return providerIndex >= 0 ? providerIndex : 0
-  }
-  if (key === "model_reasoning_effort") {
-    const modelIndex = findTomlRootAssignmentIndex(lines, "model")
-    return modelIndex >= 0 ? modelIndex + 1 : 0
   }
   let insertAt = findTomlRootEndIndex(lines)
   while (insertAt > 0 && lines[insertAt - 1].trim() === "") {
@@ -2489,18 +2632,16 @@ function findTomlSectionRange(
   lines: string[],
   sectionName: string
 ): { start: number; end: number } | null {
-  const headerText = `[${sectionName}]`
   let sectionStart = -1
   let sectionEnd = lines.length
   for (let i = 0; i < lines.length; i += 1) {
-    const trimmed = lines[i].trim()
     if (sectionStart < 0) {
-      if (trimmed === headerText) {
+      if (tomlSectionHeaderName(lines[i]) === sectionName) {
         sectionStart = i
       }
       continue
     }
-    if (/^\[.*\]$/.test(trimmed)) {
+    if (isTomlSectionHeader(lines[i])) {
       sectionEnd = i
       break
     }
@@ -2525,6 +2666,58 @@ function removeTomlSection(
   return lines.join("\n").trim()
 }
 
+/**
+ * Drop any ROOT-level `<section>.<key> = …` line — the dotted spelling of the
+ * very key this upsert is about to write into `[section]`.
+ *
+ * TOML treats `features.skills = true` and `[features]` + `skills = true` as
+ * the same key, but they cannot coexist: the dotted form defines the `features`
+ * table implicitly, so a later `[features]` header is a hard
+ * "trying to redefine an already defined table" parse error. Leaving the dotted
+ * line in place therefore breaks both directions — turning the switch OFF would
+ * not remove the value the reader still sees (the control snaps back), and
+ * turning it ON would emit a config.toml the backend refuses to persist.
+ *
+ * Only lines above the FIRST section header are considered: inside
+ * `[model_providers.codeg]`, `features.skills` means
+ * `model_providers.codeg.features.skills`, an unrelated key we must not touch.
+ */
+function stripRootDottedKey(
+  lines: string[],
+  sectionName: string,
+  key: string
+): void {
+  const dotted = `${sectionName}.${key}`
+  for (let i = 0; i < lines.length; i += 1) {
+    if (isTomlSectionHeader(lines[i])) return
+    if (parseTomlAssignmentKey(lines[i]) === dotted) {
+      lines.splice(i, 1)
+      i -= 1
+    }
+  }
+}
+
+/**
+ * Index of the last ROOT-level `<section>.…` dotted assignment, or -1.
+ *
+ * A surviving sibling means the root table already defines `[section]`
+ * implicitly, so emitting a `[section]` header would be a redefinition. Writing
+ * the new key in the same dotted spelling keeps the document valid and leaves
+ * the sibling — someone else's setting — exactly where the user put it.
+ */
+function lastRootDottedSiblingIndex(
+  lines: string[],
+  sectionName: string
+): number {
+  const prefix = `${sectionName}.`
+  let last = -1
+  for (let i = 0; i < lines.length; i += 1) {
+    if (isTomlSectionHeader(lines[i])) break
+    if (parseTomlAssignmentKey(lines[i])?.startsWith(prefix)) last = i
+  }
+  return last
+}
+
 function upsertTomlSectionBooleanKey(
   configTomlText: string,
   sectionName: string,
@@ -2532,6 +2725,7 @@ function upsertTomlSectionBooleanKey(
   value: boolean | null
 ): string {
   const lines = configTomlText.split(/\r?\n/)
+  stripRootDottedKey(lines, sectionName, key)
   const section = findTomlSectionRange(lines, sectionName)
 
   if (section) {
@@ -2591,11 +2785,25 @@ function upsertTomlSectionBooleanKey(
     return lines.join("\n").trim()
   }
 
+  // No `[section]` to edit. Removing is still not a no-op: a root-level dotted
+  // spelling of this key may have just been stripped above, and that IS the
+  // value the reader was showing.
   if (value === null) {
-    return configTomlText.trim()
+    return lines.join("\n").trim()
   }
 
   const lineText = `${key} = ${value ? "true" : "false"}`
+
+  // The root table may already define this section through a dotted sibling we
+  // must not touch (`features.skills = true` while we write
+  // `features.default_mode_request_user_input`). Join it in its own spelling
+  // rather than opening a header that would redefine the table.
+  const sibling = lastRootDottedSiblingIndex(lines, sectionName)
+  if (sibling >= 0) {
+    lines.splice(sibling + 1, 0, `${sectionName}.${lineText}`)
+    return lines.join("\n").trim()
+  }
+
   const insertAt = findTomlRootEndIndex(lines)
   const prefixBlank =
     insertAt > 0 && lines[insertAt - 1].trim() !== "" ? [""] : []
@@ -2895,9 +3103,9 @@ export function patchCodexConfigTomlText(
     apiBaseUrl?: string
     model?: string
     modelProvider?: string
-    modelReasoningEffort?: string
     supportsWebsockets?: boolean
     skills?: boolean
+    defaultModeRequestUserInput?: boolean
     serviceTierFast?: boolean
   }
 ): string {
@@ -2915,16 +3123,6 @@ export function patchCodexConfigTomlText(
   }
   if (typeof patch.model === "string") {
     nextTomlText = updateTomlRootStringKey(nextTomlText, "model", patch.model)
-  }
-  if (typeof patch.modelReasoningEffort === "string") {
-    const reasoningEffort =
-      normalizeCodexReasoningEffort(patch.modelReasoningEffort) ??
-      CODEX_DEFAULT_REASONING_EFFORT
-    nextTomlText = updateTomlRootStringKey(
-      nextTomlText,
-      "model_reasoning_effort",
-      reasoningEffort
-    )
   }
   if (typeof patch.apiBaseUrl === "string") {
     const tomlValues = extractCodexTomlImportantValues(nextTomlText)
@@ -2975,16 +3173,21 @@ export function patchCodexConfigTomlText(
       normalizedTomlValues.model
     )
   }
-  nextTomlText = updateTomlRootStringKey(
-    nextTomlText,
-    "model_reasoning_effort",
-    normalizedTomlValues.modelReasoningEffort
-  )
   const activeProvider =
     normalizedTomlValues.modelProvider.trim() || CODEX_DEFAULT_MODEL_PROVIDER
-  const shouldEnableFeature = Boolean(
-    normalizedTomlValues.providerSupportsWebsockets[activeProvider]
-  )
+  // This key is rewritten on EVERY patch, including ones that have nothing to
+  // do with WebSockets, so it must resolve the flag exactly the way
+  // `extractCodexImportantValues` does — including its fallback to the feature
+  // key itself when the provider declares no `supports_websockets`. Reading
+  // only the provider field would treat "declared solely as a feature flag" as
+  // "off" and delete the user's setting the next time any other control moved.
+  // `??` and not `||`: an explicit `false` on the provider must win over the
+  // fallback, which is how the WebSocket switch turns itself off.
+  const shouldEnableFeature =
+    normalizedTomlValues.providerSupportsWebsockets[activeProvider] ??
+    (activeProvider === CODEX_DEFAULT_MODEL_PROVIDER
+      ? normalizedTomlValues.featureResponsesWebsocketsV2
+      : false)
   nextTomlText = upsertTomlSectionBooleanKey(
     nextTomlText,
     "features",
@@ -2997,6 +3200,17 @@ export function patchCodexConfigTomlText(
       "features",
       "skills",
       patch.skills ? true : null
+    )
+  }
+  if (typeof patch.defaultModeRequestUserInput === "boolean") {
+    // Upstream default is false, so "off" removes the key instead of writing
+    // `= false` — same contract as `skills` above, and it keeps config.toml
+    // free of a flag the user never opted into.
+    nextTomlText = upsertTomlSectionBooleanKey(
+      nextTomlText,
+      "features",
+      CODEX_DEFAULT_MODE_REQUEST_USER_INPUT_KEY,
+      patch.defaultModeRequestUserInput ? true : null
     )
   }
   if (typeof patch.serviceTierFast === "boolean") {
@@ -3554,9 +3768,10 @@ function buildAgentDraft(agent: AcpAgentInfo): AgentDraft {
     codexAuthMode,
     codexModelProvider: codexImportant.modelProvider,
     codexProviderOptions: codexImportant.providerOptions,
-    codexReasoningEffort: codexImportant.reasoningEffort,
     codexSupportsWebsockets: codexImportant.supportsWebsockets,
     codexSkills: codexImportant.skills,
+    codexDefaultModeRequestUserInput:
+      codexImportant.defaultModeRequestUserInput,
     codexServiceTierFast: codexImportant.serviceTierFast,
     ...codexSandboxFields,
     codexSandboxBaseline: codexSandboxBaselineOf(codexSandboxFields),
@@ -3573,7 +3788,6 @@ function buildAgentDraft(agent: AcpAgentInfo): AgentDraft {
     claudeCustomModelOptionName: important.claudeCustomModelOptionName,
     claudeCustomModelOptionDescription:
       important.claudeCustomModelOptionDescription,
-    claudeEffortLevel: important.claudeEffortLevel,
     claudeSendAttributionHeader: important.claudeSendAttributionHeader,
     claudeDisableNonessentialTraffic:
       important.claudeDisableNonessentialTraffic,
@@ -3815,12 +4029,15 @@ export function buildVersionCheck(
 
   // Custom-version install is offered in every installable state (and stays
   // available after a version is installed, so users can switch versions).
-  // Binary agents need the registry version present to template the download URL.
-  // uvx agents pin their version in the package spec, so custom-version
-  // install does not apply (the backend ignores the override).
-  const supportsCustomInstall =
-    agent.distribution_type === "npx" ||
-    (agent.distribution_type === "binary" && Boolean(agent.registry_version))
+  //
+  // The backend decides, because the condition is a property of the download
+  // URL rather than of the distribution kind: a binary agent's custom install
+  // substitutes the requested version into the pinned URL, which only yields a
+  // different archive when the pinned version appears in it. Antigravity's URLs
+  // carry a Google build id, so inferring support from
+  // `binary && registry_version` — as this did — offered an install that
+  // downloaded the same bytes and cached them under the number the user typed.
+  const supportsCustomInstall = agent.supports_custom_version
   const customInstallFix: UiFixAction = {
     label: acpText("actions.customInstall", "Custom install"),
     kind: "custom_install",
@@ -3828,6 +4045,12 @@ export function buildVersionCheck(
   }
   const withCustomInstall = (fixes: UiFixAction[]): UiFixAction[] =>
     supportsCustomInstall ? [...fixes, customInstallFix] : fixes
+
+  // The opt-in "Adapter version: Latest" channel (npx agents only) — install
+  // and upgrade actions resolve the `latest` dist-tag instead of the pin.
+  const latestChannel =
+    agent.distribution_type === "npx" &&
+    adapterChannelFromEnv(agent.env) === "latest"
 
   if (!agent.installed_version) {
     return {
@@ -3939,6 +4162,37 @@ export function buildVersionCheck(
         { versionText }
       ),
       fixes: withCustomInstall([
+        {
+          label: acpText("actions.uninstall", "Uninstall"),
+          kind: uninstallAction,
+          payload: agent.agent_type,
+        },
+      ]),
+    }
+  }
+
+  // A latest-channel agent's installed version normally sits AT or AHEAD of
+  // the pin, so the compare-to-pin branch above never offers an upgrade again
+  // — and codeg cannot know whether npm has something newer, because nothing
+  // polls in the background (by design). Keep the Upgrade action available:
+  // it resolves the `latest` dist-tag on demand, and "Already latest" would
+  // claim a comparison that was never made.
+  if (latestChannel) {
+    return {
+      check_id: "version_status",
+      label: acpText("version.statusLabel", "Version Status"),
+      status: "pass",
+      message: acpText(
+        "version.latestChannel",
+        "{versionText}. Latest channel is on; Upgrade installs the newest release.",
+        { versionText }
+      ),
+      fixes: withCustomInstall([
+        {
+          label: acpText("actions.upgrade", "Upgrade"),
+          kind: upgradeAction,
+          payload: agent.agent_type,
+        },
         {
           label: acpText("actions.uninstall", "Uninstall"),
           kind: uninstallAction,
@@ -5169,7 +5423,7 @@ export function AcpAgentSettings() {
             <span className="text-xs font-medium truncate">{check.label}</span>
           </div>
           <span
-            className={`text-[11px] font-semibold shrink-0 ${statusTone(check.status)}`}
+            className={`text-2xs font-semibold shrink-0 ${statusTone(check.status)}`}
           >
             {check.status.toUpperCase()}
           </span>
@@ -5177,11 +5431,11 @@ export function AcpAgentSettings() {
 
         {expanded && (
           <div className="flex items-start justify-between gap-2">
-            <div className="min-w-0 text-[11px] text-muted-foreground break-words">
+            <div className="min-w-0 text-2xs text-muted-foreground break-words">
               {check.message}
             </div>
             {check.fixes.length > 0 && (
-              <div className="flex flex-wrap gap-1.5 justify-end max-w-[220px] shrink-0">
+              <div className="flex flex-wrap gap-1.5 justify-end max-w-[13.75rem] shrink-0">
                 {check.fixes.map((fix, index) => {
                   const busyGated =
                     anyBinaryActionBusy &&
@@ -5298,12 +5552,6 @@ export function AcpAgentSettings() {
     selectedNeedsModelProvider && selectedDraft?.modelProviderId == null
   const selectedConfigText = selectedDraft?.configText ?? ""
   const selectedOpenCodeAuthJsonText = selectedDraft?.openCodeAuthJsonText ?? ""
-  const selectedCodexReasoningEffortOption =
-    selectedAgent?.agent_type === "codex" && selectedDraft
-      ? (CODEX_REASONING_EFFORT_OPTIONS.find(
-          (option) => option.value === selectedDraft.codexReasoningEffort
-        ) ?? null)
-      : null
   // Inline validation for `writable_roots`: codex would accept a relative entry
   // and resolve it against CODEX_HOME, so it is surfaced before the save throws.
   const codexRelativeWritableRoot =
@@ -5547,7 +5795,6 @@ export function AcpAgentSettings() {
         claudeCustomModelOptionName: important.claudeCustomModelOptionName,
         claudeCustomModelOptionDescription:
           important.claudeCustomModelOptionDescription,
-        claudeEffortLevel: important.claudeEffortLevel,
         claudeSendAttributionHeader: important.claudeSendAttributionHeader,
         claudeDisableNonessentialTraffic:
           important.claudeDisableNonessentialTraffic,
@@ -5585,41 +5832,6 @@ export function AcpAgentSettings() {
           configText: nextJson.configText,
         }
       })
-    },
-    [selectedAgent, selectedDraft, t, updateSelectedDraft]
-  )
-
-  const handleClaudeEffortLevelChange = useCallback(
-    (nextValue: ClaudeEffortLevel) => {
-      if (
-        !selectedAgent ||
-        !selectedDraft ||
-        selectedAgent.agent_type !== "claude_code"
-      )
-        return
-      const parsed = parseConfigJsonText(selectedDraft.configText)
-      if (parsed.error) {
-        toast.warning(t("warnings.nativeJsonRecoveredStructured"))
-      }
-      const config: Record<string, unknown> = parsed.error
-        ? {}
-        : { ...parsed.config }
-      if (nextValue) {
-        config[CLAUDE_EFFORT_LEVEL_CONFIG_KEY] = nextValue
-      } else {
-        delete config[CLAUDE_EFFORT_LEVEL_CONFIG_KEY]
-      }
-      const nextConfigText =
-        Object.keys(config).length === 0 ? "" : JSON.stringify(config, null, 2)
-      setConfigErrors((prev) => ({
-        ...prev,
-        [selectedAgent.agent_type]: null,
-      }))
-      updateSelectedDraft((current) => ({
-        ...current,
-        claudeEffortLevel: nextValue,
-        configText: nextConfigText,
-      }))
     },
     [selectedAgent, selectedDraft, t, updateSelectedDraft]
   )
@@ -6994,9 +7206,9 @@ export function AcpAgentSettings() {
         model: important.model,
         codexModelProvider: important.modelProvider,
         codexProviderOptions: important.providerOptions,
-        codexReasoningEffort: important.reasoningEffort,
         codexSupportsWebsockets: important.supportsWebsockets,
         codexSkills: important.skills,
+        codexDefaultModeRequestUserInput: important.defaultModeRequestUserInput,
         codexServiceTierFast: important.serviceTierFast,
       }))
     },
@@ -7047,9 +7259,9 @@ export function AcpAgentSettings() {
           model: synced.model,
           codexModelProvider: synced.modelProvider,
           codexProviderOptions: synced.providerOptions,
-          codexReasoningEffort: synced.reasoningEffort,
           codexSupportsWebsockets: synced.supportsWebsockets,
           codexSkills: synced.skills,
+          codexDefaultModeRequestUserInput: synced.defaultModeRequestUserInput,
           codexServiceTierFast: synced.serviceTierFast,
         }))
         return
@@ -7081,9 +7293,9 @@ export function AcpAgentSettings() {
         model: synced.model,
         codexModelProvider: CODEX_DEFAULT_MODEL_PROVIDER,
         codexProviderOptions: synced.providerOptions,
-        codexReasoningEffort: synced.reasoningEffort,
         codexSupportsWebsockets: synced.supportsWebsockets,
         codexSkills: synced.skills,
+        codexDefaultModeRequestUserInput: synced.defaultModeRequestUserInput,
         codexServiceTierFast: synced.serviceTierFast,
       }))
     },
@@ -7093,6 +7305,9 @@ export function AcpAgentSettings() {
   const handleCodexModelListChange = useCallback(
     (next: CodexModelConfig) => {
       const defaultSlug = next.default ?? next.customs[0]?.slug ?? ""
+      // `next` arrives already pruned of exclusions that no longer name a
+      // listable official, so a plain count is the *effective* customization —
+      // codeg only takes over codex's model table when something really deviates.
       const hasCatalog =
         next.customs.length > 0 || (next.excludedOfficials?.length ?? 0) > 0
       updateSelectedDraft((current) => {
@@ -7118,10 +7333,7 @@ export function AcpAgentSettings() {
   )
 
   const handleCodexImportantConfigChange = useCallback(
-    (
-      key: "apiBaseUrl" | "apiKey" | "model" | "reasoningEffort",
-      value: string
-    ) => {
+    (key: "apiBaseUrl" | "apiKey" | "model", value: string) => {
       if (
         !selectedAgent ||
         !selectedDraft ||
@@ -7142,18 +7354,12 @@ export function AcpAgentSettings() {
           ? patchCodexConfigTomlText(selectedDraft.codexConfigTomlText, {
               apiBaseUrl: value,
               modelProvider: selectedDraft.codexModelProvider,
-              modelReasoningEffort: selectedDraft.codexReasoningEffort,
             })
           : key === "model"
             ? patchCodexConfigTomlText(selectedDraft.codexConfigTomlText, {
                 model: value,
-                modelReasoningEffort: selectedDraft.codexReasoningEffort,
               })
-            : key === "reasoningEffort"
-              ? patchCodexConfigTomlText(selectedDraft.codexConfigTomlText, {
-                  modelReasoningEffort: value,
-                })
-              : selectedDraft.codexConfigTomlText
+            : selectedDraft.codexConfigTomlText
       if (nextAuth.recoveredFromInvalid) {
         toast.warning(t("warnings.authRecoveredStructured"))
       }
@@ -7162,22 +7368,15 @@ export function AcpAgentSettings() {
         nextToml
       )
       updateSelectedDraft((current) => ({
-        ...(key === "reasoningEffort"
-          ? {
-              ...current,
-              codexReasoningEffort:
-                normalizeCodexReasoningEffort(value) ??
-                CODEX_DEFAULT_REASONING_EFFORT,
-            }
-          : applyImportantFieldToDraft(current, key, value)),
+        ...applyImportantFieldToDraft(current, key, value),
         apiBaseUrl: synced.apiBaseUrl,
         apiKey: synced.apiKey ?? current.apiKey,
         model: synced.model,
         codexModelProvider: synced.modelProvider,
         codexProviderOptions: synced.providerOptions,
-        codexReasoningEffort: synced.reasoningEffort,
         codexSupportsWebsockets: synced.supportsWebsockets,
         codexSkills: synced.skills,
+        codexDefaultModeRequestUserInput: synced.defaultModeRequestUserInput,
         codexServiceTierFast: synced.serviceTierFast,
         codexAuthJsonText: nextAuth.authJsonText,
         codexConfigTomlText: nextToml,
@@ -7212,9 +7411,9 @@ export function AcpAgentSettings() {
         model: synced.model,
         codexModelProvider: synced.modelProvider,
         codexProviderOptions: synced.providerOptions,
-        codexReasoningEffort: synced.reasoningEffort,
         codexSupportsWebsockets: synced.supportsWebsockets,
         codexSkills: synced.skills,
+        codexDefaultModeRequestUserInput: synced.defaultModeRequestUserInput,
         codexServiceTierFast: synced.serviceTierFast,
         codexConfigTomlText: nextToml,
       }))
@@ -7245,9 +7444,42 @@ export function AcpAgentSettings() {
         model: synced.model,
         codexModelProvider: synced.modelProvider,
         codexProviderOptions: synced.providerOptions,
-        codexReasoningEffort: synced.reasoningEffort,
         codexSupportsWebsockets: synced.supportsWebsockets,
         codexSkills: synced.skills,
+        codexDefaultModeRequestUserInput: synced.defaultModeRequestUserInput,
+        codexServiceTierFast: synced.serviceTierFast,
+        codexConfigTomlText: nextToml,
+      }))
+    },
+    [selectedAgent, selectedDraft, updateSelectedDraft]
+  )
+
+  const handleCodexDefaultModeRequestUserInputChange = useCallback(
+    (enabled: boolean) => {
+      if (
+        !selectedAgent ||
+        !selectedDraft ||
+        selectedAgent.agent_type !== "codex"
+      )
+        return
+      const nextToml = patchCodexConfigTomlText(
+        selectedDraft.codexConfigTomlText,
+        { defaultModeRequestUserInput: enabled }
+      )
+      const synced = extractCodexImportantValues(
+        selectedDraft.codexAuthJsonText,
+        nextToml
+      )
+      updateSelectedDraft((current) => ({
+        ...current,
+        apiBaseUrl: synced.apiBaseUrl,
+        apiKey: synced.apiKey ?? current.apiKey,
+        model: synced.model,
+        codexModelProvider: synced.modelProvider,
+        codexProviderOptions: synced.providerOptions,
+        codexSupportsWebsockets: synced.supportsWebsockets,
+        codexSkills: synced.skills,
+        codexDefaultModeRequestUserInput: synced.defaultModeRequestUserInput,
         codexServiceTierFast: synced.serviceTierFast,
         codexConfigTomlText: nextToml,
       }))
@@ -7278,9 +7510,9 @@ export function AcpAgentSettings() {
         model: synced.model,
         codexModelProvider: synced.modelProvider,
         codexProviderOptions: synced.providerOptions,
-        codexReasoningEffort: synced.reasoningEffort,
         codexSupportsWebsockets: synced.supportsWebsockets,
         codexSkills: synced.skills,
+        codexDefaultModeRequestUserInput: synced.defaultModeRequestUserInput,
         codexServiceTierFast: synced.serviceTierFast,
         codexConfigTomlText: nextToml,
       }))
@@ -7482,7 +7714,7 @@ export function AcpAgentSettings() {
         </div>
       )}
 
-      <div className="flex-1 min-h-0 grid gap-3 lg:grid-cols-[minmax(240px,320px)_1fr]">
+      <div className="flex-1 min-h-0 grid gap-3 lg:grid-cols-[minmax(15rem,20rem)_1fr]">
         <div className="min-h-0 min-w-0 rounded-lg border bg-card flex flex-col overflow-hidden">
           <div className="border-b px-3 py-2 text-xs font-medium text-muted-foreground">
             {t("agentList")}
@@ -7747,7 +7979,7 @@ export function AcpAgentSettings() {
                     </div>
                   )}
                   <div className="flex items-center justify-between gap-2">
-                    <div className="text-[11px] text-muted-foreground flex items-center gap-1">
+                    <div className="text-2xs text-muted-foreground flex items-center gap-1">
                       <CheckCircle2 className="h-3 w-3" />
                       {t("preflight.count", { count: selectedChecks.length })}
                     </div>
@@ -7772,7 +8004,7 @@ export function AcpAgentSettings() {
                   )}
                   {installStream.status !== "idle" &&
                     streamAgentType === selectedAgent.agent_type && (
-                      <div className="mt-2 rounded-md border bg-muted/50 text-muted-foreground p-3 max-h-[200px] overflow-y-auto font-mono text-[11px] leading-relaxed">
+                      <div className="mt-2 rounded-md border bg-muted/50 text-muted-foreground p-3 max-h-[12.5rem] overflow-y-auto font-mono text-2xs leading-relaxed">
                         {installStream.logs.map((line, i) => (
                           <div
                             key={i}
@@ -7818,7 +8050,7 @@ export function AcpAgentSettings() {
                       <label className="text-xs font-medium">
                         {t("hostTools.label")}
                       </label>
-                      <p className="text-[11px] text-muted-foreground">
+                      <p className="text-2xs text-muted-foreground">
                         {t("hostTools.description")}
                       </p>
                     </div>
@@ -7837,6 +8069,58 @@ export function AcpAgentSettings() {
                       aria-label={t("hostTools.label")}
                     />
                   </div>
+                  {/*
+                    Same contract as the host-tools switch above: backed by the
+                    `envText` draft, persisted by the one Save button. Npx
+                    agents only — a binary or uvx install has no npm dist-tag
+                    to track.
+                  */}
+                  {selectedAgent.distribution_type === "npx" && (
+                    <div className="flex items-start justify-between gap-3 rounded-md border bg-muted/10 p-3">
+                      <div className="min-w-0 space-y-1">
+                        <label className="text-xs font-medium">
+                          {t("adapterChannel.label")}
+                        </label>
+                        <p className="text-2xs text-muted-foreground">
+                          {t("adapterChannel.description")}
+                        </p>
+                        {adapterChannelFromEnvText(selectedDraft.envText) ===
+                          "latest" && (
+                          <p className="text-2xs text-yellow-600 dark:text-yellow-400">
+                            {t("adapterChannel.latestWarning")}
+                          </p>
+                        )}
+                      </div>
+                      <Select
+                        value={adapterChannelFromEnvText(selectedDraft.envText)}
+                        onValueChange={(value) => {
+                          updateSelectedDraft((current) => ({
+                            ...current,
+                            envText: setAdapterChannel(
+                              current.envText,
+                              value === "latest" ? "latest" : "pinned"
+                            ),
+                          }))
+                        }}
+                        disabled={selectedGrokSaving}
+                      >
+                        <SelectTrigger
+                          className="w-44 shrink-0"
+                          aria-label={t("adapterChannel.label")}
+                        >
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="pinned">
+                            {t("adapterChannel.pinned")}
+                          </SelectItem>
+                          <SelectItem value="latest">
+                            {t("adapterChannel.latest")}
+                          </SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  )}
                   <div className="flex justify-end">
                     <Button
                       size="sm"
@@ -7883,13 +8167,13 @@ export function AcpAgentSettings() {
                       <label className="text-xs font-medium">
                         {t("configManagement")}
                       </label>
-                      <p className="mt-1 text-[11px] text-muted-foreground">
+                      <p className="mt-1 text-2xs text-muted-foreground">
                         {t("codex.configDescription")}
                       </p>
                     </div>
 
                     <div className="space-y-1.5">
-                      <label className="text-[11px] text-muted-foreground">
+                      <label className="text-2xs text-muted-foreground">
                         {t("codex.authMode")}
                       </label>
                       <Select
@@ -7917,7 +8201,7 @@ export function AcpAgentSettings() {
                           ))}
                         </SelectContent>
                       </Select>
-                      <p className="text-[11px] text-muted-foreground">
+                      <p className="text-2xs text-muted-foreground">
                         {selectedDraft.codexAuthMode === "chatgpt_subscription"
                           ? t("codex.chatgptSubscriptionHint")
                           : selectedDraft.codexAuthMode === "model_provider"
@@ -8032,7 +8316,7 @@ export function AcpAgentSettings() {
 
                     {selectedDraft.codexAuthMode === "model_provider" && (
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
+                        <label className="text-2xs text-muted-foreground">
                           {t("selectModelProvider")}
                         </label>
                         {selectedModelProviders.length > 0 ? (
@@ -8061,7 +8345,7 @@ export function AcpAgentSettings() {
                             </SelectContent>
                           </Select>
                         ) : (
-                          <p className="text-[11px] text-muted-foreground">
+                          <p className="text-2xs text-muted-foreground">
                             {t("noModelProviderAvailable")}
                           </p>
                         )}
@@ -8071,7 +8355,7 @@ export function AcpAgentSettings() {
                     {(selectedDraft.codexAuthMode === "api_key" ||
                       selectedDraft.codexAuthMode === "model_provider") && (
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
+                        <label className="text-2xs text-muted-foreground">
                           API URL
                         </label>
                         <Input
@@ -8093,7 +8377,7 @@ export function AcpAgentSettings() {
                     {(selectedDraft.codexAuthMode === "api_key" ||
                       selectedDraft.codexAuthMode === "model_provider") && (
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
+                        <label className="text-2xs text-muted-foreground">
                           API Key
                         </label>
                         <div className="flex items-center gap-2">
@@ -8156,40 +8440,8 @@ export function AcpAgentSettings() {
                     )}
 
                     <div className="space-y-1.5">
-                      <label className="text-[11px] text-muted-foreground">
-                        Reasoning Effort
-                      </label>
-                      <Select
-                        value={selectedDraft.codexReasoningEffort}
-                        onValueChange={(nextValue) => {
-                          handleCodexImportantConfigChange(
-                            "reasoningEffort",
-                            nextValue
-                          )
-                        }}
-                      >
-                        <SelectTrigger className="w-full">
-                          <SelectValue
-                            placeholder={t("codex.selectReasoningEffort")}
-                          />
-                        </SelectTrigger>
-                        <SelectContent align="start">
-                          {CODEX_REASONING_EFFORT_OPTIONS.map((option) => (
-                            <SelectItem key={option.value} value={option.value}>
-                              {option.label}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                      <p className="text-[11px] text-muted-foreground">
-                        {selectedCodexReasoningEffortOption?.description ??
-                          "Greater reasoning depth for complex problems"}
-                      </p>
-                    </div>
-
-                    <div className="space-y-1.5">
                       <div className="flex items-center justify-between rounded-md border px-3 py-2">
-                        <label className="text-[11px] text-muted-foreground">
+                        <label className="text-2xs text-muted-foreground">
                           {t("codex.enableWebsocket")}
                         </label>
                         <Switch
@@ -8202,7 +8454,7 @@ export function AcpAgentSettings() {
 
                     <div className="space-y-1.5">
                       <div className="flex items-center justify-between rounded-md border px-3 py-2">
-                        <label className="text-[11px] text-muted-foreground">
+                        <label className="text-2xs text-muted-foreground">
                           {t("codex.enableSkills")}
                         </label>
                         <Switch
@@ -8213,9 +8465,35 @@ export function AcpAgentSettings() {
                       </div>
                     </div>
 
+                    {/* `[features].default_mode_request_user_input` — without
+                        it codex refuses its own `request_user_input` tool
+                        outside Plan mode, so codeg's question cards never
+                        appear in an ordinary turn (openai/codex#24750). */}
                     <div className="space-y-1.5">
                       <div className="flex items-center justify-between rounded-md border px-3 py-2">
-                        <label className="text-[11px] text-muted-foreground">
+                        <label className="text-2xs text-muted-foreground">
+                          {t("codex.enableDefaultModeRequestUserInput")}
+                        </label>
+                        <Switch
+                          checked={
+                            selectedDraft.codexDefaultModeRequestUserInput
+                          }
+                          onCheckedChange={
+                            handleCodexDefaultModeRequestUserInputChange
+                          }
+                          aria-label={t(
+                            "codex.enableDefaultModeRequestUserInputAria"
+                          )}
+                        />
+                      </div>
+                      <p className="text-3xs text-muted-foreground">
+                        {t("codex.enableDefaultModeRequestUserInputHint")}
+                      </p>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <div className="flex items-center justify-between rounded-md border px-3 py-2">
+                        <label className="text-2xs text-muted-foreground">
                           {t("codex.enableFast")}
                         </label>
                         <Switch
@@ -8232,28 +8510,28 @@ export function AcpAgentSettings() {
                         preset's own policy per turn and ignore these keys. */}
                     <div className="space-y-2 rounded-md border px-3 py-2.5">
                       <div className="space-y-1">
-                        <p className="text-[11px] font-medium">
+                        <p className="text-2xs font-medium">
                           {t("codex.sandboxGroupTitle")}
                         </p>
-                        <p className="text-[10px] text-muted-foreground">
+                        <p className="text-3xs text-muted-foreground">
                           {t("codex.sandboxGroupHint")}
                         </p>
                       </div>
 
                       {selectedDraft.codexSandboxShadowed ? (
-                        <p className="text-[10px] text-yellow-500">
+                        <p className="text-3xs text-yellow-500">
                           {t("codex.sandboxShadowedWarning")}
                         </p>
                       ) : null}
                       {selectedDraft.codexSandboxHasPermissionsTable &&
                       !selectedDraft.codexSandboxShadowed ? (
-                        <p className="text-[10px] text-yellow-500">
+                        <p className="text-3xs text-yellow-500">
                           {t("codex.sandboxPermissionsTableWarning")}
                         </p>
                       ) : null}
 
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
+                        <label className="text-2xs text-muted-foreground">
                           {t("codex.approvalPolicyLabel")}
                         </label>
                         <Select
@@ -8290,7 +8568,7 @@ export function AcpAgentSettings() {
                             (#442). Say so where the user picks it, rather than
                             letting it look effective. */}
                         {selectedDraft.codexApprovalPolicy === "untrusted" ? (
-                          <p className="text-[10px] text-yellow-500">
+                          <p className="text-3xs text-yellow-500">
                             {t("codex.approvalPolicyUntrustedAcpWarning")}
                           </p>
                         ) : null}
@@ -8298,7 +8576,7 @@ export function AcpAgentSettings() {
 
                       {selectedDraft.codexApprovalPolicy === "granular" ? (
                         <div className="space-y-1 rounded-md border border-dashed px-2.5 py-2">
-                          <p className="text-[10px] text-muted-foreground">
+                          <p className="text-3xs text-muted-foreground">
                             {t("codex.granularHint")}
                           </p>
                           {CODEX_GRANULAR_KEYS.map((key) => (
@@ -8306,7 +8584,7 @@ export function AcpAgentSettings() {
                               className="flex items-center justify-between gap-2 py-0.5"
                               key={key}
                             >
-                              <label className="text-[11px] text-muted-foreground">
+                              <label className="text-2xs text-muted-foreground">
                                 {t(`codex.granular_${key}`)}
                               </label>
                               <Switch
@@ -8328,7 +8606,7 @@ export function AcpAgentSettings() {
                       ) : null}
 
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
+                        <label className="text-2xs text-muted-foreground">
                           {t("codex.sandboxModeLabel")}
                         </label>
                         <Select
@@ -8361,16 +8639,35 @@ export function AcpAgentSettings() {
                             ))}
                           </SelectContent>
                         </Select>
-                        <p className="text-[10px] text-muted-foreground">
+                        <p className="text-3xs text-muted-foreground">
                           {t("codex.sandboxModeHint")}
                         </p>
                         {/* Sandbox mode is what codeg maps onto the session's
                             starting approval preset (#442), so it reaches
                             ordinary prompts even though approval_policy does
                             not. Worth stating next to the control that does it. */}
-                        <p className="text-[10px] text-muted-foreground">
-                          {t("codex.sandboxModeSeedsPresetHint")}
-                        </p>
+                        {codexSandboxSeedsAcpPreset(
+                          selectedDraft.codexSandboxShadowed
+                        ) ? (
+                          <p className="text-3xs text-muted-foreground">
+                            {t("codex.sandboxModeSeedsPresetHint")}
+                          </p>
+                        ) : null}
+                        {/* codex-acp 1.7.0 redefined its `read-only` preset to
+                            carry a workspace-write sandbox, and it re-sends
+                            that policy every turn — so an ACP session cannot
+                            honor a read-only sandbox at all any more. This
+                            control keeps working for codex CLI/IDE sessions,
+                            which is exactly why the divergence has to be said
+                            out loud rather than left to look effective. */}
+                        {showsCodexReadOnlyAcpWarning(
+                          selectedDraft.codexSandboxMode,
+                          selectedDraft.codexSandboxShadowed
+                        ) ? (
+                          <p className="text-3xs text-yellow-500">
+                            {t("codex.sandboxModeReadOnlyAcpWarning")}
+                          </p>
+                        ) : null}
                       </div>
 
                       {codexWorkspaceWriteApplies(
@@ -8378,11 +8675,11 @@ export function AcpAgentSettings() {
                       ) && !selectedDraft.codexSandboxShadowed ? (
                         <div className="space-y-2 rounded-md border border-dashed px-2.5 py-2">
                           <div className="space-y-1">
-                            <label className="text-[11px] text-muted-foreground">
+                            <label className="text-2xs text-muted-foreground">
                               {t("codex.writableRootsLabel")}
                             </label>
                             <Textarea
-                              className="min-h-16 font-mono text-[11px]"
+                              className="min-h-16 font-mono text-2xs"
                               spellCheck={false}
                               value={selectedDraft.codexWritableRootsText}
                               onChange={(event) => {
@@ -8395,19 +8692,19 @@ export function AcpAgentSettings() {
                               placeholder={"/Users/me/shared\n/srv/cache"}
                             />
                             {codexRelativeWritableRoot ? (
-                              <p className="text-[10px] text-red-500">
+                              <p className="text-3xs text-red-500">
                                 {t("codex.sandboxRootsRelativeError", {
                                   path: codexRelativeWritableRoot,
                                 })}
                               </p>
                             ) : (
-                              <p className="text-[10px] text-muted-foreground">
+                              <p className="text-3xs text-muted-foreground">
                                 {t("codex.writableRootsHint")}
                               </p>
                             )}
                           </div>
                           <div className="flex items-center justify-between gap-2">
-                            <label className="text-[11px] text-muted-foreground">
+                            <label className="text-2xs text-muted-foreground">
                               {t("codex.networkAccessLabel")}
                             </label>
                             <Switch
@@ -8422,7 +8719,7 @@ export function AcpAgentSettings() {
                             />
                           </div>
                           <div className="flex items-center justify-between gap-2">
-                            <label className="text-[11px] text-muted-foreground">
+                            <label className="text-2xs text-muted-foreground">
                               {t("codex.excludeTmpdirLabel")}
                             </label>
                             <Switch
@@ -8437,7 +8734,7 @@ export function AcpAgentSettings() {
                             />
                           </div>
                           <div className="flex items-center justify-between gap-2">
-                            <label className="text-[11px] text-muted-foreground">
+                            <label className="text-2xs text-muted-foreground">
                               {t("codex.excludeSlashTmpLabel")}
                             </label>
                             <Switch
@@ -8456,7 +8753,7 @@ export function AcpAgentSettings() {
                     </div>
 
                     <div className="space-y-1.5">
-                      <label className="text-[11px] text-muted-foreground">
+                      <label className="text-2xs text-muted-foreground">
                         {t("codex.configTomlNative")}
                       </label>
                       <Textarea
@@ -8567,13 +8864,13 @@ supports_websockets = true`}
                       <label className="text-xs font-medium">
                         {t("gemini.authConfig")}
                       </label>
-                      <p className="mt-1 text-[11px] text-muted-foreground">
+                      <p className="mt-1 text-2xs text-muted-foreground">
                         {t("gemini.authConfigDescription")}
                       </p>
                     </div>
 
                     <div className="space-y-1.5">
-                      <label className="text-[11px] text-muted-foreground">
+                      <label className="text-2xs text-muted-foreground">
                         {t("gemini.authMode")}
                       </label>
                       <Select
@@ -8599,14 +8896,14 @@ supports_websockets = true`}
                           ))}
                         </SelectContent>
                       </Select>
-                      <p className="text-[11px] text-muted-foreground">
+                      <p className="text-2xs text-muted-foreground">
                         {geminiAuthModeHint(selectedDraft.geminiAuthMode)}
                       </p>
                     </div>
 
                     {selectedDraft.geminiAuthMode === "model_provider" && (
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
+                        <label className="text-2xs text-muted-foreground">
                           {t("selectModelProvider")}
                         </label>
                         {selectedModelProviders.length > 0 ? (
@@ -8635,7 +8932,7 @@ supports_websockets = true`}
                             </SelectContent>
                           </Select>
                         ) : (
-                          <p className="text-[11px] text-muted-foreground">
+                          <p className="text-2xs text-muted-foreground">
                             {t("noModelProviderAvailable")}
                           </p>
                         )}
@@ -8643,7 +8940,7 @@ supports_websockets = true`}
                     )}
 
                     <div className="space-y-1.5">
-                      <label className="text-[11px] text-muted-foreground">
+                      <label className="text-2xs text-muted-foreground">
                         Model
                       </label>
                       <Input
@@ -8656,7 +8953,7 @@ supports_websockets = true`}
                         }}
                         placeholder="gemini-3-pro-preview"
                       />
-                      <p className="text-[11px] text-muted-foreground">
+                      <p className="text-2xs text-muted-foreground">
                         {t("modelHintDefault")}
                       </p>
                     </div>
@@ -8664,7 +8961,7 @@ supports_websockets = true`}
                     {(selectedDraft.geminiAuthMode === "custom" ||
                       selectedDraft.geminiAuthMode === "model_provider") && (
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
+                        <label className="text-2xs text-muted-foreground">
                           GOOGLE_GEMINI_BASE_URL
                         </label>
                         <Input
@@ -8688,7 +8985,7 @@ supports_websockets = true`}
                       selectedDraft.geminiAuthMode === "model_provider" ||
                       selectedDraft.geminiAuthMode === "vertex_api_key") && (
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
+                        <label className="text-2xs text-muted-foreground">
                           {selectedDraft.geminiAuthMode === "vertex_api_key"
                             ? "GOOGLE_API_KEY"
                             : "GEMINI_API_KEY"}
@@ -8759,7 +9056,7 @@ supports_websockets = true`}
                       selectedDraft.geminiAuthMode === "vertex_api_key") && (
                       <div className="grid gap-3 md:grid-cols-2">
                         <div className="space-y-1.5">
-                          <label className="text-[11px] text-muted-foreground">
+                          <label className="text-2xs text-muted-foreground">
                             GOOGLE_CLOUD_PROJECT
                           </label>
                           <Input
@@ -8774,7 +9071,7 @@ supports_websockets = true`}
                           />
                         </div>
                         <div className="space-y-1.5">
-                          <label className="text-[11px] text-muted-foreground">
+                          <label className="text-2xs text-muted-foreground">
                             GOOGLE_CLOUD_LOCATION
                           </label>
                           <Input
@@ -8794,7 +9091,7 @@ supports_websockets = true`}
                     {selectedDraft.geminiAuthMode ===
                       "vertex_service_account" && (
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
+                        <label className="text-2xs text-muted-foreground">
                           GOOGLE_APPLICATION_CREDENTIALS
                         </label>
                         <Input
@@ -8885,14 +9182,14 @@ supports_websockets = true`}
                       <label className="text-xs font-medium">
                         {t("openCode.configManagement")}
                       </label>
-                      <p className="mt-1 text-[11px] text-muted-foreground">
+                      <p className="mt-1 text-2xs text-muted-foreground">
                         {t("openCode.configDescription")}
                       </p>
                     </div>
 
                     <div className="grid gap-3 md:grid-cols-2">
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
+                        <label className="text-2xs text-muted-foreground">
                           {t("openCode.mainModel")}
                         </label>
                         <OpenCodeModelCombobox
@@ -8905,7 +9202,7 @@ supports_websockets = true`}
                         />
                       </div>
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
+                        <label className="text-2xs text-muted-foreground">
                           {t("openCode.smallModel")}
                         </label>
                         <OpenCodeModelCombobox
@@ -8921,10 +9218,10 @@ supports_websockets = true`}
 
                     <div className="space-y-2 rounded-md border bg-background/60 p-3">
                       <div className="flex items-center justify-between gap-2">
-                        <label className="text-[11px] font-medium">
+                        <label className="text-2xs font-medium">
                           {t("openCode.providerManagement")}
                         </label>
-                        <div className="text-[11px] text-muted-foreground">
+                        <div className="text-2xs text-muted-foreground">
                           {t("openCode.providerCount", {
                             count:
                               selectedOpenCodeConfig?.providerIds.length ?? 0,
@@ -8964,7 +9261,7 @@ supports_websockets = true`}
                         </Button>
                         {openCodeCatalogLoading &&
                           openCodeCatalog.length === 0 && (
-                            <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
+                            <span className="inline-flex items-center gap-1 text-2xs text-muted-foreground">
                               <Loader2 className="h-3 w-3 animate-spin" />
                               {t("openCode.connect.loading")}
                             </span>
@@ -8972,12 +9269,12 @@ supports_websockets = true`}
                       </div>
 
                       {openCodeWellKnownConnected.length === 0 ? (
-                        <div className="text-[11px] text-muted-foreground">
+                        <div className="text-2xs text-muted-foreground">
                           {t("openCode.noConnectedProviders")}
                         </div>
                       ) : (
                         <div className="space-y-1.5">
-                          <label className="text-[11px] font-medium">
+                          <label className="text-2xs font-medium">
                             {t("openCode.connectedProviders")}
                           </label>
                           <div className="space-y-1.5">
@@ -8990,13 +9287,10 @@ supports_websockets = true`}
                                   <span className="truncate text-xs font-medium">
                                     {provider.name}
                                   </span>
-                                  <span className="text-[10px] text-muted-foreground">
+                                  <span className="text-3xs text-muted-foreground">
                                     {provider.id}
                                   </span>
-                                  <Badge
-                                    variant="outline"
-                                    className="text-[10px]"
-                                  >
+                                  <Badge variant="outline" className="text-3xs">
                                     {provider.authKind === "oauth"
                                       ? t("openCode.authKindOauth")
                                       : provider.authKind === "api"
@@ -9006,7 +9300,7 @@ supports_websockets = true`}
                                   {!provider.inCatalog && (
                                     <Badge
                                       variant="secondary"
-                                      className="text-[10px]"
+                                      className="text-3xs"
                                     >
                                       {t("openCode.customBadge")}
                                     </Badge>
@@ -9089,7 +9383,7 @@ supports_websockets = true`}
 
                       <div className="space-y-1 border-t pt-2">
                         <div className="flex items-center justify-between gap-2">
-                          <div className="text-[11px] font-medium text-muted-foreground">
+                          <div className="text-2xs font-medium text-muted-foreground">
                             {t("openCode.advancedProviderConfig")}
                           </div>
                           <Button
@@ -9110,13 +9404,13 @@ supports_websockets = true`}
                             {t("openCode.addCustomProvider")}
                           </Button>
                         </div>
-                        <p className="text-[10px] text-muted-foreground">
+                        <p className="text-3xs text-muted-foreground">
                           {t("openCode.customProviderConfigHint")}
                         </p>
                       </div>
 
                       {openCodeCustomProviderIds.length === 0 ? (
-                        <div className="text-[11px] text-muted-foreground">
+                        <div className="text-2xs text-muted-foreground">
                           {t("openCode.emptyProvider")}
                         </div>
                       ) : (
@@ -9166,12 +9460,12 @@ supports_websockets = true`}
                                       <span className="truncate text-xs font-medium">
                                         {providerId}
                                       </span>
-                                      <span className="text-[11px] text-muted-foreground">
+                                      <span className="text-2xs text-muted-foreground">
                                         models: {provider.modelCount}
                                       </span>
                                     </button>
                                     <div className="flex items-center gap-3">
-                                      <span className="text-[11px] text-muted-foreground">
+                                      <span className="text-2xs text-muted-foreground">
                                         {isDisabled
                                           ? t("status.disabled")
                                           : t("status.enabled")}
@@ -9216,7 +9510,7 @@ supports_websockets = true`}
                                   <CollapsibleContent className="px-2.5 pb-2.5">
                                     <div className="grid gap-3 border-t pt-2.5 md:grid-cols-2">
                                       <div className="space-y-1.5">
-                                        <label className="text-[11px] text-muted-foreground">
+                                        <label className="text-2xs text-muted-foreground">
                                           provider.name
                                         </label>
                                         <Input
@@ -9232,7 +9526,7 @@ supports_websockets = true`}
                                         />
                                       </div>
                                       <div className="space-y-1.5">
-                                        <label className="text-[11px] text-muted-foreground">
+                                        <label className="text-2xs text-muted-foreground">
                                           provider.npm
                                         </label>
                                         <Select
@@ -9272,7 +9566,7 @@ supports_websockets = true`}
                                         </Select>
                                       </div>
                                       <div className="space-y-1.5">
-                                        <label className="text-[11px] text-muted-foreground">
+                                        <label className="text-2xs text-muted-foreground">
                                           provider.api
                                         </label>
                                         <Input
@@ -9288,7 +9582,7 @@ supports_websockets = true`}
                                         />
                                       </div>
                                       <div className="space-y-1.5">
-                                        <label className="text-[11px] text-muted-foreground">
+                                        <label className="text-2xs text-muted-foreground">
                                           provider.options.baseURL
                                         </label>
                                         <Input
@@ -9304,7 +9598,7 @@ supports_websockets = true`}
                                         />
                                       </div>
                                       <div className="space-y-1.5 md:col-span-2">
-                                        <label className="text-[11px] text-muted-foreground">
+                                        <label className="text-2xs text-muted-foreground">
                                           provider.options.apiKey
                                         </label>
                                         <div className="flex items-center gap-2">
@@ -9393,18 +9687,18 @@ supports_websockets = true`}
                                                 ] && "rotate-180"
                                               )}
                                             />
-                                            <span className="text-[11px] font-medium">
+                                            <span className="text-2xs font-medium">
                                               {t("openCode.modelManagement")}
                                             </span>
                                           </div>
-                                          <span className="text-[11px] text-muted-foreground">
+                                          <span className="text-2xs text-muted-foreground">
                                             {t("openCode.modelCount", {
                                               count: provider.modelCount,
                                             })}
                                           </span>
                                         </button>
                                         <CollapsibleContent className="pt-2">
-                                          <p className="text-[11px] text-muted-foreground">
+                                          <p className="text-2xs text-muted-foreground">
                                             {t("openCode.modelDescription")}
                                           </p>
 
@@ -9421,7 +9715,7 @@ supports_websockets = true`}
                                                   event.target.value
                                                 )
                                               }}
-                                              className="w-[240px]"
+                                              className="w-[15rem]"
                                               placeholder="new-model-id"
                                             />
                                             <Button
@@ -9439,12 +9733,12 @@ supports_websockets = true`}
                                           </div>
 
                                           {provider.modelIds.length === 0 ? (
-                                            <div className="mt-2 text-[11px] text-muted-foreground">
+                                            <div className="mt-2 text-2xs text-muted-foreground">
                                               {t("openCode.emptyModel")}
                                             </div>
                                           ) : (
                                             <div className="mt-2 space-y-1">
-                                              <div className="flex items-center gap-2 px-1 text-[10px] text-muted-foreground">
+                                              <div className="flex items-center gap-2 px-1 text-3xs text-muted-foreground">
                                                 <div className="min-w-0 flex-1">
                                                   {t("openCode.modelId")}
                                                 </div>
@@ -9654,8 +9948,19 @@ supports_websockets = true`}
                       disabled={selectedIsSavingConfig}
                     />
 
+                    {/*
+                      Same contract as the permissions editor above: it owns a
+                      disjoint set of top-level keys, rewrites the whole
+                      document, and leaves the write to this card's Save button.
+                    */}
+                    <OpenCodeBehaviorSection
+                      configText={selectedDraft.configText}
+                      onChange={handleConfigTextChange}
+                      disabled={selectedIsSavingConfig}
+                    />
+
                     <div className="space-y-1.5">
-                      <label className="text-[11px] text-muted-foreground">
+                      <label className="text-2xs text-muted-foreground">
                         {t("openCode.nativeJsonConfig")}
                       </label>
                       <Textarea
@@ -9677,7 +9982,7 @@ supports_websockets = true`}
                         className="min-h-44 max-h-96 overflow-y-auto font-mono text-xs"
                       />
                       {selectedConfigError && (
-                        <div className="rounded-md border border-red-500/30 bg-red-500/5 px-2.5 py-1.5 text-[11px] text-red-400">
+                        <div className="rounded-md border border-red-500/30 bg-red-500/5 px-2.5 py-1.5 text-2xs text-red-400">
                           {selectedConfigError}
                         </div>
                       )}
@@ -9731,13 +10036,13 @@ supports_websockets = true`}
                   <div className="space-y-3 rounded-md border bg-muted/10 p-3">
                     <div>
                       <label className="text-xs font-medium">Cline</label>
-                      <p className="mt-1 text-[11px] text-muted-foreground">
+                      <p className="mt-1 text-2xs text-muted-foreground">
                         {t("cline.configDescription")}
                       </p>
                     </div>
 
                     <div className="space-y-1.5">
-                      <label className="text-[11px] text-muted-foreground">
+                      <label className="text-2xs text-muted-foreground">
                         Provider
                       </label>
                       <Select
@@ -9750,63 +10055,125 @@ supports_websockets = true`}
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
-                          {CLINE_PROVIDERS.map((p) => (
-                            <SelectItem key={p.value} value={p.value}>
-                              {p.label}
-                            </SelectItem>
-                          ))}
+                          <SelectGroup>
+                            <SelectLabel>{t("cline.signInGroup")}</SelectLabel>
+                            {CLINE_SIGNIN_PROVIDERS.map((p) => (
+                              <SelectItem key={p.value} value={p.value}>
+                                {p.label}
+                              </SelectItem>
+                            ))}
+                          </SelectGroup>
+                          <SelectGroup>
+                            <SelectLabel>{t("cline.byoGroup")}</SelectLabel>
+                            {CLINE_BYO_PROVIDERS.map((p) => (
+                              <SelectItem key={p.value} value={p.value}>
+                                {p.label}
+                              </SelectItem>
+                            ))}
+                          </SelectGroup>
+                          {/* A provider configured outside codeg (e.g. `cline
+                              auth bedrock`) keeps its own row, so opening this
+                              panel can't silently retarget the store. */}
+                          {!isClineSignInProvider(
+                            selectedDraft.clineProvider
+                          ) &&
+                            !CLINE_BYO_PROVIDERS.some(
+                              (p) => p.value === selectedDraft.clineProvider
+                            ) && (
+                              <SelectGroup>
+                                <SelectLabel>
+                                  {t("cline.externalGroup")}
+                                </SelectLabel>
+                                <SelectItem value={selectedDraft.clineProvider}>
+                                  {selectedDraft.clineProvider}
+                                </SelectItem>
+                              </SelectGroup>
+                            )}
                         </SelectContent>
                       </Select>
                     </div>
 
-                    <div className="space-y-1.5">
-                      <label className="text-[11px] text-muted-foreground">
-                        API Key
-                      </label>
-                      <div className="flex items-center gap-2">
-                        <Input
-                          type={
-                            showApiKeys[selectedAgent.agent_type]
-                              ? "text"
-                              : "password"
-                          }
-                          value={selectedDraft.clineApiKey}
-                          onChange={(event) => {
-                            handleClineFieldChange(
-                              "clineApiKey",
-                              event.target.value
-                            )
-                          }}
-                          placeholder="sk-..."
-                        />
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          onClick={() => {
-                            setShowApiKeys((prev) => ({
-                              ...prev,
-                              [selectedAgent.agent_type]:
-                                !prev[selectedAgent.agent_type],
-                            }))
-                          }}
-                          title={
-                            showApiKeys[selectedAgent.agent_type]
-                              ? t("actions.hideApiKey")
-                              : t("actions.showApiKey")
-                          }
-                        >
-                          {showApiKeys[selectedAgent.agent_type] ? (
-                            <EyeOff className="h-3.5 w-3.5" />
-                          ) : (
-                            <Eye className="h-3.5 w-3.5" />
-                          )}
-                        </Button>
+                    {isClineSignInProvider(selectedDraft.clineProvider) ? (
+                      // Sign-in: cline holds the credential, so there is nothing
+                      // here to fill in — only the command that obtains it. The
+                      // launch path deliberately exports no provider/key pair
+                      // for these, leaving `tryRestoreAuth` to find the token.
+                      <div className="space-y-1.5">
+                        <p className="text-2xs text-muted-foreground">
+                          {t("cline.signInHint")}
+                        </p>
+                        <div className="flex items-center gap-2">
+                          <code className="flex-1 overflow-x-auto rounded bg-muted px-2 py-1 text-2xs font-mono whitespace-nowrap">
+                            {clineAuthCommand(selectedDraft.clineProvider)}
+                          </code>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 w-7 shrink-0 p-0"
+                            onClick={async () => {
+                              const ok = await copyTextToClipboard(
+                                clineAuthCommand(selectedDraft.clineProvider)
+                              )
+                              if (ok) toast.success(t("grok.commandCopied"))
+                            }}
+                            title={t("grok.copyCommand")}
+                            aria-label={t("grok.copyCommand")}
+                          >
+                            <Copy className="h-3 w-3" />
+                          </Button>
+                        </div>
                       </div>
-                    </div>
+                    ) : (
+                      <div className="space-y-1.5">
+                        <label className="text-2xs text-muted-foreground">
+                          API Key
+                        </label>
+                        <div className="flex items-center gap-2">
+                          <Input
+                            type={
+                              showApiKeys[selectedAgent.agent_type]
+                                ? "text"
+                                : "password"
+                            }
+                            value={selectedDraft.clineApiKey}
+                            onChange={(event) => {
+                              handleClineFieldChange(
+                                "clineApiKey",
+                                event.target.value
+                              )
+                            }}
+                            placeholder="sk-..."
+                          />
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            onClick={() => {
+                              setShowApiKeys((prev) => ({
+                                ...prev,
+                                [selectedAgent.agent_type]:
+                                  !prev[selectedAgent.agent_type],
+                              }))
+                            }}
+                            title={
+                              showApiKeys[selectedAgent.agent_type]
+                                ? t("actions.hideApiKey")
+                                : t("actions.showApiKey")
+                            }
+                          >
+                            {showApiKeys[selectedAgent.agent_type] ? (
+                              <EyeOff className="h-3.5 w-3.5" />
+                            ) : (
+                              <Eye className="h-3.5 w-3.5" />
+                            )}
+                          </Button>
+                        </div>
+                      </div>
+                    )}
 
                     <div className="space-y-1.5">
-                      <label className="text-[11px] text-muted-foreground">
+                      <label className="text-2xs text-muted-foreground">
                         Model
                       </label>
                       <Input
@@ -9821,24 +10188,33 @@ supports_websockets = true`}
                       />
                     </div>
 
-                    <div className="space-y-1.5">
-                      <label className="text-[11px] text-muted-foreground">
-                        API URL
-                      </label>
-                      <Input
-                        value={selectedDraft.clineBaseUrl}
-                        onChange={(event) => {
-                          handleClineFieldChange(
-                            "clineBaseUrl",
-                            event.target.value
-                          )
-                        }}
-                        placeholder="https://api.openai.com"
-                      />
-                    </div>
+                    {/* Endpoint, like the key, is cline's own for a sign-in
+                        provider — its account service, not something to point
+                        elsewhere. */}
+                    {!isClineSignInProvider(selectedDraft.clineProvider) && (
+                      <div className="space-y-1.5">
+                        <label className="text-2xs text-muted-foreground">
+                          API URL
+                        </label>
+                        {/* Cline stores this as `settings.baseUrl`, which its
+                            own schema validates as a full URL — and an
+                            OpenAI-compatible endpoint wants the version suffix,
+                            so the placeholder shows the whole shape. */}
+                        <Input
+                          value={selectedDraft.clineBaseUrl}
+                          onChange={(event) => {
+                            handleClineFieldChange(
+                              "clineBaseUrl",
+                              event.target.value
+                            )
+                          }}
+                          placeholder="https://api.openai.com/v1"
+                        />
+                      </div>
+                    )}
 
                     <div className="space-y-1.5">
-                      <label className="text-[11px] text-muted-foreground">
+                      <label className="text-2xs text-muted-foreground">
                         {t("nativeJsonConfig")} (config)
                       </label>
                       <Textarea
@@ -9854,7 +10230,7 @@ supports_websockets = true`}
 }`}
                       />
                       {selectedConfigError && (
-                        <div className="rounded-md border border-red-500/30 bg-red-500/5 px-2.5 py-1.5 text-[11px] text-red-400">
+                        <div className="rounded-md border border-red-500/30 bg-red-500/5 px-2.5 py-1.5 text-2xs text-red-400">
                           {selectedConfigError}
                         </div>
                       )}
@@ -9906,13 +10282,13 @@ supports_websockets = true`}
                       <label className="text-xs font-medium">
                         {t("openClaw.gatewayConfig")}
                       </label>
-                      <p className="mt-1 text-[11px] text-muted-foreground">
+                      <p className="mt-1 text-2xs text-muted-foreground">
                         {t("openClaw.gatewayDescription")}
                       </p>
                     </div>
 
                     <div className="space-y-1.5">
-                      <label className="text-[11px] text-muted-foreground">
+                      <label className="text-2xs text-muted-foreground">
                         Gateway URL
                       </label>
                       <Input
@@ -9925,13 +10301,13 @@ supports_websockets = true`}
                         }}
                         placeholder="wss://gateway-host:18789"
                       />
-                      <p className="text-[11px] text-muted-foreground">
+                      <p className="text-2xs text-muted-foreground">
                         {t("openClaw.gatewayUrlHint")}
                       </p>
                     </div>
 
                     <div className="space-y-1.5">
-                      <label className="text-[11px] text-muted-foreground">
+                      <label className="text-2xs text-muted-foreground">
                         Gateway Token
                       </label>
                       <div className="flex items-center gap-2">
@@ -9974,13 +10350,13 @@ supports_websockets = true`}
                           )}
                         </Button>
                       </div>
-                      <p className="text-[11px] text-muted-foreground">
+                      <p className="text-2xs text-muted-foreground">
                         {t("openClaw.gatewayTokenHint")}
                       </p>
                     </div>
 
                     <div className="space-y-1.5">
-                      <label className="text-[11px] text-muted-foreground">
+                      <label className="text-2xs text-muted-foreground">
                         Session Key
                       </label>
                       <Input
@@ -9993,7 +10369,7 @@ supports_websockets = true`}
                         }}
                         placeholder="agent:main:main"
                       />
-                      <p className="text-[11px] text-muted-foreground">
+                      <p className="text-2xs text-muted-foreground">
                         {t("openClaw.sessionKeyHint")}
                       </p>
                     </div>
@@ -10052,13 +10428,13 @@ supports_websockets = true`}
                       <label className="text-xs font-medium">
                         {t("hermes.configManagement")}
                       </label>
-                      <p className="mt-1 text-[11px] text-muted-foreground">
+                      <p className="mt-1 text-2xs text-muted-foreground">
                         {t("hermes.configDescription")}
                       </p>
                     </div>
 
                     <div className="space-y-1.5">
-                      <label className="text-[11px] text-muted-foreground">
+                      <label className="text-2xs text-muted-foreground">
                         {t("hermes.providerLabel")}
                       </label>
                       <Select
@@ -10110,14 +10486,14 @@ supports_websockets = true`}
                           })}
                         </SelectContent>
                       </Select>
-                      <p className="text-[11px] text-muted-foreground">
+                      <p className="text-2xs text-muted-foreground">
                         {t("hermes.providerHint")}
                       </p>
                     </div>
 
                     {selectedHermesProviderOption?.kind === "apiKey" && (
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
+                        <label className="text-2xs text-muted-foreground">
                           API Key
                         </label>
                         <div className="flex items-center gap-2">
@@ -10161,7 +10537,7 @@ supports_websockets = true`}
                             )}
                           </Button>
                         </div>
-                        <p className="text-[11px] text-muted-foreground">
+                        <p className="text-2xs text-muted-foreground">
                           {t("hermes.apiKeyHint")}
                         </p>
                       </div>
@@ -10169,7 +10545,7 @@ supports_websockets = true`}
 
                     {selectedHermesProviderOption?.needsBaseUrl && (
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
+                        <label className="text-2xs text-muted-foreground">
                           API URL
                         </label>
                         <Input
@@ -10187,7 +10563,7 @@ supports_websockets = true`}
                     )}
 
                     <div className="space-y-1.5">
-                      <label className="text-[11px] text-muted-foreground">
+                      <label className="text-2xs text-muted-foreground">
                         {t("hermes.modelName")}
                       </label>
                       <Input
@@ -10201,19 +10577,19 @@ supports_websockets = true`}
                     </div>
 
                     {selectedHermesProviderOption?.kind === "oauth" && (
-                      <p className="text-[11px] text-muted-foreground">
+                      <p className="text-2xs text-muted-foreground">
                         {t("hermes.oauthHint")}
                       </p>
                     )}
 
                     {selectedHermesProviderOption?.kind === "aws" && (
-                      <p className="text-[11px] text-muted-foreground">
+                      <p className="text-2xs text-muted-foreground">
                         {t("hermes.awsHint")}
                       </p>
                     )}
 
                     {!selectedHermesProviderOption && (
-                      <p className="text-[11px] text-amber-600 dark:text-amber-500">
+                      <p className="text-2xs text-amber-600 dark:text-amber-500">
                         {t("hermes.unsupportedProvider")}
                       </p>
                     )}
@@ -10243,10 +10619,10 @@ supports_websockets = true`}
 
                     <div className="space-y-2 rounded-md border p-3">
                       <div>
-                        <label className="text-[11px] font-medium">
+                        <label className="text-2xs font-medium">
                           {t("hermes.setupTitle")}
                         </label>
-                        <p className="mt-1 text-[11px] text-muted-foreground">
+                        <p className="mt-1 text-2xs text-muted-foreground">
                           {t("hermes.setupHint")}
                         </p>
                       </div>
@@ -10288,7 +10664,7 @@ supports_websockets = true`}
                       )}
                       {selectedDraft.hermesSetupCommand && (
                         <div className="flex items-center gap-2">
-                          <code className="flex-1 overflow-x-auto rounded bg-muted px-2 py-1 text-[11px] font-mono whitespace-nowrap">
+                          <code className="flex-1 overflow-x-auto rounded bg-muted px-2 py-1 text-2xs font-mono whitespace-nowrap">
                             {selectedDraft.hermesSetupCommand}
                           </code>
                           <Button
@@ -10312,11 +10688,11 @@ supports_websockets = true`}
                     </div>
 
                     <details className="rounded-md border p-3">
-                      <summary className="cursor-pointer text-[11px] font-medium text-muted-foreground">
+                      <summary className="cursor-pointer text-2xs font-medium text-muted-foreground">
                         {t("hermes.advancedTitle")}
                       </summary>
                       <div className="mt-2 space-y-2">
-                        <p className="text-[11px] text-muted-foreground">
+                        <p className="text-2xs text-muted-foreground">
                           {t("hermes.rawConfigHint")}
                         </p>
                         <Textarea
@@ -10402,7 +10778,67 @@ supports_websockets = true`}
                     onAffectedSessions={reportAffectedSessions}
                   />
                 ) : selectedAgent.agent_type === "deepseek" ? (
-                  <DeepSeekConfigPanel
+                  <>
+                    <DeepSeekConfigPanel
+                      agent={selectedAgent}
+                      saving={Boolean(savingEnv[selectedAgent.agent_type])}
+                      onSaveEnv={(env, enabled) =>
+                        persistEnv(
+                          selectedAgent.agent_type,
+                          enabled,
+                          envMapToText(env),
+                          selectedAgent.model_provider_id,
+                          // The keys this panel owns, folded into the raw
+                          // editor's draft (which the enable switch persists
+                          // wholesale) so the two can never disagree.
+                          // `DEEPSEEK_ACP_MODEL` is NOT one of them — the raw
+                          // editor owns it, and folding it in would overwrite a
+                          // model line being typed there.
+                          {
+                            DEEPSEEK_API_KEY: env.DEEPSEEK_API_KEY,
+                            DEEPSEEK_BASE_URL: env.DEEPSEEK_BASE_URL,
+                            DEEPSEEK_ACP_PROVIDER: env.DEEPSEEK_ACP_PROVIDER,
+                          }
+                        )
+                      }
+                    />
+                    {/* The deployment's model catalog. It lives in the harness'
+                      own `settings.yaml`, not in the agent env, so it has its
+                      own section and its own save — and it is what the
+                      composer's per-session model selector gets to choose
+                      from. */}
+                    <DeepSeekModelListEditor
+                      launchModel={selectedAgent.env.DEEPSEEK_ACP_MODEL}
+                    />
+                  </>
+                ) : selectedAgent.agent_type === "qoder" ? (
+                  <QoderConfigPanel
+                    agent={selectedAgent}
+                    saving={Boolean(savingEnv[selectedAgent.agent_type])}
+                    onSaveEnv={(env, enabled) =>
+                      persistEnv(
+                        selectedAgent.agent_type,
+                        enabled,
+                        envMapToText(env),
+                        selectedAgent.model_provider_id,
+                        // The one key this panel owns, folded into the raw
+                        // editor's draft. That draft is persisted WHOLESALE by
+                        // the enable switch and the generic env Save button, so
+                        // without this a saved token would be silently deleted
+                        // the moment either one fires. `undefined` (the token
+                        // field was cleared) deletes the line, which is the
+                        // outcome clearing it asks for.
+                        {
+                          QODER_PERSONAL_ACCESS_TOKEN:
+                            env.QODER_PERSONAL_ACCESS_TOKEN,
+                        }
+                      )
+                    }
+                    onSaved={refreshAgents}
+                    onAffectedSessions={reportAffectedSessions}
+                  />
+                ) : selectedAgent.agent_type === "antigravity" ? (
+                  <AntigravityConfigPanel
                     agent={selectedAgent}
                     saving={Boolean(savingEnv[selectedAgent.agent_type])}
                     onSaveEnv={(env, enabled) =>
@@ -10412,18 +10848,19 @@ supports_websockets = true`}
                         envMapToText(env),
                         selectedAgent.model_provider_id,
                         // The keys this panel owns, folded into the raw
-                        // editor's draft (which the enable switch persists
-                        // wholesale) so the two can never disagree.
-                        // `DEEPSEEK_ACP_MODEL` is NOT one of them — the raw
-                        // editor owns it, and folding it in would overwrite a
-                        // model line being typed there.
-                        {
-                          DEEPSEEK_API_KEY: env.DEEPSEEK_API_KEY,
-                          DEEPSEEK_BASE_URL: env.DEEPSEEK_BASE_URL,
-                          DEEPSEEK_ACP_PROVIDER: env.DEEPSEEK_ACP_PROVIDER,
-                        }
+                        // editor's draft. That draft is persisted WHOLESALE by
+                        // the enable switch and the generic env Save button, so
+                        // without this a saved auth method would be silently
+                        // deleted the moment either one fires. `undefined` (the
+                        // method does not use that credential) deletes the
+                        // line, which is exactly what switching methods asks
+                        // for.
+                        Object.fromEntries(
+                          ANTIGRAVITY_ENV_KEYS.map((key) => [key, env[key]])
+                        )
                       )
                     }
+                    onSaved={refreshAgents}
                   />
                 ) : selectedAgent.agent_type === "grok" ? (
                   <div className="space-y-3 rounded-md border bg-muted/10 p-3">
@@ -10431,7 +10868,7 @@ supports_websockets = true`}
                       <label className="text-xs font-medium">
                         {t("configManagement")}
                       </label>
-                      <p className="mt-1 text-[11px] text-muted-foreground">
+                      <p className="mt-1 text-2xs text-muted-foreground">
                         {t("grok.configDescription")}
                       </p>
                     </div>
@@ -10439,7 +10876,7 @@ supports_websockets = true`}
                     {/* Structured controls — mode + reasoning effort */}
                     <div className="grid gap-3 md:grid-cols-2">
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
+                        <label className="text-2xs text-muted-foreground">
                           {t("grok.permissionModeLabel")}
                         </label>
                         <Select
@@ -10480,7 +10917,7 @@ supports_websockets = true`}
                       </div>
 
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
+                        <label className="text-2xs text-muted-foreground">
                           {t("grok.reasoningEffortLabel")}
                         </label>
                         <Select
@@ -10529,7 +10966,7 @@ supports_websockets = true`}
                         on load via inferGrokMode and recorded as GROK_AUTH_MODE. */}
                     <div className="space-y-2.5 rounded-md border p-2.5">
                       <div className="space-y-1.5">
-                        <label className="text-[11px] font-medium">
+                        <label className="text-2xs font-medium">
                           {t("grok.authTitle")}
                         </label>
                         <Select
@@ -10557,7 +10994,7 @@ supports_websockets = true`}
                             </SelectItem>
                           </SelectContent>
                         </Select>
-                        <p className="text-[11px] text-muted-foreground">
+                        <p className="text-2xs text-muted-foreground">
                           {selectedDraft.grokAuthMode === "subscription"
                             ? t("grok.subscriptionHint")
                             : selectedDraft.grokAuthMode === "custom"
@@ -10571,11 +11008,11 @@ supports_websockets = true`}
                         // session lives in ~/.grok/auth.json (untouched here); the
                         // launch path strips any inherited XAI_API_KEY.
                         <div className="space-y-1.5">
-                          <p className="text-[11px] text-muted-foreground">
+                          <p className="text-2xs text-muted-foreground">
                             {t("grok.loginHint")}
                           </p>
                           <div className="flex items-center gap-2">
-                            <code className="flex-1 overflow-x-auto rounded bg-muted px-2 py-1 text-[11px] font-mono whitespace-nowrap">
+                            <code className="flex-1 overflow-x-auto rounded bg-muted px-2 py-1 text-2xs font-mono whitespace-nowrap">
                               {GROK_LOGIN_COMMAND}
                             </code>
                             <Button
@@ -10598,7 +11035,7 @@ supports_websockets = true`}
                       ) : selectedDraft.grokAuthMode === "api_key" ? (
                         // API key: the non-interactive XAI_API_KEY credential.
                         <div className="space-y-1.5">
-                          <label className="text-[11px] text-muted-foreground">
+                          <label className="text-2xs text-muted-foreground">
                             XAI_API_KEY
                           </label>
                           <div className="flex items-center gap-2">
@@ -10652,7 +11089,7 @@ supports_websockets = true`}
                               )}
                             </Button>
                           </div>
-                          <p className="text-[11px] text-muted-foreground">
+                          <p className="text-2xs text-muted-foreground">
                             {selectedDraft.apiKey.trim()
                               ? t("grok.authKeyConfigured")
                               : t("grok.authKeyMissing")}
@@ -10668,16 +11105,16 @@ supports_websockets = true`}
                     {selectedDraft.grokAuthMode === "custom" ? (
                       <div className="space-y-2.5 rounded-md border p-2.5">
                         <div>
-                          <label className="text-[11px] font-medium">
+                          <label className="text-2xs font-medium">
                             {t("grok.customModelTitle")}
                           </label>
-                          <p className="mt-1 text-[11px] text-muted-foreground">
+                          <p className="mt-1 text-2xs text-muted-foreground">
                             {t("grok.customModelHint")}
                           </p>
                         </div>
 
                         <div className="space-y-1.5">
-                          <label className="text-[11px] text-muted-foreground">
+                          <label className="text-2xs text-muted-foreground">
                             {t("grok.customModelIdLabel")}
                           </label>
                           <Input
@@ -10694,14 +11131,14 @@ supports_websockets = true`}
                             spellCheck={false}
                             disabled={grokSaving}
                           />
-                          <p className="text-[11px] text-muted-foreground">
+                          <p className="text-2xs text-muted-foreground">
                             {t("grok.customModelIdHint")}
                           </p>
                         </div>
 
                         <div className="grid gap-3 md:grid-cols-2">
                           <div className="space-y-1.5">
-                            <label className="text-[11px] text-muted-foreground">
+                            <label className="text-2xs text-muted-foreground">
                               {t("grok.customBaseUrlLabel")}
                             </label>
                             <Input
@@ -10720,7 +11157,7 @@ supports_websockets = true`}
                             />
                           </div>
                           <div className="space-y-1.5">
-                            <label className="text-[11px] text-muted-foreground">
+                            <label className="text-2xs text-muted-foreground">
                               {t("grok.customApiBackendLabel")}
                             </label>
                             <Select
@@ -10758,7 +11195,7 @@ supports_websockets = true`}
                         </div>
 
                         <div className="space-y-1.5">
-                          <label className="text-[11px] text-muted-foreground">
+                          <label className="text-2xs text-muted-foreground">
                             {t("grok.customApiKeyLabel")}
                           </label>
                           <div className="flex items-center gap-2">
@@ -10804,13 +11241,13 @@ supports_websockets = true`}
                               )}
                             </Button>
                           </div>
-                          <p className="text-[11px] text-muted-foreground">
+                          <p className="text-2xs text-muted-foreground">
                             {t("grok.customApiKeyHint")}
                           </p>
                         </div>
 
                         <div className="space-y-1.5">
-                          <label className="text-[11px] text-muted-foreground">
+                          <label className="text-2xs text-muted-foreground">
                             {t("grok.customContextWindowLabel")}
                           </label>
                           <Input
@@ -10827,7 +11264,7 @@ supports_websockets = true`}
                             aria-label={t("grok.customContextWindowLabel")}
                             disabled={grokSaving}
                           />
-                          <p className="text-[11px] text-muted-foreground">
+                          <p className="text-2xs text-muted-foreground">
                             {t("grok.customContextWindowHint")}
                           </p>
                         </div>
@@ -10836,7 +11273,7 @@ supports_websockets = true`}
 
                     {/* Compaction — session-global auto-compact threshold. */}
                     <div className="space-y-1.5">
-                      <label className="text-[11px] text-muted-foreground">
+                      <label className="text-2xs text-muted-foreground">
                         {t("grok.autoCompactLabel")}
                       </label>
                       <Input
@@ -10855,7 +11292,7 @@ supports_websockets = true`}
                         aria-label={t("grok.autoCompactLabel")}
                         disabled={grokSaving}
                       />
-                      <p className="text-[11px] text-muted-foreground">
+                      <p className="text-2xs text-muted-foreground">
                         {t("grok.autoCompactHint")}
                       </p>
                     </div>
@@ -10872,7 +11309,7 @@ supports_websockets = true`}
                         <Button
                           variant="ghost"
                           size="sm"
-                          className="h-7 gap-1 px-1 text-[11px] text-muted-foreground"
+                          className="h-7 gap-1 px-1 text-2xs text-muted-foreground"
                         >
                           <ChevronRight
                             className={cn(
@@ -10884,7 +11321,7 @@ supports_websockets = true`}
                         </Button>
                       </CollapsibleTrigger>
                       <CollapsibleContent className="space-y-1.5 pt-2">
-                        <label className="text-[11px] text-muted-foreground">
+                        <label className="text-2xs text-muted-foreground">
                           {t("grok.configTomlNative")}
                         </label>
                         <Textarea
@@ -10902,7 +11339,7 @@ supports_websockets = true`}
                           aria-label={t("grok.configTomlNative")}
                           disabled={grokSaving}
                         />
-                        <p className="text-[11px] text-muted-foreground">
+                        <p className="text-2xs text-muted-foreground">
                           {t("grok.configTomlHint")}
                         </p>
                       </CollapsibleContent>
@@ -11065,7 +11502,7 @@ supports_websockets = true`}
                       <label className="text-xs font-medium">
                         {t("configManagement")}
                       </label>
-                      <p className="mt-1 text-[11px] text-muted-foreground">
+                      <p className="mt-1 text-2xs text-muted-foreground">
                         {selectedAgent.agent_type === "claude_code"
                           ? t("generalConfigDescriptionClaude")
                           : t("generalConfigDescriptionDefault")}
@@ -11074,7 +11511,7 @@ supports_websockets = true`}
 
                     {selectedAgent.agent_type === "claude_code" && (
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
+                        <label className="text-2xs text-muted-foreground">
                           {t("claude.authMode")}
                         </label>
                         <Select
@@ -11106,7 +11543,7 @@ supports_websockets = true`}
                             </SelectItem>
                           </SelectContent>
                         </Select>
-                        <p className="text-[11px] text-muted-foreground">
+                        <p className="text-2xs text-muted-foreground">
                           {selectedDraft.claudeAuthMode ===
                           "official_subscription"
                             ? t("claude.officialSubscriptionHint")
@@ -11120,7 +11557,7 @@ supports_websockets = true`}
                     {selectedAgent.agent_type === "claude_code" &&
                       selectedDraft.claudeAuthMode === "model_provider" && (
                         <div className="space-y-1.5">
-                          <label className="text-[11px] text-muted-foreground">
+                          <label className="text-2xs text-muted-foreground">
                             {t("selectModelProvider")}
                           </label>
                           {selectedModelProviders.length > 0 ? (
@@ -11149,7 +11586,7 @@ supports_websockets = true`}
                               </SelectContent>
                             </Select>
                           ) : (
-                            <p className="text-[11px] text-muted-foreground">
+                            <p className="text-2xs text-muted-foreground">
                               {t("noModelProviderAvailable")}
                             </p>
                           )}
@@ -11163,7 +11600,7 @@ supports_websockets = true`}
                         {importantFieldsFor(selectedAgent.agent_type)
                           .apiBaseUrl && (
                           <div className="space-y-1.5">
-                            <label className="text-[11px] text-muted-foreground">
+                            <label className="text-2xs text-muted-foreground">
                               API URL
                             </label>
                             <Input
@@ -11187,7 +11624,7 @@ supports_websockets = true`}
                         {importantFieldsFor(selectedAgent.agent_type)
                           .apiKey && (
                           <div className="space-y-1.5">
-                            <label className="text-[11px] text-muted-foreground">
+                            <label className="text-2xs text-muted-foreground">
                               API Key
                             </label>
                             <div className="flex items-center gap-2">
@@ -11244,7 +11681,7 @@ supports_websockets = true`}
                       <div className="space-y-2">
                         <div className="grid gap-3 md:grid-cols-2">
                           <div className="space-y-1.5">
-                            <label className="text-[11px] text-muted-foreground">
+                            <label className="text-2xs text-muted-foreground">
                               {t("claude.mainModel")}
                             </label>
                             <Input
@@ -11263,7 +11700,7 @@ supports_websockets = true`}
                             />
                           </div>
                           <div className="space-y-1.5">
-                            <label className="text-[11px] text-muted-foreground">
+                            <label className="text-2xs text-muted-foreground">
                               {t("claude.reasoningModel")}
                             </label>
                             <Input
@@ -11282,7 +11719,7 @@ supports_websockets = true`}
                             />
                           </div>
                           <div className="space-y-1.5">
-                            <label className="text-[11px] text-muted-foreground">
+                            <label className="text-2xs text-muted-foreground">
                               {t("claude.haikuDefaultModel")}
                             </label>
                             <Input
@@ -11301,7 +11738,7 @@ supports_websockets = true`}
                             />
                           </div>
                           <div className="space-y-1.5">
-                            <label className="text-[11px] text-muted-foreground">
+                            <label className="text-2xs text-muted-foreground">
                               {t("claude.sonnetDefaultModel")}
                             </label>
                             <Input
@@ -11320,7 +11757,7 @@ supports_websockets = true`}
                             />
                           </div>
                           <div className="space-y-1.5 md:col-span-2">
-                            <label className="text-[11px] text-muted-foreground">
+                            <label className="text-2xs text-muted-foreground">
                               {t("claude.opusDefaultModel")}
                             </label>
                             <Input
@@ -11339,13 +11776,13 @@ supports_websockets = true`}
                             />
                           </div>
                         </div>
-                        <p className="text-[11px] text-muted-foreground">
+                        <p className="text-2xs text-muted-foreground">
                           {t("modelHintDefault")}
                         </p>
                         <div className="space-y-2 border-t border-border/60 pt-3">
                           <div className="grid gap-3 md:grid-cols-2">
                             <div className="space-y-1.5 md:col-span-2">
-                              <label className="text-[11px] text-muted-foreground">
+                              <label className="text-2xs text-muted-foreground">
                                 {t("claude.customModelOption")}
                               </label>
                               <Input
@@ -11364,7 +11801,7 @@ supports_websockets = true`}
                               />
                             </div>
                             <div className="space-y-1.5">
-                              <label className="text-[11px] text-muted-foreground">
+                              <label className="text-2xs text-muted-foreground">
                                 {t("claude.customModelOptionName")}
                               </label>
                               <Input
@@ -11385,7 +11822,7 @@ supports_websockets = true`}
                               />
                             </div>
                             <div className="space-y-1.5">
-                              <label className="text-[11px] text-muted-foreground">
+                              <label className="text-2xs text-muted-foreground">
                                 {t("claude.customModelOptionDescription")}
                               </label>
                               <Input
@@ -11406,44 +11843,13 @@ supports_websockets = true`}
                               />
                             </div>
                           </div>
-                          <p className="text-[11px] text-muted-foreground">
+                          <p className="text-2xs text-muted-foreground">
                             {t("claude.customModelOptionHint")}
                           </p>
                         </div>
                         <div className="space-y-1.5">
-                          <label className="text-[11px] text-muted-foreground">
-                            {t("claude.effortLevel")}
-                          </label>
-                          <Select
-                            value={selectedDraft.claudeEffortLevel || "default"}
-                            onValueChange={(nextValue) => {
-                              handleClaudeEffortLevelChange(
-                                nextValue === "default"
-                                  ? ""
-                                  : (nextValue as ClaudeEffortLevel)
-                              )
-                            }}
-                          >
-                            <SelectTrigger className="w-full">
-                              <SelectValue
-                                placeholder={t("claude.effortLevelDefault")}
-                              />
-                            </SelectTrigger>
-                            <SelectContent align="start">
-                              <SelectItem value="default">
-                                {t("claude.effortLevelDefault")}
-                              </SelectItem>
-                              {CLAUDE_EFFORT_LEVEL_VALUES.map((value) => (
-                                <SelectItem key={value} value={value}>
-                                  {t(`claude.effortLevel_${value}`)}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                        </div>
-                        <div className="space-y-1.5">
                           <div className="flex items-center justify-between rounded-md border px-3 py-2">
-                            <label className="text-[11px] text-muted-foreground">
+                            <label className="text-2xs text-muted-foreground">
                               {t("claude.sendAttributionHeader")}
                             </label>
                             <Switch
@@ -11463,7 +11869,7 @@ supports_websockets = true`}
                         </div>
                         <div className="space-y-1.5">
                           <div className="flex items-center justify-between rounded-md border px-3 py-2">
-                            <label className="text-[11px] text-muted-foreground">
+                            <label className="text-2xs text-muted-foreground">
                               {t("claude.disableNonessentialTraffic")}
                             </label>
                             <Switch
@@ -11487,7 +11893,7 @@ supports_websockets = true`}
                     ) : (
                       importantFieldsFor(selectedAgent.agent_type).model && (
                         <div className="space-y-1.5">
-                          <label className="text-[11px] text-muted-foreground">
+                          <label className="text-2xs text-muted-foreground">
                             Model
                           </label>
                           <Input
@@ -11506,7 +11912,7 @@ supports_websockets = true`}
                     )}
 
                     <div className="space-y-1.5">
-                      <label className="text-[11px] text-muted-foreground">
+                      <label className="text-2xs text-muted-foreground">
                         {t("nativeJsonConfig")}
                       </label>
                       <Textarea
@@ -11525,7 +11931,7 @@ supports_websockets = true`}
                         className="min-h-36 font-mono text-xs"
                       />
                       {selectedConfigError && (
-                        <div className="rounded-md border border-red-500/30 bg-red-500/5 px-2.5 py-1.5 text-[11px] text-red-400">
+                        <div className="rounded-md border border-red-500/30 bg-red-500/5 px-2.5 py-1.5 text-2xs text-red-400">
                           {selectedConfigError}
                         </div>
                       )}
@@ -11846,7 +12252,7 @@ supports_websockets = true`}
             />
             {customVersionInput.trim() !== "" &&
               !isValidCustomVersion(customVersionInput) && (
-                <p className="text-[11px] text-red-500">
+                <p className="text-2xs text-red-500">
                   {t("dialogs.customInstallInvalid")}
                 </p>
               )}

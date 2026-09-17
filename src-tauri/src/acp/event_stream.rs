@@ -442,10 +442,10 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
                     .iter()
                     .map(|s| {
                         // Keys + braces + commas for every field (task_id,
-                        // status, summary, tool_use_id, result, wire_visible)
-                        // plus the `wire_visible` bool value and the element
-                        // comma — generously fixed so `estimate >= serialized`
-                        // holds for every present/absent optional combination.
+                        // status, summary, tool_use_id, result) plus the
+                        // element comma — generously fixed so `estimate >=
+                        // serialized` holds for every present/absent optional
+                        // combination.
                         128 + json_str_len(&s.task_id)
                             + json_str_len(&s.status)
                             + opt_str_size(&s.summary)
@@ -1018,6 +1018,7 @@ mod tests {
             duration_ms: Some(u64::MAX),
             model: Some("claude-sonnet-5[1m]".into()),
             completed_at: Some(chrono::Utc::now()),
+        agent_message_id: None,
         };
         let env = Arc::new(EventEnvelope {
             seq: u64::MAX,
@@ -1035,7 +1036,6 @@ mod tests {
                         // Escape-heavy + large, to exercise the estimate's
                         // coverage of the (previously omitted) `result` field.
                         result: Some("Build \"log\"\n\t".repeat(2048)),
-                        wire_visible: true,
                     },
                     crate::acp::types::BackgroundSettledInfo {
                         task_id: "bipkee1pw".into(),
@@ -1043,7 +1043,6 @@ mod tests {
                         summary: None,
                         tool_use_id: None,
                         result: None,
-                        wire_visible: false,
                     },
                 ],
                 watermark: u64::MAX,

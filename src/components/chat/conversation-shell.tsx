@@ -1,3 +1,4 @@
+import type { ConversationFolderPickerOverride } from "@/components/chat/conversation-context-bar"
 import { useMemo, type ReactNode } from "react"
 import { useTranslations } from "next-intl"
 import type {
@@ -11,12 +12,14 @@ import type {
   PromptInputBlock,
   QuestionAnswer,
   SessionConfigOptionInfo,
+  AsyncTaskRecord,
   SessionFailureRecord,
   SessionModeInfo,
   AvailableCommandInfo,
 } from "@/lib/types"
 import type { SessionFailureAction } from "@/lib/session-failures"
 import { SessionFailureBanner } from "@/components/chat/session-failure-banner"
+import { AsyncTaskStrip } from "@/components/chat/async-task-strip"
 import type {
   PendingPermission,
   PendingQuestion,
@@ -25,6 +28,7 @@ import type {
 import type { QueuedMessage } from "@/hooks/use-message-queue"
 import { Loader2 } from "lucide-react"
 import { ChatInput } from "@/components/chat/chat-input"
+import type { ComposerInjectContent } from "@/components/chat/message-input"
 import { PermissionDialog } from "@/components/chat/permission-dialog"
 import { QuestionDialog } from "@/components/chat/question-dialog"
 import { AskQuestionCard } from "@/components/chat/ask-question-card"
@@ -50,6 +54,12 @@ interface ConversationShellProps {
    *  every surface with a live store — dismissing is client-local, so viewers
    *  get it too. */
   onSessionFailureDismiss?: (ids: string[]) => void
+  /** AIR async tasks for this connection. The strip filters to the live ones
+   *  itself; omit/empty renders nothing. */
+  asyncTasks?: AsyncTaskRecord[]
+  /** Stops one async task. Omitted for read-only surfaces — the stop buttons
+   *  are then hidden, which is right: a viewer has no connection to ask. */
+  onStopAsyncTask?: (taskId: string) => Promise<boolean>
   pendingPermission: PendingPermission | null
   pendingQuestion: PendingQuestion | null
   /** Awaiting-answer multiple-choice `ask_user_question`. */
@@ -81,7 +91,11 @@ interface ConversationShellProps {
   agentType?: AgentType | null
   availableCommands?: AvailableCommandInfo[] | null
   attachmentTabId?: string | null
+  /** Pass-through: see `MessageInput`. */
+  folderPickerOverride?: ConversationFolderPickerOverride
   draftStorageKey?: string | null
+  /** Pass-through: see `MessageInput.getSentHistory`. */
+  getSentHistory?: () => string[]
   hideInput?: boolean
   /** Optional banner rendered in the composer dock, where the input sits.
    *  Used with `hideInput` to explain WHY the composer is unavailable (e.g.
@@ -106,21 +120,37 @@ interface ConversationShellProps {
   onQueueReorder?: (items: QueuedMessage[]) => void
   onQueueEdit?: (id: string) => void
   onQueueDelete?: (id: string) => void
+  /** Insert one queued item into the RUNNING turn over the session's
+   *  live-feedback channel; threaded straight through to the composer's
+   *  queue list. See `ChatInputProps.onQueueSteer`. */
+  onQueueSteer?: (id: string) => Promise<void> | void
   editingItemId?: string | null
   editingDraftText?: string | null
   editingDraftBlocks?: PromptInputBlock[] | null
   isEditingQueueItem?: boolean
   onSaveQueueEdit?: (draft: PromptDraft) => void
   onCancelQueueEdit?: () => void
-  onForkSend?: (draft: PromptDraft, modeId?: string | null) => void
-  /** Inject the draft's text into the RUNNING turn (native live-feedback
-   *  steering). Present only for sessions on the native channel; threaded
-   *  straight through to the composer. */
-  onSteer?: (text: string) => Promise<void>
+  /** Send the draft into the RUNNING turn over the session's live-feedback
+   *  channel. Present only for sessions with a working delivery channel;
+   *  threaded straight through to the composer. `blocks` carries the full
+   *  draft when it holds more than plain text (image attachments, file
+   *  badges); `text` stays the recorded/display form. Must stay in sync with
+   *  `MessageInputProps.onSteer` — the optional second parameter makes a
+   *  stale one-arg declaration here assignable, so tsc would NOT catch a
+   *  wrapper that silently drops the blocks. */
+  onSteer?: (text: string, blocks?: PromptInputBlock[]) => Promise<void>
+  /** Which channel `onSteer` rides (picks the composer's honest copy);
+   *  threaded straight through. See `MessageInput`. */
+  steerChannel?: "native" | "pull"
   /** Optional banner pinned to the top of the panel, above the message area
    *  (e.g. the "restart to apply" config-stale banner). Renders nothing when
    *  omitted. */
   topBanner?: ReactNode
+  /** Content pushed into the docked composer from outside it — currently a
+   *  quoted transcript selection. Cleared by the host via `onInjectConsumed`
+   *  once the composer has taken it. */
+  injectContent?: ComposerInjectContent | null
+  onInjectConsumed?: () => void
 }
 
 export function ConversationShell({
@@ -133,6 +163,8 @@ export function ConversationShell({
   sessionFailures,
   onSessionFailureAction,
   onSessionFailureDismiss,
+  asyncTasks,
+  onStopAsyncTask,
   pendingPermission,
   pendingQuestion,
   pendingAskQuestion,
@@ -156,7 +188,9 @@ export function ConversationShell({
   agentType,
   availableCommands,
   attachmentTabId,
+  folderPickerOverride,
   draftStorageKey,
+  getSentHistory,
   hideInput = false,
   composerBanner,
   feedbackList,
@@ -169,15 +203,18 @@ export function ConversationShell({
   onQueueReorder,
   onQueueEdit,
   onQueueDelete,
+  onQueueSteer,
   editingItemId,
   editingDraftText,
   editingDraftBlocks,
   isEditingQueueItem,
   onSaveQueueEdit,
   onCancelQueueEdit,
-  onForkSend,
   onSteer,
+  steerChannel,
   topBanner,
+  injectContent,
+  onInjectConsumed,
 }: ConversationShellProps) {
   const tAcp = useTranslations("Folder.chat.acpConnections")
   const retryLineText = useMemo(() => {
@@ -196,7 +233,11 @@ export function ConversationShell({
       retry.retryDelayMs !== null && retry.retryDelayMs !== undefined
         ? (retry.retryDelayMs / 1000).toFixed(1)
         : null
-    const errorLabel = retry.error ?? tAcp("claudeApiRetry.fallbackError")
+    // `null` only for a source that reports no cause at all (pi, #525) — see
+    // `ClaudeApiRetryState.reportsError`. Claude and codex keep the fallback.
+    const errorLabel =
+      retry.error ??
+      (retry.reportsError ? tAcp("claudeApiRetry.fallbackError") : null)
     const statusLabel =
       retry.errorStatus !== null && retry.errorStatus !== undefined
         ? tAcp("claudeApiRetry.httpStatus", {
@@ -221,15 +262,27 @@ export function ConversationShell({
           })
         : null
 
+    // With no cause AND no HTTP status there is nothing to put before the
+    // separator, and the shared template would render a dangling "· 正在重试".
+    // Take the prefix-less pair instead — the counters carry the whole message.
+    if (errorLabel === null && statusLabel === "") {
+      return delayLabel !== null
+        ? tAcp("claudeApiRetry.lineNoErrorWithDelay", {
+            retry: retryLabel,
+            delay: delayLabel,
+          })
+        : tAcp("claudeApiRetry.lineNoError", { retry: retryLabel })
+    }
+
     return delayLabel !== null
       ? tAcp("claudeApiRetry.lineWithDelay", {
-          error: errorLabel,
+          error: errorLabel ?? "",
           status: statusLabel,
           retry: retryLabel,
           delay: delayLabel,
         })
       : tAcp("claudeApiRetry.line", {
-          error: errorLabel,
+          error: errorLabel ?? "",
           status: statusLabel,
           retry: retryLabel,
         })
@@ -238,11 +291,22 @@ export function ConversationShell({
   return (
     <div className="relative flex h-full min-h-0 flex-col">
       {topBanner}
+
+      {/* Above the transcript, not down in the composer dock: this is the state
+          of work running RIGHT NOW, and pinning it here keeps it still while the
+          messages scroll under it — the stop button doesn't move out from under
+          the pointer. The dock below is for things that come and go with the
+          turn (retry line, last error). */}
+      {asyncTasks && asyncTasks.length > 0 && (
+        <AsyncTaskStrip tasks={asyncTasks} onStop={onStopAsyncTask} />
+      )}
+
       <div className="flex-1 min-h-0">{children}</div>
 
       <PermissionDialog
         permission={pendingPermission}
         onRespond={onRespondPermission}
+        agentType={agentType}
       />
 
       <QuestionDialog question={pendingQuestion} onAnswer={onAnswerQuestion} />
@@ -303,7 +367,9 @@ export function ConversationShell({
               agentType={agentType}
               availableCommands={availableCommands}
               attachmentTabId={attachmentTabId}
+              folderPickerOverride={folderPickerOverride}
               draftStorageKey={draftStorageKey}
+              getSentHistory={getSentHistory}
               isActive={isActive}
               showActiveFlow={showActiveFlow}
               queue={queue}
@@ -311,16 +377,19 @@ export function ConversationShell({
               onQueueReorder={onQueueReorder}
               onQueueEdit={onQueueEdit}
               onQueueDelete={onQueueDelete}
+              onQueueSteer={onQueueSteer}
               editingItemId={editingItemId}
               editingDraftText={editingDraftText}
               editingDraftBlocks={editingDraftBlocks}
               isEditingQueueItem={isEditingQueueItem}
               onSaveQueueEdit={onSaveQueueEdit}
               onCancelQueueEdit={onCancelQueueEdit}
-              onForkSend={onForkSend}
               onSteer={onSteer}
+              steerChannel={steerChannel}
               onAddFeedback={onAddFeedback}
               feedbackAddDisabled={feedbackAddDisabled}
+              injectContent={injectContent}
+              onInjectConsumed={onInjectConsumed}
             />
           </div>
         )}

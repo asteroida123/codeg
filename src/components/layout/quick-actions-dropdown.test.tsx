@@ -2,7 +2,6 @@ import { render, screen } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi } from "vitest"
-import type { FolderDetail } from "@/lib/types"
 
 // The menu is a thin router over existing entry points, so every one of them is
 // stubbed: the test's job is to prove each row reaches the right door (and that
@@ -14,12 +13,10 @@ const mocks = vi.hoisted(() => {
   ]
   return {
     connections,
-    openImportSessionsWindow: vi.fn(),
     openProjectBootWindow: vi.fn(() => Promise.resolve()),
     openPetWindow: vi.fn(() => Promise.resolve()),
     openRemoteWorkspace: vi.fn(() => Promise.resolve()),
     listRemoteWorkspaceConnections: vi.fn(() => Promise.resolve(connections)),
-    setSearchOpen: vi.fn(),
     setRoute: vi.fn(),
   }
 })
@@ -28,7 +25,6 @@ let desktop = true
 vi.mock("@/lib/platform", () => ({ isDesktop: () => desktop }))
 
 vi.mock("@/lib/api", () => ({
-  openImportSessionsWindow: mocks.openImportSessionsWindow,
   openProjectBootWindow: mocks.openProjectBootWindow,
 }))
 
@@ -37,18 +33,6 @@ vi.mock("@/lib/pet/api", () => ({ openPetWindow: mocks.openPetWindow }))
 vi.mock("@/lib/remote-workspace", () => ({
   listRemoteWorkspaceConnections: mocks.listRemoteWorkspaceConnections,
   openRemoteWorkspace: mocks.openRemoteWorkspace,
-}))
-
-let activeFolder: FolderDetail | null = null
-vi.mock("@/contexts/active-folder-context", () => ({
-  useActiveFolder: () => ({
-    activeFolder,
-    activeFolderId: activeFolder?.id ?? null,
-  }),
-}))
-
-vi.mock("@/contexts/search-dialog-context", () => ({
-  useSearchDialog: () => ({ open: false, setOpen: mocks.setSearchOpen }),
 }))
 
 vi.mock("@/contexts/automations-view-context", () => ({
@@ -80,16 +64,9 @@ vi.mock("./remote-workspace-manage-dialog", () => ({
   RemoteWorkspaceManageDialog: ({ open }: { open: boolean }) =>
     open ? <div>REMOTE-MANAGE-DIALOG</div> : null,
 }))
-vi.mock("@/components/conversations/conversation-manage-dialog", () => ({
-  ConversationManageDialog: ({ folderId }: { folderId: number }) => (
-    <div>MANAGE-DIALOG-{folderId}</div>
-  ),
-}))
 
 import { QuickActionsDropdown } from "./quick-actions-dropdown"
 import enMessages from "@/i18n/messages/en.json"
-
-const FOLDER = { id: 7, name: "repo", path: "/tmp/repo" } as FolderDetail
 
 /** Mount once, then open the (single) trigger. */
 async function mountAndOpen() {
@@ -113,23 +90,18 @@ async function clickItem(name: string | RegExp) {
 // "Automations" carries a failure-count badge inside the row (2, per the mock),
 // so its accessible name is the label plus that number — matched by prefix.
 const AUTOMATIONS_ROW = /^Automations/
+const FORGE_ROW = "Repository panel"
 
 beforeEach(() => {
   desktop = true
-  activeFolder = null
   vi.clearAllMocks()
 })
 
 describe("QuickActionsDropdown", () => {
-  it("groups all ten actions under their headings on desktop", async () => {
+  it("groups all eight actions under their headings on desktop", async () => {
     await mountAndOpen()
 
-    for (const group of [
-      "Workspace",
-      "Sessions",
-      "Automation & to-dos",
-      "More",
-    ]) {
+    for (const group of ["Workspace", "Navigation", "More"]) {
       expect(await screen.findByText(group)).toBeVisible()
     }
     for (const label of [
@@ -137,25 +109,49 @@ describe("QuickActionsDropdown", () => {
       "Clone Repository",
       "Project Boot",
       "Open remote workspace",
-      "Manage conversations",
-      "Import local sessions",
-      "Search",
       AUTOMATIONS_ROW,
       "To-dos",
+      FORGE_ROW,
       "Show pet",
     ]) {
       expect(await screen.findByRole("menuitem", { name: label })).toBeVisible()
     }
   })
 
+  it("has no Search row — that button is always visible in the chrome", async () => {
+    await mountAndOpen()
+    // Every other entry here is a fallback for a home that disappears with the
+    // sidebar; search's home (LeftEdgeChrome / FolderTitleBar) never does.
+    expect(screen.queryByRole("menuitem", { name: "Search" })).toBeNull()
+  })
+
+  it("has no folder-scoped session rows", async () => {
+    await mountAndOpen()
+    // Manage conversations / Import local sessions act on ONE folder, so their
+    // homes are the folder row's context menu and the Folders section header —
+    // both of which are reachable without this launcher. A copy here would only
+    // ever act on whatever folder happened to be active.
+    expect(screen.queryByText("Sessions")).toBeNull()
+    expect(
+      screen.queryByRole("menuitem", { name: "Manage conversations" })
+    ).toBeNull()
+    expect(
+      screen.queryByRole("menuitem", { name: "Import local sessions" })
+    ).toBeNull()
+  })
+
   it("drops the desktop-only rows in web mode", async () => {
     desktop = false
     await mountAndOpen()
 
-    // The remaining eight still render, so this is a targeted removal rather
-    // than the menu failing to open.
+    // The remaining six still render, so this is a targeted removal rather
+    // than the menu failing to open. The navigation rows in particular are
+    // platform-neutral route switches and must survive off the desktop.
     expect(
-      await screen.findByRole("menuitem", { name: "Search" })
+      await screen.findByRole("menuitem", { name: "Open Folder" })
+    ).toBeVisible()
+    expect(
+      await screen.findByRole("menuitem", { name: FORGE_ROW })
     ).toBeVisible()
     expect(
       screen.queryByRole("menuitem", { name: "Open remote workspace" })
@@ -165,22 +161,10 @@ describe("QuickActionsDropdown", () => {
   })
 
   it("routes each action to its own entry point", async () => {
-    activeFolder = FOLDER
     await mountAndOpen()
 
-    await clickItem("Search")
-    expect(mocks.setSearchOpen).toHaveBeenCalledWith(true)
-
-    await reopen()
     await clickItem(AUTOMATIONS_ROW)
     expect(mocks.setRoute).toHaveBeenCalledWith("automations")
-
-    await reopen()
-    await clickItem("Import local sessions")
-    // Anchored on the active folder, like the folder context-menu entry.
-    expect(mocks.openImportSessionsWindow).toHaveBeenCalledWith({
-      focusPath: "/tmp/repo",
-    })
 
     await reopen()
     await clickItem("Project Boot")
@@ -189,6 +173,10 @@ describe("QuickActionsDropdown", () => {
     await reopen()
     await clickItem("To-dos")
     expect(mocks.setRoute).toHaveBeenCalledWith("tasks")
+
+    await reopen()
+    await clickItem(FORGE_ROW)
+    expect(mocks.setRoute).toHaveBeenCalledWith("forge")
 
     await reopen()
     await clickItem("Show pet")
@@ -222,22 +210,6 @@ describe("QuickActionsDropdown", () => {
     )
     await clickItem("Manage remote workspace")
     expect(await screen.findByText("REMOTE-MANAGE-DIALOG")).toBeVisible()
-  })
-
-  it("opens the conversation manager scoped to the active folder", async () => {
-    activeFolder = FOLDER
-    await mountAndOpen()
-
-    await clickItem("Manage conversations")
-    expect(await screen.findByText("MANAGE-DIALOG-7")).toBeVisible()
-  })
-
-  it("disables conversation management with no active folder", async () => {
-    await mountAndOpen()
-
-    expect(
-      await screen.findByRole("menuitem", { name: "Manage conversations" })
-    ).toHaveAttribute("data-disabled")
   })
 
   it("opens the folder and clone dialogs from their rows", async () => {

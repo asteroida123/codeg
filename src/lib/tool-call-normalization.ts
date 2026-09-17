@@ -20,6 +20,14 @@ const EXACT_TOOL_NAME_ALIASES: Record<string, string> = {
   // Terminal card. Cursor's other tool names (read/edit/grep/glob/ls) already
   // match their canonical kinds verbatim.
   shell: "bash",
+  // Antigravity calls its terminal tool `run_command`, which is the name its
+  // history parser reads back out of the trajectory (`parsers/antigravity.rs`).
+  // The LIVE stream never sends it: `tools.py::extract_tool_display_title`
+  // replaces the title with the command string itself ("so IDEs render the
+  // command inside the terminal box"), so the live path has to classify on the
+  // input shape instead — see the `command_line` / `CommandLine` keys in
+  // `inferFromInput`. Both paths land on the same Terminal card.
+  run_command: "bash",
   exec_command: "exec_command",
   "functions.exec_command": "exec_command",
   "functions.read": "read",
@@ -102,6 +110,17 @@ const EXACT_TOOL_NAME_ALIASES: Record<string, string> = {
   mcp__codeg__delegate_to_agent: "delegate_to_agent",
   get_delegation_status: "get_delegation_status",
   cancel_delegation: "cancel_delegation",
+  resume_delegation: "resume_delegation",
+  // codeg-mcp workbench companions (session lookup, work-task reporting, chat
+  // authoring). Listed explicitly because the freeform `^task(\b|[_\s:-])` rule
+  // below would otherwise collapse `task_progress` / `task_complete` into the
+  // generic "task" tool and strand them on the generic tool shell. The suffix
+  // rules in `normalizeToolName` cover the `mcp__<server>__…` forms.
+  get_session_info: "get_session_info",
+  task_progress: "task_progress",
+  task_complete: "task_complete",
+  create_automation: "create_automation",
+  create_work_task: "create_work_task",
   // codeg-mcp live-feedback poll (server prefix varies by host; the suffix rule
   // in `normalizeToolName` covers the other separators). Codex persists it under
   // the bare `check_user_feedback` name, dropping the `mcp__codeg_mcp` namespace.
@@ -239,6 +258,42 @@ function hasAnyKey(obj: Record<string, unknown>, keys: string[]): boolean {
 }
 
 /**
+ * Codex ACP uses human titles for web-search follow-up actions. Those frames
+ * keep `kind: "search"` (the same kind used by local fuzzy-file search), so
+ * the title is the only identity signal when the raw-input type is omitted on
+ * session replay.
+ */
+function isCodexWebSearchTitle(input: string | null | undefined): boolean {
+  const title = input?.trim()
+  if (!title) return false
+  return /^(?:web\s+search|open\s+page|find\s+in\s+page)(?:\s*:|\s|$)/i.test(
+    title
+  )
+}
+
+/**
+ * Gemini's web-search title, for the same reason Codex needs one above: its
+ * `google_web_search` tool reports `kind: "search"` — the kind it also uses for
+ * glob and grep — so the title is the only thing that says "web". The format is
+ * `Searching the web for: "<query>"`, straight from the tool's own
+ * `getDescription()` (packages/core/src/tools/web-search.ts, gemini-cli 0.60.0).
+ *
+ * Anchored at the start so an assistant or MCP tool that merely mentions the
+ * phrase mid-title is not swept in.
+ */
+function isGeminiWebSearchTitle(input: string | null | undefined): boolean {
+  const title = input?.trim()
+  if (!title) return false
+  return /^searching\s+the\s+web\s+for\s*:/i.test(title)
+}
+
+/** Codex's raw-input marker is camelCase on the ACP wire (`webSearch`). */
+function isCodexWebSearchType(input: unknown): boolean {
+  if (typeof input !== "string") return false
+  return canonicalizeToolName(input).replace(/_/g, "") === "websearch"
+}
+
+/**
  * Wire spellings that mean the same argument as one of the canonical
  * (snake_case) keys every tool card reads. OpenCode names its tool arguments in
  * camelCase and its ACP adapter forwards them verbatim, so the LIVE stream
@@ -341,6 +396,15 @@ function inferFromInput(
       "args",
       "argv",
       "command_args",
+      // Antigravity's exec tools, in both spellings that reach a client: the
+      // SDK hands the EXECUTED call `command_line`/`working_dir`, while the
+      // model's own envelope — what a permission-prompt frame carries, and
+      // what the trajectory stores — is PascalCase `CommandLine`/`Cwd`. Input
+      // shape is the only signal available: the live title IS the command
+      // (see the `run_command` alias above), so every title-based rule would
+      // name the tool "pnpm build".
+      "command_line",
+      "CommandLine",
     ])
   )
     return "bash"
@@ -361,7 +425,24 @@ function inferFromInput(
     return "edit"
   if (hasAnyKey(parsed, ["changes"])) return "edit"
   if (hasAnyKey(parsed, ["todos"])) return "todowrite"
-  if (hasAnyKey(parsed, ["query"])) return "websearch"
+  // `query` is a common MCP argument (for example CodeGraph's
+  // `codegraph_explore` and Context7's query tools), not a web-search
+  // discriminator. Only classify it as websearch when the wire also names a
+  // web-search tool, or when Codex's action title/type identifies the call;
+  // otherwise `inferLiveToolName` can preserve the explicit tool title instead
+  // of showing every query-bearing MCP call as "WebSearch". Codex's generic
+  // `kind: "search"` intentionally remains a local file search (`grep`).
+  if (
+    hasAnyKey(parsed, ["query"]) &&
+    (normalizedTitle === "websearch" ||
+      normalizedTitle === "web_search" ||
+      normalizedKind === "websearch" ||
+      normalizedKind === "web_search" ||
+      isCodexWebSearchTitle(title) ||
+      isGeminiWebSearchTitle(title) ||
+      isCodexWebSearchType(parsed.type))
+  )
+    return "websearch"
   if (hasAnyKey(parsed, ["url"])) return "webfetch"
 
   const hasPattern = hasAnyKey(parsed, ["pattern"])
@@ -479,8 +560,17 @@ export function normalizeToolName(toolName: string): string {
   if (/[^a-z0-9]get_delegation_status$/.test(canonical))
     return "get_delegation_status"
   if (/[^a-z0-9]cancel_delegation$/.test(canonical)) return "cancel_delegation"
+  if (/[^a-z0-9]resume_delegation$/.test(canonical)) return "resume_delegation"
   if (/[^a-z0-9]create_goal$/.test(canonical)) return "create_goal"
   if (/[^a-z0-9]update_goal$/.test(canonical)) return "update_goal"
+
+  // codeg-mcp workbench companions — same host-prefix story as the delegation
+  // tools above (`mcp__<server>__get_session_info`, `<server>/task_progress`, …).
+  if (/[^a-z0-9]get_session_info$/.test(canonical)) return "get_session_info"
+  if (/[^a-z0-9]task_progress$/.test(canonical)) return "task_progress"
+  if (/[^a-z0-9]task_complete$/.test(canonical)) return "task_complete"
+  if (/[^a-z0-9]create_automation$/.test(canonical)) return "create_automation"
+  if (/[^a-z0-9]create_work_task$/.test(canonical)) return "create_work_task"
 
   // codeg-mcp ask-user-question companion tool. Same host-prefix story as the
   // delegation tools above (`mcp__<server>__ask_user_question`,
@@ -507,13 +597,17 @@ export function normalizeToolName(toolName: string): string {
   return trimmed
 }
 
-// Canonical names of the codeg-mcp delegation companion tools. Each has a
-// dedicated card renderer, so its identity must win over input-shape
-// heuristics during live streaming (see `inferLiveToolName`).
+// Canonical names of the codeg-mcp delegation companion tools. Their identity
+// must win over input-shape heuristics during live streaming (see
+// `inferLiveToolName`): most have a dedicated card renderer, and
+// `resume_delegation`'s `{task_id, reason}` input would otherwise be
+// misclassified by `inferFromInput` exactly like `cancel_delegation`'s
+// `{task_id}` (generic "task" tool).
 const DELEGATION_COMPANION_TOOLS: ReadonlySet<string> = new Set([
   "delegate_to_agent",
   "get_delegation_status",
   "cancel_delegation",
+  "resume_delegation",
 ])
 
 export function inferLiveToolName(params: {
@@ -558,19 +652,22 @@ export function inferLiveToolName(params: {
 
   // The codeg-mcp delegation companion tools carry their authoritative identity
   // in `meta.claudeCode.toolName` — claude-agent-acp sets it to the raw
-  // `mcp__<server>__<tool>` name for every MCP call. Resolve them FIRST, ahead
-  // of `inferFromInput`, so the live stream routes into the same delegation
-  // cards the historical path resolves from the raw tool name. Without this,
-  // `cancel_delegation` (input `{task_id}`) gets misclassified by
-  // `inferFromInput` as the generic "task" tool (shown as "任务" with no detail),
-  // and `get_delegation_status` (input `{task_ids}`) falls through unclassified —
-  // both need meta to resolve to the canonical companion tool name.
+  // `mcp__<server>__<tool>` name for every MCP call — and, on Qoder, in
+  // `meta.qoder.toolName`. Resolve them FIRST, ahead of `inferFromInput`, so the
+  // live stream routes into the same delegation cards the historical path
+  // resolves from the raw tool name. Without this, `cancel_delegation` (input
+  // `{task_id}`) gets misclassified by `inferFromInput` as the generic "task"
+  // tool (shown as "任务" with no detail), and `get_delegation_status` (input
+  // `{task_ids}`) falls through unclassified — both need meta to resolve to the
+  // canonical companion tool name.
   // Scoped to these three so the documented input-shape-first ordering below
   // (notably Claude Code's `Task` → "agent" via `subagent_type`, whose meta
   // name is "Task" — not a delegation tool) is preserved for everything else.
   const metaToolName = extractClaudeCodeToolName(params.meta)
-  if (metaToolName) {
-    const normalizedMeta = normalizeToolName(metaToolName)
+  const qoderToolName = extractQoderToolName(params.meta)
+  for (const candidate of [metaToolName, qoderToolName]) {
+    if (!candidate) continue
+    const normalizedMeta = normalizeToolName(candidate)
     if (DELEGATION_COMPANION_TOOLS.has(normalizedMeta)) return normalizedMeta
   }
 
@@ -611,6 +708,24 @@ export function inferLiveToolName(params: {
   // carries no `subagent` flag.
   if (claudeCodeMarksSubagent(params.meta)) return "agent"
 
+  // OpenCode's authoritative tool name, recorded by the backend from the one
+  // frame that carries it (`stamp_opencode_tool_name`). This is the exception
+  // to the input-shape-first ordering below, and deliberately so: OpenCode's
+  // completion frame drops `kind`/`rawInput` and rewrites `title` into a
+  // display label, so the input shape is ALL that survives — and several of its
+  // tools are ambiguous under it. Measured against opencode 1.18.30's real
+  // frames, `glob` ({pattern}) resolved to "grep", `lsp_diagnostics` ({path}) to
+  // "read", and an MCP tool taking {query} to "websearch" — each of which the
+  // history parser (reading `part.tool`) names correctly, so the same call
+  // changed identity on reload.
+  //
+  // Placed AFTER the `title === "agent"` sentinel at the top, which is what
+  // keeps OpenCode's own sub-agent `task` call on the Agent card: the backend
+  // rewrites that title once `rawInput.subagent_type` arrives, and the marker
+  // here (recorded from the arg-less opening frame) must not undo it.
+  const openCodeToolName = extractOpenCodeToolName(params.meta)
+  if (openCodeToolName) return normalizeToolName(openCodeToolName)
+
   // Input-shape detection runs FIRST so cross-agent heuristics (Claude Code
   // `Task` tool routed via `subagent_type`, OpenCode sub-agent calls, etc.)
   // keep priority. The meta-tool-name override below only kicks in when the
@@ -650,6 +765,28 @@ export function inferLiveToolName(params: {
   const grokToolName = extractGrokToolName(params.meta)
   if (grokToolName) return normalizeToolName(grokToolName)
 
+  // Qoder stamps the authoritative tool name in `_meta.qoder.toolName` on EVERY
+  // `tool_call` (`AOn` in its ACP bridge), while the `title` it ships for an MCP
+  // call is a human sentence — `"<tool> (<server> MCP Server)"` — that no
+  // suffix/alias rule can collapse. Without this, every codeg-mcp companion but
+  // `delegate_to_agent` (rescued by the broker's `codeg.delegation` marker
+  // above) fell through to the generic tool shell: `get_session_info` /
+  // `task_progress` / `check_user_feedback` kept the sentence as their "name",
+  // so their cards never matched — while the historical path, which reads the
+  // raw `mcp__codeg-mcp__<tool>` name straight out of the transcript, rendered
+  // them correctly. Same placement as the Grok override: AFTER `inferFromInput`,
+  // so every input-shape classification Qoder's own tools rely on is preserved
+  // (`Agent` → "agent" via `subagent_type`, `TodoWrite` → "todowrite" via
+  // `todos`, …) and this only decides the cases where the input shape is silent.
+  //
+  // Lower-cased for the same reason the claude-agent-acp branch above is: Qoder
+  // names its native tools in CamelCase (`ExitPlanMode`, `Workflow`), and
+  // `normalizeToolName` passes an unmatched name through with its case intact —
+  // but every other return here is lower-case, and some consumers compare
+  // case-sensitively. Display is unaffected: the header prefers the ACP `title`,
+  // which Qoder always sends.
+  if (qoderToolName) return normalizeToolName(qoderToolName).toLowerCase()
+
   // codex-acp ≥1.1.8 Plan-mode review gate. The backend seeds this tool call
   // from the `session/request_permission` (see `is_codex_plan_review`), so it
   // carries no `rawInput` and its human title is a question ("Implement this
@@ -676,6 +813,52 @@ function extractClaudeCodeToolName(
   const tn = (cc as Record<string, unknown>).toolName
   if (typeof tn !== "string") return null
   const trimmed = tn.trim()
+  return trimmed.length > 0 ? trimmed : null
+}
+
+/**
+ * Qoder's authoritative tool name from `_meta.qoder.toolName` — the raw SDK name
+ * (`Bash`, `TodoWrite`, `mcp__codeg-mcp__get_delegation_status`, …) its ACP
+ * bridge attaches to every `tool_call` it emits, and the same name its history
+ * parser reads back out of the transcript. Unlike `title`, it neither mutates
+ * across the call's lifecycle nor gets rewritten into a human sentence.
+ *
+ * Only the OPENING `tool_call` carries it — Qoder's `tool_call_update` frames
+ * ship status/output only — which is fine: the reducer preserves a block's meta
+ * when an update omits it.
+ */
+function extractQoderToolName(
+  meta: Record<string, unknown> | null | undefined
+): string | null {
+  if (!meta || typeof meta !== "object") return null
+  const qoder = (meta as Record<string, unknown>).qoder
+  if (!qoder || typeof qoder !== "object") return null
+  const name = (qoder as Record<string, unknown>).toolName
+  if (typeof name !== "string") return null
+  const trimmed = name.trim()
+  return trimmed.length > 0 ? trimmed : null
+}
+
+/**
+ * OpenCode's authoritative tool name from `_meta.opencode.toolName` — the raw
+ * tool id (`glob`, `lsp_diagnostics`, `context7_query-docs`, …) codeg's backend
+ * lifts off the opening `tool_call` frame, which is the only frame OpenCode
+ * states it on (see `stamp_opencode_tool_name` for the captured wire evidence).
+ * The same name the history parser reads out of `part.tool`, so both paths land
+ * on the same card.
+ *
+ * Only the OPENING frame carries it; the reducer preserves a block's `meta`
+ * when an update omits it, so it stays available for the call's whole lifetime.
+ */
+function extractOpenCodeToolName(
+  meta: Record<string, unknown> | null | undefined
+): string | null {
+  if (!meta || typeof meta !== "object") return null
+  const opencode = (meta as Record<string, unknown>).opencode
+  if (!opencode || typeof opencode !== "object") return null
+  const name = (opencode as Record<string, unknown>).toolName
+  if (typeof name !== "string") return null
+  const trimmed = name.trim()
   return trimmed.length > 0 ? trimmed : null
 }
 
@@ -746,6 +929,39 @@ export function extractClaudeCodeSkillName(
   if (typeof skill !== "string") return null
   const trimmed = skill.trim()
   return trimmed.length > 0 ? trimmed : null
+}
+
+/**
+ * Whether the agent has moved this tool call's process into the background —
+ * JetBrains AIR's `_meta.jetbrains.air.asyncTasks.backgrounded` marker
+ * (codex-acp 1.10+, published only because `build_client_capabilities`
+ * advertises the `asyncTasks` capability).
+ *
+ * It arrives on a `tool_call_update` that carries NOTHING else: no status, no
+ * content, no output — just the id and this flag, immediately before the
+ * matching `async_task_spawned`. That is the point of reading it: the launching
+ * `execute` call stays `in_progress` for the rest of the connection (codex only
+ * completes it when the process finally exits or a stop lands), so without the
+ * marker the card is indistinguishable from a command that hung.
+ *
+ * Two shape notes, both load-bearing:
+ *   - there is NO `version` key inside this `air` block — unlike its
+ *     `sessionFailure` sibling — so nothing here may gate on one;
+ *   - the flag is only ever published as `true`; the adapter withdraws it by
+ *     settling the tool call, never by sending `false`. Strict equality anyway,
+ *     so a future `false` reads as "not backgrounded" rather than truthy.
+ */
+export function toolCallMovedToBackground(
+  meta: Record<string, unknown> | null | undefined
+): boolean {
+  if (!meta || typeof meta !== "object") return false
+  const jetbrains = (meta as Record<string, unknown>).jetbrains
+  if (!jetbrains || typeof jetbrains !== "object") return false
+  const air = (jetbrains as Record<string, unknown>).air
+  if (!air || typeof air !== "object") return false
+  const asyncTasks = (air as Record<string, unknown>).asyncTasks
+  if (!asyncTasks || typeof asyncTasks !== "object") return false
+  return (asyncTasks as Record<string, unknown>).backgrounded === true
 }
 
 /**

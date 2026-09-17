@@ -13,6 +13,7 @@ import {
   Loader2,
 } from "lucide-react"
 import { AgentIcon } from "@/components/agent-icon"
+import { BrowserLink } from "@/components/ui/browser-link"
 import { Button } from "@/components/ui/button"
 import { formatRelative } from "@/components/conversations/sidebar-conversation-grouping"
 import { formatScheduleFull, formatScheduleShort } from "@/lib/task-schedule"
@@ -166,6 +167,42 @@ export function statusAccent(task: WorkTask): string {
     case "canceled":
       return "bg-muted-foreground/25"
   }
+}
+
+/**
+ * Statuses in which the engine is holding an agent for this task, and the
+ * card's italic note line is therefore about work happening right now.
+ *
+ * `preparing` counts: a round that resumes a session spends it on a real agent
+ * turn — the pre-prompt context compaction, minutes of it on a full context
+ * window — and that is exactly the stretch the note line exists to explain.
+ * Shared by the card and the list row so the two cannot drift.
+ */
+export function isLiveStatus(task: WorkTask): boolean {
+  return (
+    task.status === "preparing" ||
+    task.status === "running" ||
+    task.status === "awaiting_input" ||
+    task.status === "merging"
+  )
+}
+
+/**
+ * The italic line under a live card: what this generation is doing.
+ *
+ * The compaction outranks the agent's own last milestone because it is the
+ * more recent truth AND the more surprising one — a card that has sat in
+ * 准备中 or 合并中 for minutes has no other explanation on screen. Below it,
+ * `latest_progress` is already scoped to this generation by the backend, so
+ * there is nothing here to guard against a previous round's leftovers.
+ */
+export function liveNote(
+  task: WorkTask,
+  t: (key: "compactingNote") => string
+): string | null {
+  if (!isLiveStatus(task)) return null
+  if (task.compacting) return t("compactingNote")
+  return task.latest_progress ?? null
 }
 
 interface TaskCardProps extends TaskActionHandlers {
@@ -346,10 +383,7 @@ export function TaskCard({
 }: TaskCardProps) {
   const t = useTranslations("Tasks")
   const archived = task.archived_at != null
-  const live =
-    task.status === "running" ||
-    task.status === "awaiting_input" ||
-    task.status === "merging"
+  const note = liveNote(task, t)
 
   const stat =
     task.files_changed != null && task.files_changed > 0 ? (
@@ -364,6 +398,11 @@ export function TaskCard({
     task.finished_at ?? task.settled_at ?? task.started_at ?? task.created_at,
     now
   )
+
+  // Hoisted so the click handler closes over a plain string: narrowing on
+  // `task.source_meta?.url` does not survive into the callback.
+  const source = task.source_meta
+  const sourceUrl = source?.url ?? null
 
   const { primary, secondaries } = buildTaskActions(task, t, handlers)
 
@@ -446,6 +485,27 @@ export function TaskCard({
         ) : null}
       </div>
 
+      {/* Forge provenance — `#123 · owner/repo`, straight to the issue. On its
+          own row rather than in the meta line above: `owner/repo` is long
+          enough that beside a folder and a `task/7` branch it either crowds
+          them or truncates itself into uselessness. mt-1 (tighter than the
+          meta line's own mt-1.5) keeps it reading as part of that block.
+          inline-block, not block, so the hit area hugs the text — a
+          full-width anchor would swallow clicks meant for the card. */}
+      {sourceUrl && source ? (
+        <div className="mt-1 min-w-0">
+          <BrowserLink
+            href={sourceUrl}
+            // The card itself opens the detail sheet — keep the click local.
+            onClick={(e) => e.stopPropagation()}
+            className="inline-block max-w-full truncate align-bottom font-mono text-[0.625rem] text-primary/80 hover:underline"
+            title={sourceUrl}
+          >
+            #{source.number} · {source.owner_repo}
+          </BrowserLink>
+        </div>
+      ) : null}
+
       {task.last_error &&
       (task.status === "failed" || task.status === "review") ? (
         <div className="mt-2 flex items-center gap-1.5 rounded-lg bg-destructive/10 px-2 py-1.5 text-[0.6875rem] text-destructive">
@@ -468,9 +528,9 @@ export function TaskCard({
           {task.result_summary}
         </p>
       ) : null}
-      {live && task.latest_progress ? (
+      {note ? (
         <p className="mt-1.5 line-clamp-2 text-[0.6875rem] leading-snug text-muted-foreground italic">
-          {task.latest_progress}
+          {note}
         </p>
       ) : null}
 

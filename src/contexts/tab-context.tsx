@@ -13,6 +13,7 @@ import {
   runCorrectionOnce,
   runRecoveryOnce,
   useTabStore,
+  type OpenedDraftTarget,
   type TabItem,
 } from "@/stores/tab-store"
 import {
@@ -22,7 +23,7 @@ import {
   type TabsChanged,
 } from "@/lib/types"
 
-export type { TabItem }
+export type { OpenedDraftTarget, TabItem }
 export { useTabStore, useTabActions } from "@/stores/tab-store"
 
 interface TabProviderProps {
@@ -218,7 +219,8 @@ export interface TabContextValue {
     pin?: boolean,
     title?: string
   ) => void
-  closeTab: (tabId: string) => void
+  /** See `TabStoreState.closeTab` for `recordForReopen`. */
+  closeTab: (tabId: string, options?: { recordForReopen?: boolean }) => void
   closeConversationTab: (
     folderId: number,
     conversationId: number,
@@ -238,9 +240,13 @@ export interface TabContextValue {
       inheritFromActive?: boolean
       folderDefaultAgent?: TabItem["agentType"] | null
       targetGroup?: string
+      forceAgent?: TabItem["agentType"]
     }
-  ) => void
-  openChatModeTab: (options?: { targetGroup?: string }) => void
+  ) => OpenedDraftTarget
+  openChatModeTab: (options?: {
+    targetGroup?: string
+    forceAgent?: TabItem["agentType"]
+  }) => OpenedDraftTarget
   setChatDraftWorkingDir: (tabId: string, workingDir: string) => void
   confirmDraftAgent: (tabId: string, agentType: TabItem["agentType"]) => void
   setDraftAgentFromFallback: (

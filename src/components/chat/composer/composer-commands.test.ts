@@ -268,15 +268,48 @@ describe("restoreBlocksIntoEditor", () => {
     // docToPromptBlocks emits ONE text block with every badge serialized inline,
     // so a queue-edit has to parse them back out to show the sender's badges.
     const text = "run /review on [app.ts](file:///repo/app.ts)"
-    const attachments = restoreBlocksIntoEditor(editor, [
-      { type: "text", text },
-    ])
+    const attachments = restoreBlocksIntoEditor(
+      editor,
+      [{ type: "text", text }],
+      new Set(["/review"])
+    )
     expect(
       JSON.stringify(editor.getJSON()).match(/"type":"reference"/g)
     ).toHaveLength(2)
     // Lossless: re-serializing reproduces the block text verbatim.
     expect(serialized(editor)).toBe(text)
     expect(attachments).toEqual([])
+  })
+
+  it("restores a queued `/cmd` the agent no longer advertises as its text", () => {
+    // The message still sends the same bytes; it just stops claiming to be a
+    // command the agent would recognize.
+    const text = "run /review on [app.ts](file:///repo/app.ts)"
+    restoreBlocksIntoEditor(editor, [{ type: "text", text }], new Set())
+    expect(
+      JSON.stringify(editor.getJSON()).match(/"type":"reference"/g)
+    ).toHaveLength(1)
+    expect(serialized(editor)).toBe(text)
+  })
+
+  it("restores every serialized agent link as a badge, losslessly", () => {
+    // No badge is privileged over another: routing is derived backend-side from
+    // the VISIBLE link, so a restored draft sends exactly like the original.
+    const text =
+      "raw [@Claude](codeg://agent/claude_code) then " +
+      "genuine [@Claude](codeg://agent/claude_code)"
+    const blocks: PromptInputBlock[] = [{ type: "text", text }]
+    restoreBlocksIntoEditor(editor, blocks)
+
+    const agents: unknown[] = []
+    editor.state.doc.descendants((node) => {
+      if (node.type.name === "reference" && node.attrs.refType === "agent") {
+        agents.push(node.attrs.id)
+      }
+      return true
+    })
+    expect(agents).toEqual(["claude_code", "claude_code"])
+    expect(serializeDocToText(editor.state.doc).trim()).toBe(text)
   })
 
   it("restores a non-composer resource_link as an attachment, not a badge", () => {

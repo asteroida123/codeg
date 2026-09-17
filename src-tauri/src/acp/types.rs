@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PromptInputBlock {
     Text {
@@ -95,6 +95,181 @@ pub struct SessionFailureRecord {
     /// Emitted `false` from the parser; flipped by the two stores.
     #[serde(default)]
     pub resolved: bool,
+}
+
+/// Cumulative cost of one async task, as the adapter last reported it
+/// (`async_task_progress.usage`). All three fields are required upstream — the
+/// adapter drops a partial `usage` object rather than publishing one — so this
+/// is either fully present or absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AsyncTaskUsage {
+    pub total_tokens: u64,
+    pub tool_uses: u64,
+    pub duration_ms: u64,
+}
+
+/// One JetBrains AIR async task — an agent's non-agent background work, merged
+/// from the three `session/update` variants that describe it (claude-agent-acp
+/// 0.73+: background shells, workflows, monitors; codex-acp 1.10+: background
+/// terminals). Published only because `build_client_capabilities` advertises the
+/// `asyncTasks` AIR capability.
+///
+/// This is the MERGED projection, not a wire frame: the adapter announces a
+/// task once with its full identity (`async_task_spawned`) and then revises it
+/// with partial deltas ([`AsyncTaskDelta`]). `SessionState::apply_event` and
+/// the frontend reducer apply the same merge, so a client attaching mid-session
+/// (which seeds from the snapshot's merged table) and one that watched every
+/// event converge on identical rows.
+///
+/// Sub-agent tasks are NOT here: the adapter marks `taskType: "local_agent"`
+/// ignored on this channel and describes them on the subagent channel instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AsyncTaskRecord {
+    pub task_id: String,
+    /// Adapter-authored label — claude: the workflow name, else the
+    /// description; codex: the launching tool call's title, else the raw
+    /// command.
+    pub name: String,
+    /// Already FRIENDLY, not the SDK's raw type: claude maps
+    /// `local_bash`→`"shell"`, `local_workflow`→`"workflow"`,
+    /// `local_monitor`/`mcp`→`"monitor"`, and anything else to `"task"`; codex
+    /// publishes `"shell"` for every background terminal. Kept a plain string so
+    /// an unmapped future type renders as itself instead of failing to
+    /// deserialize.
+    pub task_type: String,
+    pub description: String,
+    /// Whether this task earns its own transcript card upstream. codeg renders
+    /// the live strip regardless — that is AIR's always-on task panel, and the
+    /// strip answers "is it still running", which no transcript card can. Not
+    /// currently read by any surface; carried so a client that does want to
+    /// distinguish a task already drawn as an ordinary tool call (a background
+    /// `Bash` is one) from a standalone job doesn't need a wire change.
+    pub show_in_transcript: bool,
+    /// Whether `_session/async_task/stop` is offered. The adapter announces
+    /// `true` for every task it publishes; it is carried rather than assumed so
+    /// a future adapter can withdraw the affordance without a codeg release.
+    pub can_stop: bool,
+    /// `running` | `paused` | `completed` | `failed` | `stopped`. Plain string
+    /// for the same forward-compatibility reason as `task_type`; treat anything
+    /// outside the terminal three as still live.
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AsyncTaskUsage>,
+    /// Absolute path to the task's output file, when the adapter recovered one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_file_path: Option<String>,
+    /// The tool call this task belongs to, when it has one — the link back to
+    /// the card already in the transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// One async-task delta as it arrived on the wire.
+///
+/// The adapter's three `sessionUpdate` variants collapse into this single
+/// shape: `task_id` says which row, `spawned` says whether this frame may
+/// CREATE one, and every other field is an optional revision (absent = leave
+/// the stored value alone). Collapsing them keeps one merge rule instead of
+/// three, and keeps the event enum from growing a variant per wire frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AsyncTaskDelta {
+    pub task_id: String,
+    /// True only for `async_task_spawned`. A progress/state delta naming an
+    /// unknown task is DROPPED rather than creating a placeholder row: the
+    /// adapter publishes progress only for tasks it already announced, so an
+    /// unknown id means a frame we failed to read, and a row with a default
+    /// name and no type is worse than no row (see `SessionState::apply_event`).
+    pub spawned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_in_transcript: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_stop: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AsyncTaskUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_file_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl AsyncTaskDelta {
+    /// Build the row this delta creates. Only meaningful for a `spawned`
+    /// delta — the defaults exist because the wire fields are individually
+    /// optional, not because a half-announced task is expected.
+    pub fn to_record(&self) -> AsyncTaskRecord {
+        AsyncTaskRecord {
+            task_id: self.task_id.clone(),
+            name: self.name.clone().unwrap_or_else(|| "Background task".into()),
+            task_type: self.task_type.clone().unwrap_or_else(|| "task".into()),
+            description: self.description.clone().unwrap_or_default(),
+            show_in_transcript: self.show_in_transcript.unwrap_or(true),
+            can_stop: self.can_stop.unwrap_or(false),
+            state: self.state.clone().unwrap_or_else(|| "running".into()),
+            summary: self.summary.clone(),
+            last_tool_name: self.last_tool_name.clone(),
+            usage: self.usage.clone(),
+            output_file_path: self.output_file_path.clone(),
+            tool_call_id: self.tool_call_id.clone(),
+        }
+    }
+
+    /// Apply this delta's present fields onto an existing row.
+    pub fn apply_to(&self, record: &mut AsyncTaskRecord) {
+        if let Some(v) = &self.name {
+            record.name = v.clone();
+        }
+        if let Some(v) = &self.task_type {
+            record.task_type = v.clone();
+        }
+        if let Some(v) = &self.description {
+            record.description = v.clone();
+        }
+        if let Some(v) = self.show_in_transcript {
+            record.show_in_transcript = v;
+        }
+        if let Some(v) = self.can_stop {
+            record.can_stop = v;
+        }
+        if let Some(v) = &self.state {
+            record.state = v.clone();
+        }
+        if let Some(v) = &self.summary {
+            record.summary = Some(v.clone());
+        }
+        if let Some(v) = &self.last_tool_name {
+            record.last_tool_name = Some(v.clone());
+        }
+        if let Some(v) = &self.usage {
+            record.usage = Some(v.clone());
+        }
+        if let Some(v) = &self.output_file_path {
+            record.output_file_path = Some(v.clone());
+        }
+        if let Some(v) = &self.tool_call_id {
+            record.tool_call_id = Some(v.clone());
+        }
+    }
+}
+
+/// Whether `state` is one the adapter never revises away from.
+pub fn async_task_state_is_terminal(state: &str) -> bool {
+    matches!(state, "completed" | "failed" | "stopped")
 }
 
 /// Events pushed from Rust backend to frontend via Tauri event system.
@@ -216,6 +391,12 @@ pub enum AcpEvent {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         parent_tool_use_id: Option<String>,
     },
+    /// Agent published a live session title via ACP `session_info_update.title`.
+    /// Applied to the conversation row by the lifecycle worker (unlocked titles
+    /// only). The sidebar converges through `conversation://changed`; this event
+    /// itself is not rendered. Omitted when the update carries no title so
+    /// goal-only `session_info_update`s stay off the lifecycle path.
+    NativeSessionTitle { title: String },
     /// Backend has transitioned the conversation row's `status` column.
     /// Emitted by `send_prompt_linked` (`InProgress`) and the lifecycle
     /// subscriber on `TurnComplete` (`PendingReview`). The frontend mirrors
@@ -257,6 +438,17 @@ pub enum AcpEvent {
         /// (resolved against the option's own value list), not raw ids.
         requested: String,
         actual: String,
+        /// The same two, as the RAW value ids.
+        ///
+        /// Carried beside the labels because a client that localises an agent's
+        /// hardcoded vocabulary (see `lib/agent-label-vocabulary.ts`) keys on
+        /// the id, and the labels above have already been resolved away from
+        /// it. It cannot recover them by matching the label back against the
+        /// live option list either: this event is emitted BEFORE the
+        /// `SessionConfigOptions` carrying the value the agent adopted, so that
+        /// list is still the pre-update one.
+        requested_value: String,
+        actual_value: String,
     },
     /// Initial selector payloads (modes/config options) have been emitted
     SelectorsReady,
@@ -319,13 +511,37 @@ pub enum AcpEvent {
     /// transient "retrying" indicator on the active turn — it is NOT a turn
     /// failure and must not be rendered as one. The frontend reuses the Claude
     /// API-retry banner and clears it at the next turn boundary.
+    ///
+    /// pi shares this channel (issue #525): pi-acp announces `auto_retry_start`
+    /// as ordinary prose, which spliced the sentence into the reply, so it is
+    /// classified out of the transcript and routed here instead (see
+    /// `pi_message_chunk_route`).
     TurnRetrying {
         /// Human-readable transient error (`_meta.codex.error.message`).
+        ///
+        /// EMPTY for pi, which forwards no error text at all — only the retry
+        /// counters below. The frontend renders its own localized line in that
+        /// case rather than inventing an error description.
         message: String,
         /// HTTP status pulled from a `codexErrorInfo` object variant
         /// (e.g. `responseStreamDisconnected.httpStatusCode`), when present.
         #[serde(skip_serializing_if = "Option::is_none")]
         error_status: Option<i64>,
+        /// Which retry this is, and out of how many, and how long the agent will
+        /// wait first — pi's own numbers, recovered from the sentence pi-acp
+        /// formats them into (`pi_parse_retry_announcement`). The retry banner
+        /// has localized slots for exactly these, so filling them is what keeps
+        /// a non-English UI from reading half in English.
+        ///
+        /// All `None` for codex, which reports none of them; skipped from the
+        /// wire when absent, so codex's payload stays byte-identical and older
+        /// clients are unaffected.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_retries: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_delay_ms: Option<u64>,
     },
     /// A JetBrains AIR typed session failure upsert (see
     /// [`SessionFailureRecord`]). Emitted verbatim for every VALID record the
@@ -337,15 +553,27 @@ pub enum AcpEvent {
     /// text chunks), so severity-`warning` records take over the retry-banner
     /// role on those connections.
     SessionFailure { record: SessionFailureRecord },
-    /// `session/load` failed in a non-recoverable way (e.g. the agent has no
-    /// record of this `session_id`). Emitted instead of silently falling back
-    /// to `session/new`, so the frontend can surface the failure with reload
-    /// / new-conversation actions.
+    /// A JetBrains AIR async-task delta (see [`AsyncTaskDelta`]). Emitted for
+    /// every frame codeg could read; the merge into whole rows happens
+    /// identically in `SessionState::apply_event` (which the snapshot is taken
+    /// from) and the frontend reducer, so a mid-session attach and a client that
+    /// saw every delta agree.
+    ///
+    /// Reaches codeg from the two adapters `build_client_capabilities`
+    /// advertises `asyncTasks` to: claude-agent-acp (0.73+) and codex-acp
+    /// (1.10+).
+    AsyncTask { delta: AsyncTaskDelta },
+    /// `session/load` failed in a way codeg cannot paper over — the agent has
+    /// no record of this `session_id`, the session/process died, or it is
+    /// archived. Emitted instead of silently falling back to `session/new`, so
+    /// the frontend can surface the failure with reload / new-conversation
+    /// actions.
     SessionLoadFailed {
         session_id: String,
         message: String,
-        /// Stable machine-readable identifier — currently
-        /// `"resource_not_found"` for JSON-RPC -32002.
+        /// Stable machine-readable identifier: `"resource_not_found"` for
+        /// JSON-RPC -32002, or `"session_unavailable"` / `"session_archived"`
+        /// matched on the wire message. See `classify_session_load_failure`.
         code: String,
     },
     /// Available slash commands updated
@@ -535,18 +763,6 @@ pub struct BackgroundSettledInfo {
     /// parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
-    /// Whether this task's reply is/was rendered on the ACP wire as the tail of
-    /// a turn `#870` (claude-agent-acp v0.59.0) held open for it — i.e. the
-    /// settling task's id was still in `current_turn_launched_ids` when the
-    /// watcher read the notification. The frontend uses this to decide whether
-    /// to arm the "syncing results" hint: for a wire-visible settle the reply
-    /// is already on screen (no gap to bridge), whereas a genuinely out-of-turn
-    /// settle's reply arrives later as a separate overlay turn. Derived from the
-    /// backend set (which persists until the next turn's rising edge), NOT from
-    /// the connection's current status — so it's correct even when the watcher
-    /// reads the settlement AFTER the turn already fell back to `Connected`.
-    #[serde(default)]
-    pub wire_visible: bool,
 }
 
 /// Which settings surface drifted, so the frontend can word the
@@ -568,7 +784,9 @@ pub enum ConfigStaleKind {
 /// `Resource` (how an `image:false` / `embedded_context:true` agent carries a
 /// pasted image — and still how a format the agent cannot decode travels) is
 /// promoted to `Image` so the viewer renders a thumbnail, not a link.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+// `Eq` because `FeedbackItem` carries these and derives it; every field is a
+// `String`, so the bound costs nothing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UserMessageBlock {
     Text { text: String },
@@ -713,6 +931,17 @@ pub struct SessionConfigOptionInfo {
     pub description: Option<String>,
     pub category: Option<String>,
     pub kind: SessionConfigKindInfo,
+    /// The value the AGENT recommends for this option, when it named one —
+    /// JetBrains AIR's `recommendedValue` (codex-acp 1.11.0+, gated on codeg
+    /// advertising the capability; see `build_client_capabilities`). It is a
+    /// hint, never an instruction: `current_value` still decides what is
+    /// selected, and a recommendation that matches nothing in the option list
+    /// simply marks nothing.
+    ///
+    /// `#[serde(default)]` so snapshots written before this field existed still
+    /// deserialize.
+    #[serde(default)]
+    pub recommended_value: Option<String>,
 }
 
 /// What Grok says about ONE of its models, parsed from a session response's
@@ -813,6 +1042,17 @@ pub struct AcpAgentInfo {
     pub skills_capable: bool,
     pub registry_id: String,
     pub registry_version: Option<String>,
+    /// Whether "install a specific version" can actually fetch that version.
+    ///
+    /// NOT derivable from `registry_version` + `distribution_type`, which is
+    /// what the settings page used to infer it from: a binary agent's custom
+    /// install works by substituting the requested version into the pinned
+    /// download URL, and Antigravity's URLs carry a Google build id rather than
+    /// its registry version, so the substitution is a no-op and the install
+    /// would relabel the same bytes. Resolved by
+    /// [`crate::acp::registry::AcpAgentMeta::supports_custom_version`], which
+    /// checks the URL for THIS platform.
+    pub supports_custom_version: bool,
     pub name: String,
     pub description: String,
     pub available: bool,
@@ -1166,6 +1406,33 @@ pub struct CursorModelsResult {
     pub models: Vec<CursorModelInfo>,
     pub default_model: Option<String>,
     pub error: Option<String>,
+}
+
+/// Result of probing `qoder status -o json` for the Qoder settings panel's
+/// auth card. The CLI prints a flat object:
+/// `{logged_in, version, allow_byok, username, email, avatar_url, user_type}`.
+/// Parsed defensively — a shape change degrades to `error` rather than making
+/// the card claim the account is signed out.
+#[derive(Debug, Clone, Serialize)]
+pub struct QoderAuthStatus {
+    /// A launchable `qoder` binary was found (managed cache or system install).
+    pub installed: bool,
+    pub logged_in: bool,
+    pub username: Option<String>,
+    pub email: Option<String>,
+    /// Account tier, e.g. `personal_standard`.
+    pub user_type: Option<String>,
+    /// CLI version the probe reported — the one that would actually launch,
+    /// which is not necessarily the version codeg's registry pins.
+    pub version: Option<String>,
+    /// Whether the account may bring its own model provider key.
+    pub allow_byok: Option<bool>,
+    /// Probe failure detail (spawn error / timeout / non-JSON output).
+    pub error: Option<String>,
+    /// Absolute path to the `qoder` binary codeg would launch. The panel builds
+    /// a copy-pasteable `"<binary_path>" login` command from it, because a
+    /// managed binary lives in codeg's cache and is NOT on the user's PATH.
+    pub binary_path: Option<String>,
 }
 
 /// Lightweight status info for a single agent, used by connect() pre-check.

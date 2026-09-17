@@ -71,13 +71,8 @@ function toDetailStatus(status: string | null): ConnStatusKey | "prompting" {
 function DetailRow({ label, value }: { label: string; value: string }) {
   return (
     <div className="space-y-0.5">
-      <dt className="text-[11px] leading-none text-muted-foreground">
-        {label}
-      </dt>
-      <dd
-        className="font-mono text-[11px] leading-snug break-all"
-        title={value}
-      >
+      <dt className="text-2xs leading-none text-muted-foreground">{label}</dt>
+      <dd className="font-mono text-2xs leading-snug break-all" title={value}>
         {value}
       </dd>
     </div>
@@ -117,10 +112,24 @@ export function ComposerConnectionStatus({ tabId }: { tabId: string | null }) {
     getConnSnapshot,
     getConnSnapshot
   )
+  // A `connect()` in flight has no store entry yet — the backend call that
+  // creates one only returns once the agent has spawned and resumed the
+  // session. Without this the whole (often multi-second) establishment showed
+  // the dimmed "disconnected" heart, which is the opposite of what's happening.
+  const getPendingSnapshot = useCallback(
+    () => (tabId ? store.getConnectPending(tabId) : undefined),
+    [store, tabId]
+  )
+  const connectPending = useSyncExternalStore(
+    subscribeConn,
+    getPendingSnapshot,
+    getPendingSnapshot
+  )
+  const status = conn?.status ?? (connectPending ? "connecting" : null)
 
-  const statusKey = toConnStatus(conn?.status ?? null)
+  const statusKey = toConnStatus(status)
   const statusLabel = t(statusKey)
-  const agentType = conn?.agentType ?? null
+  const agentType = conn?.agentType ?? connectPending?.agentType ?? null
   const agentLabel = agentType ? getAgentLabel(agentType) : null
   const titleText = !agentLabel
     ? statusLabel
@@ -139,8 +148,12 @@ export function ComposerConnectionStatus({ tabId }: { tabId: string | null }) {
   const detailAgentLabel = detailAgentType
     ? getAgentLabel(detailAgentType)
     : null
-  const detailStatusKey = toDetailStatus(conn?.status ?? null)
-  const workingDir = conn?.workingDir ?? reconnectInfo?.workingDir ?? null
+  const detailStatusKey = toDetailStatus(status)
+  const workingDir =
+    conn?.workingDir ??
+    connectPending?.workingDir ??
+    reconnectInfo?.workingDir ??
+    null
   const sessionId = conn?.sessionId ?? reconnectInfo?.sessionId ?? null
   // A reconnect on a busy OWNER kills the agent CLI mid-turn; a viewer's only
   // detaches and re-attaches, leaving the owner's agent alone — so only the
@@ -198,7 +211,7 @@ export function ComposerConnectionStatus({ tabId }: { tabId: string | null }) {
         </div>
 
         {conn?.error ? (
-          <p className="max-h-24 overflow-auto rounded-md bg-destructive/10 px-2 py-1 text-[11px] leading-snug break-words text-destructive">
+          <p className="max-h-24 overflow-auto rounded-md bg-destructive/10 px-2 py-1 text-2xs leading-snug break-words text-destructive">
             {conn.error}
           </p>
         ) : null}
@@ -215,13 +228,13 @@ export function ComposerConnectionStatus({ tabId }: { tabId: string | null }) {
         ) : null}
 
         {conn?.isViewer ? (
-          <p className="text-[11px] leading-snug text-muted-foreground">
+          <p className="text-2xs leading-snug text-muted-foreground">
             {t("viewerNote")}
           </p>
         ) : null}
 
         {canReconnect && destructive ? (
-          <p className="text-[11px] leading-snug text-amber-600 dark:text-amber-500">
+          <p className="text-2xs leading-snug text-amber-600 dark:text-amber-500">
             {t("reconnectInterrupts")}
           </p>
         ) : null}
@@ -239,7 +252,7 @@ export function ComposerConnectionStatus({ tabId }: { tabId: string | null }) {
         </Button>
 
         {!canReconnect ? (
-          <p className="text-[11px] leading-snug text-muted-foreground">
+          <p className="text-2xs leading-snug text-muted-foreground">
             {t("reconnectUnavailable")}
           </p>
         ) : null}

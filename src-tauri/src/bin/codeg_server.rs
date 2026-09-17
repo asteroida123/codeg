@@ -137,7 +137,9 @@ async fn async_main() -> ExitCode {
     // errors are silenced, no subprocesses spawned.
     std::thread::spawn(|| {
         let _ = std::panic::catch_unwind(|| {
+            codeg_lib::acp::binary_cache::migrate_legacy_root();
             codeg_lib::sweep_acp_binary_trash();
+            codeg_lib::sweep_acp_scratch_dirs();
         });
     });
 
@@ -294,6 +296,9 @@ async fn async_main() -> ExitCode {
         system_op_lock: codeg_lib::app_state::default_system_op_lock(),
         update_state: codeg_lib::app_state::default_update_state(),
     });
+    state
+        .connection_manager
+        .install_chat_channel(state.chat_channel_manager.clone_ref());
 
     // Logging phase 3: wire the emitter so the Logs viewer's live tail
     // (`logs://appended`) reaches WS clients.
@@ -334,10 +339,11 @@ async fn async_main() -> ExitCode {
         &chat_authoring_config,
     )
     .await;
-    // Keep ACP model terminal fallbacks aligned with the same default-shell
-    // preference used by the built-in terminal before accepting connections.
+    // Before accepting connections: keep ACP model terminal fallbacks aligned
+    // with the same default-shell preference the built-in terminal uses, and
+    // seed the command-color opt-in that every launch env is built from.
     let terminal_shell_config = state.connection_manager.terminal_shell_config();
-    codeg_lib::commands::system_settings::apply_persisted_terminal_shell_config(
+    codeg_lib::commands::system_settings::apply_persisted_terminal_settings(
         &state.db.conn,
         &terminal_shell_config,
     )
@@ -373,10 +379,18 @@ async fn async_main() -> ExitCode {
                 chat_authoring_config.clone(),
             )),
         );
-        let socket = delegation_socket_path.clone();
+        // Bind through the service handle rather than a bare `listener.run`
+        // spawn: it keeps the bind error and the accept-loop handle around, so
+        // the workspace status indicator can report why the broker socket is
+        // down and rebind it without restarting the server.
+        let service = codeg_lib::acp::delegation::service::DelegationService::new(
+            listener,
+            delegation_socket_path.clone(),
+        );
+        codeg_lib::acp::delegation::service::install(service.clone());
         tokio::spawn(async move {
-            if let Err(e) = listener.run(socket).await {
-                tracing::info!("[delegation] listener exited: {e}");
+            if let Err(e) = service.start().await {
+                tracing::error!("[delegation] listener failed to start: {e}");
             }
         });
     }
@@ -469,6 +483,12 @@ async fn async_main() -> ExitCode {
             std::time::Duration::from_secs(codeg_lib::SWEEP_INTERVAL_SECS),
         ));
     }
+
+    // Reclaim scratch directories lost track of mid-session. Deliberately NOT
+    // gated on `idle_timeout_from_env` like the sweep above: setting
+    // `CODEG_ACP_IDLE_TIMEOUT_SECS=0` disables idle disconnects, not disk
+    // reclamation.
+    tokio::spawn(codeg_lib::scratch_sweep_task());
 
     // Office watch preview servers: reap dead children + ref0 stragglers.
     if let Some(idle_timeout) = codeg_lib::office_watch::idle_timeout_from_env() {

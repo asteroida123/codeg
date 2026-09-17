@@ -14,6 +14,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { DropdownRadioItemContent } from "@/components/chat/dropdown-radio-item-content"
+import { SelectorTooltip } from "@/components/chat/selector-tooltip"
 import type { ModelOptionGroup } from "@/lib/model-config-groups"
 import type { SessionConfigOptionInfo } from "@/lib/types"
 
@@ -27,12 +28,16 @@ interface SessionConfigSelectorProps {
    * means "no grouping" — fall back to server groups, else the flat list.
    */
   derivedGroups?: ModelOptionGroup[] | null
+  /** Localized chip text for the agent's `recommended_value` row. Omit it and
+   *  the recommendation is simply not shown. */
+  recommendedLabel?: string
 }
 
 export function InlineSessionConfigSelector({
   option,
   onSelect,
   derivedGroups,
+  recommendedLabel,
 }: SessionConfigSelectorProps) {
   if (option.kind.type !== "select") return null
 
@@ -60,23 +65,31 @@ export function InlineSessionConfigSelector({
     (item) => item.value === option.kind.current_value
   )
   const currentLabel = selected?.name ?? option.kind.current_value
+  // The agent's recommended value, if it named one AND the caller supplied a
+  // chip label. Never falls back to `current_value`: "recommended" and
+  // "selected" are different claims, and badging the selected row when nothing
+  // was recommended would invent one.
+  const recommendedValue = recommendedLabel ? option.recommended_value : null
+  const badgeFor = (value: string) =>
+    value === recommendedValue ? recommendedLabel : null
 
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button
-          variant="ghost"
-          size="xs"
-          title={option.name}
-          aria-label={
-            currentLabel ? `${option.name}: ${currentLabel}` : option.name
-          }
-          className="min-w-0 gap-0.5 px-1 text-muted-foreground"
-        >
-          <span className="max-w-[10rem] truncate">{currentLabel}</span>
-          <ChevronDown className="size-3 shrink-0 text-muted-foreground" />
-        </Button>
-      </DropdownMenuTrigger>
+      <SelectorTooltip label={option.name} description={option.description}>
+        <DropdownMenuTrigger asChild>
+          <Button
+            variant="ghost"
+            size="xs"
+            aria-label={
+              currentLabel ? `${option.name}: ${currentLabel}` : option.name
+            }
+            className="min-w-0 gap-0.5 px-1 text-muted-foreground"
+          >
+            <span className="max-w-[10rem] truncate">{currentLabel}</span>
+            <ChevronDown className="size-3 shrink-0 text-muted-foreground" />
+          </Button>
+        </DropdownMenuTrigger>
+      </SelectorTooltip>
       <DropdownMenuContent
         side="top"
         align="start"
@@ -107,6 +120,7 @@ export function InlineSessionConfigSelector({
                       <DropdownRadioItemContent
                         label={item.name}
                         description={item.description}
+                        recommendedLabel={badgeFor(item.value)}
                       />
                     </DropdownMenuRadioItem>
                   ))}
@@ -121,6 +135,7 @@ export function InlineSessionConfigSelector({
                   <DropdownRadioItemContent
                     label={item.name}
                     description={item.description}
+                    recommendedLabel={badgeFor(item.value)}
                   />
                 </DropdownMenuRadioItem>
               ))}
@@ -158,25 +173,26 @@ export function InlineSessionConfigToggle({
   const Icon = checked ? ToggleRight : ToggleLeft
 
   return (
-    <Button
-      variant="ghost"
-      size="xs"
-      aria-pressed={checked}
-      aria-label={`${option.name}: ${checked ? onLabel : offLabel}`}
-      title={option.description ?? option.name}
-      onClick={() => onSelect(option.id, checked ? "false" : "true")}
-      className={cn(
-        "min-w-0 gap-1 px-1",
-        checked ? "text-foreground" : "text-muted-foreground"
-      )}
-    >
-      <Icon
+    <SelectorTooltip label={option.name} description={option.description}>
+      <Button
+        variant="ghost"
+        size="xs"
+        aria-pressed={checked}
+        aria-label={`${option.name}: ${checked ? onLabel : offLabel}`}
+        onClick={() => onSelect(option.id, checked ? "false" : "true")}
         className={cn(
-          "size-3.5 shrink-0",
-          checked ? "text-primary" : "text-muted-foreground"
+          "min-w-0 gap-1 px-1",
+          checked ? "text-foreground" : "text-muted-foreground"
         )}
-      />
-      <span className="max-w-[10rem] truncate">{option.name}</span>
-    </Button>
+      >
+        <Icon
+          className={cn(
+            "size-3.5 shrink-0",
+            checked ? "text-primary" : "text-muted-foreground"
+          )}
+        />
+        <span className="max-w-[10rem] truncate">{option.name}</span>
+      </Button>
+    </SelectorTooltip>
   )
 }

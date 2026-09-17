@@ -113,10 +113,16 @@ describe("ConversationDetailPanel new conversation layout", () => {
   })
 
   it("marks every hidden keep-alive subtree with the hardening class", () => {
-    // Under a full-page workbench route (desktop + mobile shells).
+    // Under a full-page workbench route (desktop + mobile shells) — both go
+    // through `KeptMountedSurface`, which is where the class now lives.
     expect(workspaceLayoutSource).toContain(
-      '!isConversations && "conversation-tab-hidden invisible"'
+      'hidden && "conversation-tab-hidden invisible"'
     )
+    expect(
+      workspaceLayoutSource.match(
+        /<KeptMountedSurface hidden=\{!isConversations\}>/g
+      )
+    ).toHaveLength(2)
     // The FILE column under the conversation overlay — this is the one that
     // hosts git-diff tabs.
     expect(workspaceLayoutSource).toContain(
@@ -125,6 +131,28 @@ describe("ConversationDetailPanel new conversation layout", () => {
     // The conversation column under the files-maximized overlay.
     expect(workspaceLayoutSource).toContain(
       'filesMaximized && "conversation-tab-hidden invisible"'
+    )
+  })
+
+  /**
+   * The class above only reaches what stays in the host's DOM subtree. A drawer
+   * portals to the body, so every hidden subtree that can host a CONVERSATION
+   * (and therefore a "查看会话" viewer) has to publish the flag too, or the
+   * viewer paints over whatever covered it. Three such subtrees exist; the file
+   * column is deliberately not one — no conversation lives there.
+   */
+  it("publishes the hidden flag from every conversation-hosting subtree", () => {
+    // Full-page workbench route, both shells.
+    expect(workspaceLayoutSource).toContain(
+      "<OverlayHostHiddenProvider hidden={hidden}>"
+    )
+    // Conversation column under the files-maximized overlay.
+    expect(workspaceLayoutSource).toContain(
+      "<OverlayHostHiddenProvider hidden={filesMaximized}>"
+    )
+    // A backgrounded conversation tab behind the selected one.
+    expect(source).toContain(
+      "<OverlayHostHiddenProvider hidden={!canTileG && !visible}>"
     )
   })
 
@@ -353,6 +381,63 @@ describe("ConversationDetailPanel send-path hardening", () => {
     expect(source).toContain("if (!connectionReady) return")
   })
 
+  it("gates the queue auto-flush on the SAME readiness predicate as the send", () => {
+    // The flush DEQUEUES before handing the message to handleSend, so a gate
+    // weaker than handleSend's own check takes the message off the queue and
+    // then loses it when the send bails. The two drifted once already: the agent
+    // term was added to `connectionReady` while the flush kept its own inlined
+    // connStatus+cwd pair, so a draft whose agent had just been switched — its
+    // old connection still live at the same cwd — silently ate the message.
+    // Both must read the one variable.
+    //
+    // Scoped to the flush effect's own body: `connStatus` is a legitimate gate
+    // elsewhere in the file (answering a question, forking), so banning it
+    // outright would be wrong.
+    const start = source.indexOf("// Flush queued messages whenever the agent")
+    const end = source.indexOf("autoSendQueueRef.current()", start)
+    expect(start).toBeGreaterThan(-1)
+    expect(end).toBeGreaterThan(start)
+    const flushEffect = source.slice(start, end)
+
+    expect(flushEffect).toContain("if (!connectionReady) return")
+    expect(flushEffect).toContain("if (!connectionReadyRef.current) return")
+    // No re-spelling of the predicate: the connection is judged ONLY through
+    // the shared variable.
+    expect(flushEffect).not.toContain("connStatus")
+    expect(flushEffect).not.toContain("connectedWorkingDir")
+  })
+
+  it("holds the queue auto-flush while a queued row is being inserted", () => {
+    // A queued row's click-to-insert leaves the row in the queue for the whole
+    // round-trip (it only goes once delivery is confirmed). If the turn ends in
+    // that window, the flush would dequeue and send the very row the backend
+    // just injected — the same instruction delivered twice. The hold is
+    // released in a `finally`, and the flag is a dependency, so the flush
+    // resumes on the next commit either way.
+    const start = source.indexOf("// Flush queued messages whenever the agent")
+    const depsEnd = source.indexOf("clearTimeout(timer)", start)
+    const effectWithDeps = source.slice(
+      start,
+      source.indexOf("])", depsEnd) + 2
+    )
+    expect(effectWithDeps).toContain("if (queueSteerInFlight) return")
+    // …and as a dependency, so releasing the hold re-runs the flush.
+    expect(effectWithDeps).toContain("queueSteerInFlight])")
+
+    const steerStart = source.indexOf("const handleQueueSteer = useCallback")
+    expect(steerStart).toBeGreaterThan(-1)
+    const steerHandler = source.slice(
+      steerStart,
+      source.indexOf("[msgQueue, feedbackSteer", steerStart)
+    )
+    // Set BEFORE the first await, cleared in a finally.
+    expect(steerHandler.indexOf("setQueueSteerInFlight(true)")).toBeLessThan(
+      steerHandler.indexOf("await feedbackSteer(")
+    )
+    expect(steerHandler).toContain("finally {")
+    expect(steerHandler).toContain("setQueueSteerInFlight(false)")
+  })
+
   it("disables the welcome composer while connected-but-not-ready", () => {
     // The composer reads a downgraded status so its send affordance is disabled
     // during the transient mismatch window instead of inviting a rejected send.
@@ -416,6 +501,22 @@ describe("ConversationDetailPanel session-load failure surface", () => {
     expect(banner).toContain("hasPersistedConversation && acpLoadError")
     expect(banner).toContain("handleReloadDetail")
     expect(banner).toContain("handleOpenNewSession")
+    // A failure with a runnable fix (archived session → `codex unarchive
+    // <id>`) offers it as a copy action. The message itself renders in a
+    // one-line ellipsized strip, so a 36-char session id inside the prose is
+    // exactly what gets truncated away — the button is what makes the
+    // command reachable at all, and it must not show when there is no
+    // command to copy.
+    expect(banner).toContain("{recoveryCommand && (")
+    expect(banner).toContain("handleCopyRecoveryCommand")
+    // Every action is shrink-0 and the message is the only elastic child, so
+    // a third action has to be able to wrap. Without `flex-wrap` plus a floor
+    // under the message, the row silently pushes "New conversation" outside
+    // the banner at narrow widths (measured 34-172px past the edge at
+    // 320-384px) — i.e. adding a recovery action would break the two that
+    // were already there.
+    expect(banner).toContain("flex w-full flex-wrap items-center")
+    expect(banner).toContain("min-w-40 flex-1 overflow-hidden")
     // The shell renders the banner inside the composer dock, constrained to
     // the same message-column width as the input it replaces.
     const dockIdx = conversationShellSource.indexOf("{composerBanner && (")
@@ -453,6 +554,26 @@ describe("ConversationDetailPanel session-load failure surface", () => {
     // through, so an in-flight refetch wiped the id.
     expect(effect).not.toContain(
       "setExternalId(effectiveConversationId, detail?.summary.external_id ?? null)"
+    )
+  })
+
+  it("resolves the connect session id from the runtime store, not from detail", () => {
+    // `runtimeExternalId` is fed by BOTH sources (the effect above writes the
+    // DB value into it; the connSessionId effect writes the live session), so
+    // it is always the more recently established of the two. `detail` is only
+    // the cold-open fallback.
+    expect(source).toContain(
+      "runtimeExternalId ?? detail?.summary.external_id ?? undefined"
+    )
+    // The regression this guards, and it is not cosmetic. A fork re-points
+    // THIS row at S2 and inserts a sibling row holding S1. The panel learns S2
+    // from the fork response immediately, but `detail` still says S1 until its
+    // refetch lands — so with `detail` first, the next reconnect asked for S1,
+    // which the sibling now owns, and the tab silently re-homed onto the
+    // pre-fork history with the `[Fork]` row abandoned. Forking again then
+    // forked S1 a second time, chaining rows.
+    expect(source).not.toContain(
+      "detail?.summary.external_id ?? runtimeExternalId ?? undefined"
     )
   })
 })

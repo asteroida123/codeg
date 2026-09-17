@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 
+import { CODEG_MCP_WORKBENCH_TOOLS } from "@/lib/codeg-mcp-tool"
 import {
   classifyToolKind,
   isAgentLikeToolName,
@@ -12,6 +13,11 @@ describe("classifyToolKind", () => {
     ["grep", "search"],
     ["GLOB", "search"],
     ["list_files", "search"],
+    // pi's built-in set is bash/edit/find/grep/ls/powershell/read/write; `ls`
+    // and `powershell` used to fall through to "other".
+    ["find", "search"],
+    ["ls", "search"],
+    ["powershell", "command"],
     ["bash", "command"],
     ["execute_command", "command"],
     ["read", "read"],
@@ -80,6 +86,39 @@ describe("isAgentLikeToolName", () => {
       expect(isAgentLikeToolName(`codeg-delegate.${tool}`)).toBe(true)
       expect(isAgentLikeToolName(`codeg-delegate:${tool}`)).toBe(true)
     }
+  })
+
+  // The classifier keeps its own copy of the workbench list; when
+  // `resume_delegation` was added to `CODEG_MCP_WORKBENCH_TOOLS` the copy was
+  // not updated, so the resume card spent its life wrapped in a spurious
+  // "工具 ×1" group shell. Pin the relationship so it can't drift again.
+  it("covers every tool that owns a CodegMcpToolCard", () => {
+    for (const tool of CODEG_MCP_WORKBENCH_TOOLS) {
+      expect(isAgentLikeToolName(tool)).toBe(true)
+    }
+  })
+
+  it("matches the codeg-mcp workbench companions across host naming conventions", () => {
+    // Each owns a CodegMcpToolCard, so it breaks the tool-group run and renders
+    // standalone rather than folding into a "工具 ×N" tally.
+    for (const tool of [
+      "get_session_info",
+      "task_progress",
+      "task_complete",
+      "create_automation",
+      "create_work_task",
+      "resume_delegation",
+    ]) {
+      expect(isAgentLikeToolName(tool)).toBe(true)
+      expect(isAgentLikeToolName(`mcp__codeg-mcp__${tool}`)).toBe(true)
+      expect(isAgentLikeToolName(`mcp__codeg__${tool}`)).toBe(true)
+      expect(isAgentLikeToolName(`codeg-mcp/${tool}`)).toBe(true)
+      expect(isAgentLikeToolName(`codeg-mcp.${tool}`)).toBe(true)
+      expect(isAgentLikeToolName(`codeg-mcp:${tool}`)).toBe(true)
+    }
+    // …without dragging the generic task tools along with them.
+    expect(isAgentLikeToolName("task")).toBe(false)
+    expect(isAgentLikeToolName("taskcreate")).toBe(false)
   })
 
   it("matches Codex goal tools as standalone card tools", () => {

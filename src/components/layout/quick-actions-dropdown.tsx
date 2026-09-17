@@ -2,16 +2,15 @@
 
 import { useCallback, useState } from "react"
 import {
-  Download,
   FolderGit2,
   FolderOpenDot,
   GamepadDirectional,
-  ListChecks,
+  LayoutTemplate,
   ListTodo,
+  Map as MapIcon,
   MonitorCloud,
   PawPrint,
   Rocket,
-  Search,
   Settings,
   Zap,
 } from "lucide-react"
@@ -29,24 +28,16 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import { useActiveFolder } from "@/contexts/active-folder-context"
-import { useSearchDialog } from "@/contexts/search-dialog-context"
 import { useAutomationsView } from "@/contexts/automations-view-context"
 import { useTasksView } from "@/contexts/tasks-view-context"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
-import { openImportSessionsWindow, openProjectBootWindow } from "@/lib/api"
+import { useRemoteWorkspaceConnections } from "@/hooks/use-remote-workspace-connections"
+import { openProjectBootWindow } from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
 import { openPetWindow } from "@/lib/pet/api"
-import { isDesktop } from "@/lib/platform"
-import {
-  listRemoteWorkspaceConnections,
-  openRemoteWorkspace,
-} from "@/lib/remote-workspace"
-import type { RemoteWorkspaceConnection } from "@/lib/types"
 import { CloneDialog } from "./clone-dialog"
 import { RemoteWorkspaceManageDialog } from "./remote-workspace-manage-dialog"
 import { WorkspaceFolderDialog } from "./workspace-folder-dialog"
-import { ConversationManageDialog } from "@/components/conversations/conversation-manage-dialog"
 
 /**
  * The quick-actions launcher pinned to the status bar's leading edge — the
@@ -57,9 +48,15 @@ import { ConversationManageDialog } from "@/components/conversations/conversatio
  * those homes are scattered and several of them disappear with the sidebar
  * collapsed. The status bar never unmounts, so this menu is the one always-on
  * path to all of them. Items are grouped by what they act on rather than by
- * where they used to live: workspace (open/clone/boot/remote), sessions
- * (manage/import/search), workbench routes (automations/to-dos), and the
- * desktop pet.
+ * where they used to live: workspace (open/clone/boot/remote), navigation
+ * (every full-page workbench route), and the desktop pet. Search and the
+ * per-folder session actions (manage / import) are the deliberate omissions —
+ * search has a permanent button in the window's top-left chrome, and the
+ * session actions are folder-scoped, so they live where a folder is: "Manage
+ * conversations" in the folder row's context menu, "Import local sessions"
+ * there and on the Folders section header. Both go away with the sidebar, but
+ * a copy here could only ever act on whatever folder happened to be active,
+ * which is not what a folder-scoped action means.
  *
  * Dialogs are rendered as siblings of the menu, not inside it: the menu
  * unmounts its content on close, which would take a nested dialog with it.
@@ -71,8 +68,6 @@ export function QuickActionsDropdown() {
   const tRemote = useTranslations("RemoteWorkspace")
   const tPet = useTranslations("Pet.manager")
 
-  const { activeFolder } = useActiveFolder()
-  const { setOpen: setSearchOpen } = useSearchDialog()
   const { unseenFailures } = useAutomationsView()
   const { attentionCount } = useTasksView()
   const { setRoute } = useWorkbenchRoute()
@@ -80,45 +75,22 @@ export function QuickActionsDropdown() {
   const [folderDialogOpen, setFolderDialogOpen] = useState(false)
   const [cloneOpen, setCloneOpen] = useState(false)
   const [remoteManageOpen, setRemoteManageOpen] = useState(false)
-  const [manageFolderId, setManageFolderId] = useState<number | null>(null)
-  const [remoteConnections, setRemoteConnections] = useState<
-    RemoteWorkspaceConnection[]
-  >([])
 
   // Remote connections are only reachable on the desktop runtime (a web client
   // can't spawn another window bound to a different server), so the whole
   // submenu — and the pet entry below it — self-hide elsewhere.
-  const desktop = isDesktop()
-
-  const refreshRemote = useCallback(async () => {
-    if (!desktop) return
-    try {
-      setRemoteConnections(await listRemoteWorkspaceConnections())
-    } catch (err) {
-      toast.error(tRemote("loadFailed"), { description: toErrorMessage(err) })
-    }
-  }, [desktop, tRemote])
-
-  const handleOpenRemote = useCallback(
-    (connectionId: number) => {
-      openRemoteWorkspace(connectionId).catch((err) => {
-        toast.error(tRemote("openFailed"), { description: toErrorMessage(err) })
-      })
-    },
-    [tRemote]
-  )
+  const {
+    desktop,
+    connections: remoteConnections,
+    refresh: refreshRemote,
+    open: handleOpenRemote,
+  } = useRemoteWorkspaceConnections()
 
   const handleProjectBoot = useCallback(() => {
     openProjectBootWindow().catch((err) => {
       console.error("[QuickActionsDropdown] failed to open project boot:", err)
     })
   }, [])
-
-  const handleImportSessions = useCallback(() => {
-    // Anchor the picker on the active folder when there is one, matching the
-    // folder context-menu entry; otherwise it scans everything.
-    void openImportSessionsWindow({ focusPath: activeFolder?.path ?? null })
-  }, [activeFolder])
 
   // Summoning fails when no pet has been made active yet (the backend refuses
   // rather than opening an empty window), so surface that instead of a silent
@@ -219,33 +191,17 @@ export function QuickActionsDropdown() {
             </DropdownMenuSub>
           )}
 
-          <DropdownMenuSeparator />
-          <DropdownMenuLabel>{t("groups.sessions")}</DropdownMenuLabel>
-          {/* Conversation management is scoped to one folder (the dialog can
-              widen the scope from inside), so it needs an active one. */}
-          <DropdownMenuItem
-            disabled={!activeFolder}
-            onSelect={() => {
-              if (activeFolder) setManageFolderId(activeFolder.id)
-            }}
-          >
-            <ListChecks />
-            {tSidebar("manageConversations.title")}
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={handleImportSessions}>
-            <Download />
-            {tSidebar("importLocalSessions")}
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => setSearchOpen(true)}>
-            <Search />
-            {tSidebar("search")}
-          </DropdownMenuItem>
+          {/* No Search row: it now has a permanent button in the window's
+              top-left chrome (`LeftEdgeChrome`, and `FolderTitleBar` on mobile),
+              which is visible without opening anything. This menu exists for
+              actions whose only other home disappears with the sidebar. */}
 
           <DropdownMenuSeparator />
-          <DropdownMenuLabel>{t("groups.automation")}</DropdownMenuLabel>
-          {/* Both rows carry the same badges as their sidebar twins: failures
-              are destructive-tinted, tasks waiting on the user are not. They
-              deliberately do *not* mark the current route the way the sidebar
+          <DropdownMenuLabel>{t("groups.navigation")}</DropdownMenuLabel>
+          {/* Every full-page workbench route the sidebar lists, in the sidebar's
+              own order. The badged rows carry the same badges as their sidebar
+              twins: failures are destructive-tinted, tasks waiting on the user
+              are not. None of them mark the current route the way the sidebar
               rows do — this is a launcher, not a nav list, and every other row
               in it is stateless, so a tinted row here reads as hover/focus
               rather than "you are here". */}
@@ -268,6 +224,14 @@ export function QuickActionsDropdown() {
                 {attentionCount}
               </span>
             )}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setRoute("forge")}>
+            <LayoutTemplate />
+            {tSidebar("forge")}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setRoute("canvas")}>
+            <MapIcon />
+            {tSidebar("canvas")}
           </DropdownMenuItem>
 
           {desktop && (
@@ -295,13 +259,6 @@ export function QuickActionsDropdown() {
           open={remoteManageOpen}
           onOpenChange={setRemoteManageOpen}
           onChanged={refreshRemote}
-        />
-      )}
-      {manageFolderId != null && (
-        <ConversationManageDialog
-          open
-          onOpenChange={(next) => !next && setManageFolderId(null)}
-          folderId={manageFolderId}
         />
       )}
     </>

@@ -9,12 +9,17 @@ import {
 } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { NextIntlClientProvider } from "next-intl"
+import { toast } from "sonner"
 import type { ComponentProps } from "react"
 import type { Editor } from "@tiptap/core"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { RichComposerHandle } from "./composer/rich-composer"
 import { serializeDocToText } from "./composer/to-prompt-blocks"
+import {
+  clearMessageInputDraftV2,
+  loadMessageInputDraftV2,
+} from "@/lib/message-input-draft"
 import {
   emitAttachFileToSession,
   emitAttachSessionToSession,
@@ -85,18 +90,62 @@ vi.mock("@/components/chat/conversation-context-bar", () => ({
   ConversationFolderBranchPicker: () => null,
   useConversationFolderBranchPickerVisible: () => false,
 }))
+// `openUrl` is where link-safety lands a web-mode link, and so where the
+// right-click menu's "Open link" ends up.
+const platform = vi.hoisted(() => ({ openUrl: vi.fn(async () => {}) }))
 vi.mock("@/lib/platform", () => ({
   isDesktop: () => false,
   openFileDialog: vi.fn(),
+  openUrl: platform.openUrl,
 }))
 vi.mock("@/lib/transport", () => ({
   getActiveRemoteConnectionId: () => null,
+  isDesktop: () => false,
+}))
+// A local-file link target routes to the workspace file column, whose provider
+// this suite deliberately renders without.
+vi.mock("@/hooks/use-open-file-target", () => ({
+  useOpenFileTarget: () => async () => {},
+}))
+// The right-click menu refreshes the quick-message list as it opens; keep that
+// off the backend so the menu tests exercise only the menu.
+vi.mock("@/lib/api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/api")>()),
+  quickMessagesList: vi.fn(async () => []),
 }))
 // Real classifier only recognizes actual backend NoActiveTurn payloads; the
 // steering tests flip this per-case to drive the enqueue fallback.
 vi.mock("@/lib/turn-busy", () => ({
   isNoActiveTurnRejection: vi.fn(() => false),
 }))
+// Nothing here mounts a Toaster, so toasts would vanish silently — record them
+// instead. The steering tests assert the uploading gate's honest signal.
+vi.mock("sonner", () => ({
+  toast: { error: vi.fn(), info: vi.fn(), success: vi.fn(), dismiss: vi.fn() },
+}))
+// Wrap-mock (rich-composer pattern above): render the REAL attachments hook,
+// but let a test stage image attachments — the drop/paste pipelines that
+// normally populate them need real files and upload endpoints.
+type ComposerAttachmentsApi = ReturnType<
+  typeof import("./composer/use-composer-attachments").useComposerAttachments
+>
+const attachmentsOverride = vi.hoisted(() => ({
+  current: null as Partial<ComposerAttachmentsApi> | null,
+}))
+vi.mock("./composer/use-composer-attachments", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("./composer/use-composer-attachments")>()
+  return {
+    ...actual,
+    useComposerAttachments: (
+      ...args: Parameters<typeof actual.useComposerAttachments>
+    ) => {
+      const real = actual.useComposerAttachments(...args)
+      const override = attachmentsOverride.current
+      return override ? { ...real, ...override } : real
+    },
+  }
+})
 // virtua renders 0 rows under jsdom — render children directly so the large
 // (searchable + virtualized) model list is exercisable here too.
 vi.mock("virtua", async () => {
@@ -131,6 +180,16 @@ vi.mock("@/components/ui/scroll-area", async () => {
     },
   }
 })
+
+// ModelOptionList sizes its scroll window in rem, so it reads the live zoom
+// level — which throws outside an AppearanceProvider, and this suite renders the
+// composer bare. Pin it at 100% (1rem = 16px). Spread the real module so the
+// other appearance hooks keep their real (provider-requiring) behaviour instead
+// of silently resolving to `undefined` if something here starts using one.
+vi.mock("@/hooks/use-appearance", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/use-appearance")>()),
+  useZoomLevel: () => ({ zoomLevel: 100, setZoomLevel: () => {} }),
+}))
 
 import enMessages from "@/i18n/messages/en.json"
 import type {
@@ -264,6 +323,79 @@ describe("MessageInput attach-to-chat insertion position", () => {
       expect(serializeDocToText(editor.state.doc)).toContain(link)
     )
     assertBetweenHelloAndWorld(serializeDocToText(editor.state.doc), link)
+  })
+})
+
+// `injectContent` is the composer's inbox for content pushed in from outside:
+// welcome quick actions (replace) and quoted transcript selections (append).
+describe("MessageInput injectContent", () => {
+  afterEach(() => {
+    cleanup()
+    composerHandle.current = null
+  })
+
+  function tree(props: Partial<React.ComponentProps<typeof MessageInput>>) {
+    return (
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <MessageInput onSend={vi.fn()} promptCapabilities={CAPS} {...props} />
+      </NextIntlClientProvider>
+    )
+  }
+
+  async function mount(
+    props: Partial<React.ComponentProps<typeof MessageInput>>
+  ) {
+    const view = render(tree(props))
+    await waitFor(
+      () => expect(composerHandle.current?.getEditor()).toBeTruthy(),
+      { timeout: 5000 }
+    )
+    const editor = composerHandle.current?.getEditor()
+    if (!editor) throw new Error("composer editor not mounted")
+    return { view, editor }
+  }
+
+  it("appends a quote after an existing draft, separated by a blank line", async () => {
+    const onInjectConsumed = vi.fn()
+    const { view, editor } = await mount({ onInjectConsumed })
+    act(() => {
+      editor.commands.setContent("what does this mean?")
+    })
+
+    view.rerender(
+      tree({
+        onInjectConsumed,
+        injectContent: { text: "> quoted bit", mode: "append" },
+      })
+    )
+
+    await waitFor(() =>
+      expect(serializeDocToText(editor.state.doc)).toBe(
+        "what does this mean?\n\n> quoted bit\n\n"
+      )
+    )
+    expect(onInjectConsumed).toHaveBeenCalled()
+  })
+
+  it("appends a quote into an empty composer with no leading gap", async () => {
+    const { view, editor } = await mount({})
+    view.rerender(
+      tree({ injectContent: { text: "> quoted bit", mode: "append" } })
+    )
+    await waitFor(() =>
+      expect(serializeDocToText(editor.state.doc)).toBe("> quoted bit\n\n")
+    )
+  })
+
+  it("still replaces the whole document in the default mode", async () => {
+    const { view, editor } = await mount({})
+    act(() => {
+      editor.commands.setContent("draft to be replaced")
+    })
+    view.rerender(tree({ injectContent: { text: "quick action prompt" } }))
+    await waitFor(() =>
+      expect(serializeDocToText(editor.state.doc)).toBe("quick action prompt")
+    )
   })
 })
 
@@ -562,6 +694,63 @@ describe("MessageInput boolean config options", () => {
       within(popover).getByRole("button", { name: MSGS.toggleOn })
     )
     expect(onConfigOptionChange).toHaveBeenCalledWith("auto_approve", "true")
+  })
+})
+
+describe("MessageInput selector loading placeholder", () => {
+  afterEach(() => cleanup())
+
+  it("shows a visible placeholder in the selector row while the session comes up", async () => {
+    // Opening a historical conversation spends seconds with no selectors known.
+    // The cue has to be in the row itself — the cog popover's loading text is
+    // only reachable by a user who already suspects something is loading.
+    const { container } = renderInput({
+      configOptionsLoading: true,
+      configOptions: [],
+    })
+    await waitFor(() =>
+      expect(container.querySelector('[role="textbox"]')).not.toBeNull()
+    )
+    expect(
+      screen.getByRole("status", { name: MSGS.loadingSettings })
+    ).toBeInTheDocument()
+  })
+
+  it("drops the placeholder as soon as the real options arrive", async () => {
+    const view = renderInput({
+      configOptionsLoading: true,
+      configOptions: [],
+    })
+    await waitFor(() =>
+      expect(view.container.querySelector('[role="textbox"]')).not.toBeNull()
+    )
+    expect(screen.queryByRole("status")).not.toBeNull()
+
+    view.rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <MessageInput
+          onSend={vi.fn()}
+          promptCapabilities={CAPS}
+          configOptionsLoading={false}
+          configOptions={[MODEL_OPTION]}
+        />
+      </NextIntlClientProvider>
+    )
+    expect(screen.queryByRole("status")).toBeNull()
+    expect(screen.getByRole("button", { name: /Model/ })).toBeInTheDocument()
+  })
+
+  it("renders no selector affordance at all when nothing is loading or known", async () => {
+    // The pre-fix steady state: an agent with neither modes nor config options
+    // must not grow a placeholder that never resolves.
+    const { container } = renderInput({ configOptions: [], modes: [] })
+    await waitFor(() =>
+      expect(container.querySelector('[role="textbox"]')).not.toBeNull()
+    )
+    expect(screen.queryByRole("status")).toBeNull()
+    expect(
+      screen.queryByRole("button", { name: MSGS.agentSettings })
+    ).toBeNull()
   })
 })
 
@@ -884,10 +1073,202 @@ describe("MessageInput slash menu while the agent connects", () => {
   })
 })
 
-describe("MessageInput native steering (insert into current turn)", () => {
+describe("MessageInput slash badges", () => {
   afterEach(() => {
     cleanup()
     composerHandle.current = null
+  })
+
+  const COMMANDS = [{ name: "compact", description: "Compact the thread" }]
+
+  async function mount(
+    props: Partial<React.ComponentProps<typeof MessageInput>> = {}
+  ) {
+    renderInput({ availableCommands: COMMANDS, ...props })
+    await waitFor(
+      () => expect(composerHandle.current?.getEditor()).toBeTruthy(),
+      { timeout: 5000 }
+    )
+    const handle = composerHandle.current
+    const editor = handle?.getEditor()
+    if (!handle || !editor) throw new Error("composer editor not mounted")
+    return { handle, editor }
+  }
+
+  function press(editor: Editor, key: string) {
+    act(() => {
+      ;(editor.view.dom as HTMLElement).dispatchEvent(
+        new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true })
+      )
+    })
+  }
+
+  for (const key of ["Enter", "Tab"]) {
+    it(`still badges the command picked from the menu with ${key}`, async () => {
+      const { handle, editor } = await mount()
+      act(() => {
+        editor.commands.insertContent("/comp")
+      })
+      await screen.findByTestId("slash-menu")
+      press(editor, key)
+      await waitFor(() =>
+        expect(JSON.stringify(handle.getJSON())).toContain('"type":"reference"')
+      )
+      // The badge still brings its trailing space, so the next word is typed
+      // clear of it.
+      expect(handle.getText()).toBe("/compact ")
+    })
+  }
+
+  it("badges the command clicked in the menu", async () => {
+    const { handle, editor } = await mount()
+    act(() => {
+      editor.commands.insertContent("/comp")
+    })
+    const menu = await screen.findByTestId("slash-menu")
+    fireEvent.mouseDown(within(menu).getByText("/compact"))
+    await waitFor(() =>
+      expect(JSON.stringify(handle.getJSON())).toContain('"type":"reference"')
+    )
+    expect(handle.getText()).toBe("/compact ")
+  })
+
+  it("leaves a seeded slash word the agent never advertised as plain text", async () => {
+    const { handle } = await mount()
+    act(() => {
+      handle.setText("/notacommand on /tmp/x and and/or")
+    })
+    expect(JSON.stringify(handle.getJSON())).not.toContain('"type":"reference"')
+    expect(handle.getText()).toBe("/notacommand on /tmp/x and and/or")
+  })
+
+  it("badges a seeded token that IS one of the agent's commands", async () => {
+    const { handle } = await mount()
+    act(() => {
+      handle.setText("/compact the thread")
+    })
+    expect(JSON.stringify(handle.getJSON())).toContain('"refType":"skill"')
+    // Same bytes on the wire either way — only the composer's rendering differs.
+    expect(handle.getText()).toBe("/compact the thread")
+  })
+
+  it("leaves a seeded command alone for an agent that has none", async () => {
+    const { handle } = await mount({ availableCommands: [] })
+    act(() => {
+      handle.setText("/compact the thread")
+    })
+    expect(JSON.stringify(handle.getJSON())).not.toContain('"type":"reference"')
+    expect(handle.getText()).toBe("/compact the thread")
+  })
+})
+
+// The queue-edit / draft restore claims its one-shot guard synchronously but
+// mutates the editor in a rAF whose cleanup cancels that frame. Anything in the
+// effect's dependency array that changes identity in between therefore cancels
+// the restore and then bails on the already-claimed guard — nothing is ever
+// restored. The advertised-command list is exactly such a value: it lands with
+// the ACP connection, and the Set built from it is fresh every time.
+describe("MessageInput queue-edit restore vs. a late command list", () => {
+  afterEach(() => {
+    cleanup()
+    composerHandle.current = null
+    vi.unstubAllGlobals()
+  })
+
+  /** Hold every rAF callback so the test decides when the frame runs. */
+  function captureFrames(): { flush: () => void } {
+    const frames: (FrameRequestCallback | null)[] = []
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) =>
+      frames.push(cb)
+    )
+    vi.stubGlobal("cancelAnimationFrame", (id: number) => {
+      frames[id - 1] = null
+    })
+    return {
+      flush: () => {
+        act(() => {
+          // Indexed, not iterated: a callback may queue another frame.
+          for (let i = 0; i < frames.length; i++) {
+            const cb = frames[i]
+            frames[i] = null
+            cb?.(0)
+          }
+        })
+      },
+    }
+  }
+
+  /** The identity the ACP connection replaces once it advertises. */
+  const NO_COMMANDS: React.ComponentProps<
+    typeof MessageInput
+  >["availableCommands"] = []
+
+  function renderAgain(
+    view: ReturnType<typeof renderInput>,
+    props: Partial<React.ComponentProps<typeof MessageInput>>
+  ) {
+    view.rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <MessageInput onSend={vi.fn()} promptCapabilities={CAPS} {...props} />
+      </NextIntlClientProvider>
+    )
+  }
+
+  it("restores the queued message when the commands land before its frame", async () => {
+    const { flush } = captureFrames()
+    const editing = {
+      isEditingQueueItem: true,
+      editingItemId: "q1",
+      editingDraftBlocks: [{ type: "text" as const, text: "queued prose" }],
+    }
+    const view = renderInput({ availableCommands: NO_COMMANDS, ...editing })
+    await waitFor(
+      () => expect(composerHandle.current?.getEditor()).toBeTruthy(),
+      { timeout: 5000 }
+    )
+    // The connection comes up: a brand-new command list, and so a brand-new
+    // `knownInvocations` Set, while the restore's frame is still pending.
+    renderAgain(view, {
+      availableCommands: [{ name: "compact", description: "Compact" }],
+      ...editing,
+    })
+    flush()
+    expect(composerHandle.current?.getText()).toBe("queued prose")
+  })
+
+  // The "re-edit a DIFFERENT queued item" restore is a second effect with its
+  // own one-shot guard (the last hydrated item id), so it needs its own case.
+  it("restores the next queued item picked while its frame is pending", async () => {
+    const { flush } = captureFrames()
+    const view = renderInput({ availableCommands: NO_COMMANDS })
+    await waitFor(
+      () => expect(composerHandle.current?.getEditor()).toBeTruthy(),
+      { timeout: 5000 }
+    )
+    flush()
+
+    // The user clicks "edit" on a queued message…
+    const editing = {
+      isEditingQueueItem: true,
+      editingItemId: "q2",
+      editingDraftBlocks: [{ type: "text" as const, text: "the next one" }],
+    }
+    renderAgain(view, { availableCommands: NO_COMMANDS, ...editing })
+    // …and the command list lands before that restore's frame runs.
+    renderAgain(view, {
+      availableCommands: [{ name: "compact", description: "Compact" }],
+      ...editing,
+    })
+    flush()
+    expect(composerHandle.current?.getText()).toBe("the next one")
+  })
+})
+
+describe("MessageInput mid-turn send (live-feedback channel)", () => {
+  afterEach(() => {
+    cleanup()
+    composerHandle.current = null
+    attachmentsOverride.current = null
     vi.clearAllMocks()
   })
 
@@ -901,6 +1282,9 @@ describe("MessageInput native steering (insert into current turn)", () => {
       disabled: true,
       onCancel: vi.fn(),
       onEnqueue: vi.fn(),
+      // The prop defaults to the weaker `pull` promise, so the native cases
+      // below have to say so explicitly; the pull case overrides it back.
+      steerChannel: "native",
       ...props,
     })
     await waitFor(
@@ -958,10 +1342,14 @@ describe("MessageInput native steering (insert into current turn)", () => {
     )
 
     await user.click(screen.getByLabelText(MI.steerIntoTurn))
-    await user.click(
-      await screen.findByRole("menuitem", { name: MI.steerIntoTurn })
+    const item = await screen.findByRole("menuitem", { name: MI.steerIntoTurn })
+    // The glyph promises what the label does — the bolt is the instant insert.
+    expect(item.querySelector(".lucide-zap")).not.toBeNull()
+    await user.click(item)
+    // A plain-text draft steers as text alone — no blocks payload.
+    await waitFor(() =>
+      expect(onSteer).toHaveBeenCalledWith("go left", undefined)
     )
-    await waitFor(() => expect(onSteer).toHaveBeenCalledWith("go left"))
     // Unsettled: the draft must survive until the backend confirms.
     expect(serializeDocToText(editor.state.doc)).toContain("go left")
 
@@ -1022,5 +1410,558 @@ describe("MessageInput native steering (insert into current turn)", () => {
     // Real failure: nothing queued, draft intact for retry.
     expect(onEnqueue).not.toHaveBeenCalled()
     expect(serializeDocToText(editor.state.doc)).toContain("keep me")
+  })
+
+  it("labels the mid-turn action honestly on the pull channel", async () => {
+    // A pull-tool session gets the same split, but its action must never
+    // promise an instant insert: the note is recorded as waiting and read on
+    // the agent's next check, so the copy says exactly that.
+    const user = userEvent.setup()
+    const onSteer = vi.fn().mockResolvedValue(undefined)
+    const editor = await mountPrompting({ onSteer, steerChannel: "pull" })
+    typeDraft(editor, "check the tests")
+    await waitFor(() =>
+      expect(screen.getByLabelText(MI.steerAsNote)).toBeInTheDocument()
+    )
+    expect(screen.queryByLabelText(MI.steerIntoTurn)).toBeNull()
+
+    // The action itself rides the same steer path — only the copy differs.
+    await user.click(screen.getByLabelText(MI.steerAsNote))
+    const pullItem = await screen.findByRole("menuitem", {
+      name: MI.steerAsNote,
+    })
+    // ...and so does the glyph: the notes strip's waiting clock, never the
+    // instant-insert bolt.
+    expect(pullItem.querySelector(".lucide-clock")).not.toBeNull()
+    expect(pullItem.querySelector(".lucide-zap")).toBeNull()
+    await user.click(pullItem)
+    await waitFor(() =>
+      expect(onSteer).toHaveBeenCalledWith("check the tests", undefined)
+    )
+    await waitFor(() =>
+      expect(serializeDocToText(editor.state.doc)).not.toContain(
+        "check the tests"
+      )
+    )
+  })
+
+  const stagedImage = {
+    id: "att-1",
+    type: "image" as const,
+    data: "aGk=",
+    uri: null,
+    name: "mock.png",
+    mimeType: "image/png",
+  }
+  const stagedImageBlock = {
+    type: "image" as const,
+    data: "aGk=",
+    mime_type: "image/png",
+  }
+
+  it("steers a draft with an image attachment, blocks included", async () => {
+    // The whole point of block steering: the entry stays enabled with an
+    // image staged, and the handler ships the SAME block list a normal send
+    // would build — text prose plus the attachment — with the prose as the
+    // recorded note.
+    const user = userEvent.setup()
+    attachmentsOverride.current = {
+      attachments: [stagedImage],
+      imagePromptBlocks: () => [stagedImageBlock],
+    }
+    const onSteer = vi.fn().mockResolvedValue(undefined)
+    const editor = await mountPrompting({ onSteer })
+    typeDraft(editor, "match this mock")
+    await waitFor(() =>
+      expect(screen.getByLabelText(MI.steerIntoTurn)).toBeInTheDocument()
+    )
+
+    await user.click(screen.getByLabelText(MI.steerIntoTurn))
+    const item = await screen.findByRole("menuitem", {
+      name: MI.steerIntoTurn,
+    })
+    expect(item).not.toHaveAttribute("aria-disabled", "true")
+    await user.click(item)
+    await waitFor(() =>
+      expect(onSteer).toHaveBeenCalledWith("match this mock", [
+        { type: "text", text: "match this mock" },
+        stagedImageBlock,
+      ])
+    )
+    // Confirmed: the draft clears like any successful steer.
+    await waitFor(() =>
+      expect(serializeDocToText(editor.state.doc)).not.toContain(
+        "match this mock"
+      )
+    )
+  })
+
+  it("defaults to the pull copy when no channel is declared", async () => {
+    // The weaker promise is the default: a call site that wires `onSteer` but
+    // forgets `steerChannel` must understate delivery, never claim an insert.
+    const editor = await mountPrompting({
+      onSteer: vi.fn(),
+      steerChannel: undefined,
+    })
+    typeDraft(editor, "no channel declared")
+    await waitFor(() =>
+      expect(screen.getByLabelText(MI.steerAsNote)).toBeInTheDocument()
+    )
+    expect(screen.queryByLabelText(MI.steerIntoTurn)).toBeNull()
+    // The menu item, not just the trigger: they read from `steerChannel`
+    // independently, so a default that leaked into only one of them would
+    // still promise an insert somewhere.
+    await userEvent.setup().click(screen.getByLabelText(MI.steerAsNote))
+    expect(
+      await screen.findByRole("menuitem", { name: MI.steerAsNote })
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByRole("menuitem", { name: MI.steerIntoTurn })
+    ).toBeNull()
+  })
+
+  it("names the note, not an insert, when a pull send fails", async () => {
+    // The failure toast is the last place the pull channel could overpromise:
+    // "couldn't insert into the current turn" would describe a delivery this
+    // session never attempted.
+    const user = userEvent.setup()
+    const { isNoActiveTurnRejection } = await import("@/lib/turn-busy")
+    vi.mocked(isNoActiveTurnRejection).mockReturnValue(false)
+    const onSteer = vi.fn().mockRejectedValue(new Error("boom"))
+    const editor = await mountPrompting({ onSteer, steerChannel: "pull" })
+    typeDraft(editor, "keep me")
+    await waitFor(() =>
+      expect(screen.getByLabelText(MI.steerAsNote)).toBeInTheDocument()
+    )
+
+    await user.click(screen.getByLabelText(MI.steerAsNote))
+    await user.click(
+      await screen.findByRole("menuitem", { name: MI.steerAsNote })
+    )
+
+    await waitFor(() =>
+      expect(vi.mocked(toast.error)).toHaveBeenCalledWith(
+        MI.steerNoteFailed,
+        expect.anything()
+      )
+    )
+    // Exactly one toast: raising the insert copy alongside the note copy is
+    // the same overpromise, just louder.
+    expect(vi.mocked(toast.error)).toHaveBeenCalledTimes(1)
+    // Same draft policy as native: a real failure keeps the text for retry.
+    expect(serializeDocToText(editor.state.doc)).toContain("keep me")
+  })
+
+  it("steers an image-only draft with the attachment summary as the note", async () => {
+    // No prose to record, so the note falls back to the draft's display text
+    // (what the queue chip would have shown) while the wire still carries the
+    // real image block.
+    const user = userEvent.setup()
+    attachmentsOverride.current = {
+      attachments: [stagedImage],
+      imagePromptBlocks: () => [stagedImageBlock],
+    }
+    const onSteer = vi.fn().mockResolvedValue(undefined)
+    await mountPrompting({ onSteer })
+    await waitFor(() =>
+      expect(screen.getByLabelText(MI.steerIntoTurn)).toBeInTheDocument()
+    )
+
+    await user.click(screen.getByLabelText(MI.steerIntoTurn))
+    await user.click(
+      await screen.findByRole("menuitem", { name: MI.steerIntoTurn })
+    )
+    await waitFor(() =>
+      expect(onSteer).toHaveBeenCalledWith("Attached 1 attachment", [
+        stagedImageBlock,
+      ])
+    )
+  })
+
+  it("blocks steering while an image upload is still settling", async () => {
+    // Same guard as a plain send: an unsettled upload has no server-side uri
+    // to hydrate from. The gate must be its own honest toast — the enqueue
+    // fallback would otherwise ship a bytes-less marker block.
+    const user = userEvent.setup()
+    const { toast } = await import("sonner")
+    attachmentsOverride.current = {
+      attachments: [{ ...stagedImage, uploading: true }],
+      hasUploadingImage: true,
+      imagePromptBlocks: () => [stagedImageBlock],
+    }
+    const onSteer = vi.fn()
+    const editor = await mountPrompting({ onSteer })
+    typeDraft(editor, "wait for it")
+    await waitFor(() =>
+      expect(screen.getByLabelText(MI.steerIntoTurn)).toBeInTheDocument()
+    )
+
+    await user.click(screen.getByLabelText(MI.steerIntoTurn))
+    await user.click(
+      await screen.findByRole("menuitem", { name: MI.steerIntoTurn })
+    )
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(vi.mocked(toast.error)).toHaveBeenCalledWith(
+      enMessages.Folder.chat.messageInput.attachUploadInProgress
+    )
+    // Draft and attachment stay put for the retry.
+    expect(serializeDocToText(editor.state.doc)).toContain("wait for it")
+  })
+
+  it("queues the attachment too when the blocks steer is rejected", async () => {
+    // The load-bearing half of "attachments are never silently dropped": the
+    // backend rejects a blocks-bearing note on the pull path (and on the
+    // turn-end race) with NoActiveTurn, and this fallback has to re-route the
+    // WHOLE draft — image included — not just the prose.
+    const user = userEvent.setup()
+    const { isNoActiveTurnRejection } = await import("@/lib/turn-busy")
+    vi.mocked(isNoActiveTurnRejection).mockReturnValue(true)
+    attachmentsOverride.current = {
+      attachments: [stagedImage],
+      imagePromptBlocks: () => [stagedImageBlock],
+    }
+    const onSteer = vi.fn().mockRejectedValue(new Error("no active turn"))
+    const onEnqueue = vi.fn()
+    const editor = await mountPrompting({ onSteer, onEnqueue })
+    typeDraft(editor, "late note")
+    await waitFor(() =>
+      expect(screen.getByLabelText(MI.steerIntoTurn)).toBeInTheDocument()
+    )
+
+    await user.click(screen.getByLabelText(MI.steerIntoTurn))
+    await user.click(
+      await screen.findByRole("menuitem", { name: MI.steerIntoTurn })
+    )
+
+    await waitFor(() => expect(onEnqueue).toHaveBeenCalled())
+    const [draft] = onEnqueue.mock.calls[0]
+    expect(draft.blocks).toEqual([
+      { type: "text", text: "late note" },
+      stagedImageBlock,
+    ])
+    await waitFor(() =>
+      expect(serializeDocToText(editor.state.doc)).not.toContain("late note")
+    )
+  })
+
+  it("labels the mid-turn action honestly on the pull channel", async () => {
+    // A pull-tool session gets the same split, but its action must never
+    // promise an instant insert: the note is recorded as waiting and read on
+    // the agent's next check, so the copy says exactly that.
+    const user = userEvent.setup()
+    const onSteer = vi.fn().mockResolvedValue(undefined)
+    const editor = await mountPrompting({ onSteer, steerChannel: "pull" })
+    typeDraft(editor, "check the tests")
+    await waitFor(() =>
+      expect(screen.getByLabelText(MI.steerAsNote)).toBeInTheDocument()
+    )
+    expect(screen.queryByLabelText(MI.steerIntoTurn)).toBeNull()
+
+    // The action itself rides the same steer path — only the copy differs.
+    await user.click(screen.getByLabelText(MI.steerAsNote))
+    await user.click(
+      await screen.findByRole("menuitem", { name: MI.steerAsNote })
+    )
+    await waitFor(() =>
+      expect(onSteer).toHaveBeenCalledWith("check the tests", undefined)
+    )
+    await waitFor(() =>
+      expect(serializeDocToText(editor.state.doc)).not.toContain(
+        "check the tests"
+      )
+    )
+  })
+})
+
+describe("MessageInput right-click token selection", () => {
+  afterEach(() => {
+    cleanup()
+    composerHandle.current = null
+  })
+
+  /**
+   * The custom radix menu only replaces the browser's own where the async
+   * clipboard read exists (a secure context). jsdom has neither, so each mode is
+   * set up here rather than inherited from whatever ran before.
+   */
+  function setClipboardRead(supported: boolean) {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: supported
+        ? { readText: async () => "", writeText: async () => {} }
+        : undefined,
+    })
+  }
+
+  async function mountWithEditor({ clipboardRead = true } = {}) {
+    setClipboardRead(clipboardRead)
+    renderInput({})
+    await waitFor(
+      () => expect(composerHandle.current?.getEditor()).toBeTruthy(),
+      { timeout: 5000 }
+    )
+    const editor = composerHandle.current?.getEditor()
+    if (!editor) throw new Error("composer editor not mounted")
+    return editor
+  }
+
+  /** Seed the draft and drop a collapsed caret at `caret`. */
+  function seed(editor: Editor, text: string, caret: number) {
+    act(() => {
+      editor.commands.setContent(text)
+      editor.commands.setTextSelection(caret)
+    })
+  }
+
+  /** The editing surface the right click lands on. jsdom has no layout, so
+   *  hit-testing declines and the caret above is what the menu resolves. */
+  function editingSurface(): HTMLElement {
+    const surface = document.querySelector<HTMLElement>(".ProseMirror")
+    if (!surface) throw new Error("composer editing surface not mounted")
+    return surface
+  }
+
+  function selectedText(editor: Editor): string {
+    const { from, to } = editor.state.selection
+    return editor.state.doc.textBetween(from, to)
+  }
+
+  it("selects the address under the pointer and offers to write to it", async () => {
+    const editor = await mountWithEditor()
+    seed(editor, "ping adam@example.com today", 8)
+
+    fireEvent.contextMenu(editingSurface(), { clientX: 40, clientY: 12 })
+
+    await screen.findByRole("menuitem", { name: "Send email" })
+    expect(selectedText(editor)).toBe("adam@example.com")
+    // Copy is live off the same right click — before this it needed the user to
+    // highlight the address by hand.
+    expect(screen.getByRole("menuitem", { name: "Copy" })).not.toHaveAttribute(
+      "data-disabled"
+    )
+  })
+
+  it("opens a schemeless link through the shared opener", async () => {
+    const editor = await mountWithEditor()
+    seed(editor, "see example.com/docs later", 8)
+
+    fireEvent.contextMenu(editingSurface(), { clientX: 40, clientY: 12 })
+
+    const open = await screen.findByRole("menuitem", { name: "Open link" })
+    expect(selectedText(editor)).toBe("example.com/docs")
+
+    fireEvent.click(open)
+    await waitFor(() =>
+      expect(platform.openUrl).toHaveBeenCalledWith("https://example.com/docs")
+    )
+  })
+
+  it("selects a plain word without inventing an action for it", async () => {
+    const editor = await mountWithEditor()
+    seed(editor, "refactor the parser today", 16)
+
+    fireEvent.contextMenu(editingSurface(), { clientX: 40, clientY: 12 })
+
+    await screen.findByRole("menuitem", { name: "Copy" })
+    expect(selectedText(editor)).toBe("parser")
+    expect(screen.queryByRole("menuitem", { name: "Open link" })).toBeNull()
+    expect(screen.queryByRole("menuitem", { name: "Send email" })).toBeNull()
+  })
+
+  it("leaves a hand-made selection alone and acts on that", async () => {
+    const editor = await mountWithEditor()
+    seed(editor, "ping adam@example.com today", 1)
+    act(() => {
+      editor.commands.setTextSelection({ from: 6, to: 22 })
+    })
+
+    fireEvent.contextMenu(editingSurface(), { clientX: 40, clientY: 12 })
+
+    // A click inside a live selection neither re-selects nor collapses it, and
+    // the address it holds still gets its own row.
+    await screen.findByRole("menuitem", { name: "Send email" })
+    expect(selectedText(editor)).toBe("adam@example.com")
+  })
+
+  it("still picks the token up where the native menu takes over", async () => {
+    const editor = await mountWithEditor({ clipboardRead: false })
+    seed(editor, "ping adam@example.com today", 8)
+
+    fireEvent.contextMenu(editingSurface(), { clientX: 40, clientY: 12 })
+
+    // No custom menu in a non-secure context — the browser's own is left to
+    // appear — but it now opens over a selected address instead of a caret.
+    expect(screen.queryByRole("menuitem", { name: "Copy" })).toBeNull()
+    expect(selectedText(editor)).toBe("adam@example.com")
+  })
+})
+
+describe("MessageInput prompt history", () => {
+  async function mountWithHistory(
+    history: string[],
+    props: Partial<React.ComponentProps<typeof MessageInput>> = {}
+  ) {
+    renderInput({ getSentHistory: () => history, ...props })
+    await waitFor(
+      () => expect(composerHandle.current?.getEditor()).toBeTruthy(),
+      { timeout: 5000 }
+    )
+    const handle = composerHandle.current
+    const editor = handle?.getEditor()
+    if (!handle || !editor) throw new Error("composer editor not mounted")
+    return { handle, editor }
+  }
+
+  function press(editor: Editor, key: string) {
+    act(() => {
+      ;(editor.view.dom as HTMLElement).dispatchEvent(
+        new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true })
+      )
+    })
+  }
+
+  it("recalls sent prompts on Up and restores the draft on Down", async () => {
+    const { handle, editor } = await mountWithHistory(["first", "latest"])
+
+    act(() => handle.setText("my draft"))
+    act(() => editor.commands.focus("start"))
+    press(editor, "ArrowUp")
+    expect(handle.getText()).toBe("latest")
+
+    act(() => editor.commands.focus("start"))
+    press(editor, "ArrowUp")
+    expect(handle.getText()).toBe("first")
+
+    act(() => editor.commands.focus("end"))
+    press(editor, "ArrowDown")
+    expect(handle.getText()).toBe("latest")
+
+    // Past the newest entry the original draft comes back.
+    act(() => editor.commands.focus("end"))
+    press(editor, "ArrowDown")
+    expect(handle.getText()).toBe("my draft")
+  })
+
+  it("recalls into an empty composer, where the caret is at both edges", async () => {
+    const { handle, editor } = await mountWithHistory(["first", "latest"])
+
+    // The common case: nothing typed yet. Down must still fall through (there
+    // is nothing recalled to move forward from), Up must recall.
+    press(editor, "ArrowDown")
+    expect(handle.getText()).toBe("")
+    press(editor, "ArrowUp")
+    expect(handle.getText()).toBe("latest")
+  })
+
+  it("persists the draft the first recall replaces", async () => {
+    // The stash that ArrowDown restores lives only in memory, and the draft
+    // save is debounced: a recall that lands inside that window must flush the
+    // typed draft rather than let the timer write the RECALLED prompt over it
+    // (a tab switch from there would lose what the user typed).
+    const draftKey = "test:history-recall-draft"
+    clearMessageInputDraftV2(draftKey)
+    const { handle, editor } = await mountWithHistory(["first", "latest"], {
+      draftStorageKey: draftKey,
+    })
+
+    act(() => editor.commands.insertContent("my draft"))
+    act(() => editor.commands.focus("start"))
+    press(editor, "ArrowUp")
+    expect(handle.getText()).toBe("latest")
+
+    // Past the debounce: whatever was going to be written has been written.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 350))
+    })
+    const stored = loadMessageInputDraftV2(draftKey)
+    expect(JSON.stringify(stored)).toContain("my draft")
+    expect(JSON.stringify(stored)).not.toContain("latest")
+    clearMessageInputDraftV2(draftKey)
+  })
+
+  it("editing a recalled prompt leaves history mode", async () => {
+    const { handle, editor } = await mountWithHistory(["first", "latest"])
+
+    act(() => editor.commands.focus("start"))
+    press(editor, "ArrowUp")
+    expect(handle.getText()).toBe("latest")
+
+    // Type into the recalled entry, then Down must NOT be treated as "newer"
+    // past the newest — history mode ended with the edit.
+    act(() => editor.commands.focus("end"))
+    act(() => editor.commands.insertContent(" edited"))
+    expect(handle.getText()).toBe("latest edited")
+    act(() => editor.commands.focus("end"))
+    press(editor, "ArrowDown")
+    expect(handle.getText()).toBe("latest edited")
+  })
+
+  it("does nothing on Up when the session has no history", async () => {
+    const { handle, editor } = await mountWithHistory([])
+
+    act(() => handle.setText("my draft"))
+    act(() => editor.commands.focus("start"))
+    press(editor, "ArrowUp")
+    expect(handle.getText()).toBe("my draft")
+  })
+
+  it("steps on the edge and lands on the edge it travelled from", async () => {
+    const { handle, editor } = await mountWithHistory([
+      "first",
+      "older\nmulti\nline",
+      "newest\nmulti\nline",
+    ])
+
+    act(() => handle.setText("DRAFT"))
+    act(() => editor.commands.focus("start"))
+    press(editor, "ArrowUp")
+    expect(handle.getText()).toBe("newest\nmulti\nline")
+
+    // Recalling lands at the TOP, so the same key keeps going older without the
+    // caret having to be walked anywhere.
+    press(editor, "ArrowUp")
+    expect(handle.getText()).toBe("older\nmulti\nline")
+    press(editor, "ArrowUp")
+    expect(handle.getText()).toBe("first")
+
+    // Turning around means walking to the bottom edge first — until it gets
+    // there the caret is the editor's, not the history's. (jsdom has no native
+    // caret movement, so that walk is simulated with focus("end").)
+    act(() => editor.commands.focus("end"))
+    press(editor, "ArrowDown")
+    expect(handle.getText()).toBe("older\nmulti\nline")
+    press(editor, "ArrowDown")
+    expect(handle.getText()).toBe("newest\nmulti\nline")
+    press(editor, "ArrowDown")
+    expect(handle.getText()).toBe("DRAFT")
+  })
+
+  it("does not switch prompts while the caret is inside a multi-line entry", async () => {
+    const { handle, editor } = await mountWithHistory([
+      "older",
+      "newest\nmulti\nline",
+    ])
+
+    act(() => editor.commands.focus("start"))
+    press(editor, "ArrowUp")
+    expect(handle.getText()).toBe("newest\nmulti\nline")
+
+    // The caret is at the TOP, so Down belongs to the caret, not the history
+    // (jsdom has no native caret movement, so the observable is "no recall").
+    press(editor, "ArrowDown")
+    expect(handle.getText()).toBe("newest\nmulti\nline")
+  })
+
+  it("leaves the arrows to the caret while editing a queued message", async () => {
+    const { handle, editor } = await mountWithHistory(["older", "newest"], {
+      isEditingQueueItem: true,
+    })
+
+    act(() => handle.setText("queued edit"))
+    act(() => editor.commands.focus("start"))
+    press(editor, "ArrowUp")
+
+    // A recall here would replace the queued message being edited.
+    expect(handle.getText()).toBe("queued edit")
   })
 })

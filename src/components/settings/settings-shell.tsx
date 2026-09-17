@@ -34,7 +34,7 @@ import { cn } from "@/lib/utils"
 import { detectEnvironment } from "@/lib/transport/detect"
 import { AppTitleBar } from "@/components/layout/app-title-bar"
 import { useIsMobile } from "@/hooks/use-mobile"
-import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet"
+import { Drawer, DrawerContent, DrawerTitle } from "@/components/ui/drawer"
 
 interface SettingsNavItem {
   href: string
@@ -194,7 +194,7 @@ export function SettingsShell({ children }: SettingsShellProps) {
 
   const navContent = (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="px-2 pb-2 text-[11px] font-medium text-muted-foreground">
+      <div className="px-2 pb-2 text-2xs font-medium text-muted-foreground">
         {t("preferences")}
       </div>
       <ScrollArea className="min-h-0 flex-1">
@@ -255,18 +255,27 @@ export function SettingsShell({ children }: SettingsShellProps) {
           </aside>
         )}
 
-        {/* Mobile navigation Sheet */}
+        {/* Mobile navigation Drawer. Opts back into press-outside-to-close,
+            against the app-wide drawer default: it is navigation, and tapping
+            the page it partially covers is how you put it away on a phone. */}
         {isMobile && (
-          <Sheet open={navOpen} onOpenChange={setNavOpen}>
-            <SheetContent
-              side="left"
+          <Drawer
+            open={navOpen}
+            onOpenChange={setNavOpen}
+            swipeDirection="left"
+            disablePointerDismissal={false}
+          >
+            {/* rem so the nav grows with the zoom level like its own labels do,
+                but capped against the viewport: 16.25rem at 150% is 390px, wider
+                than the phone this drawer is for. */}
+            <DrawerContent
               showCloseButton={false}
-              className="w-[260px] p-3"
+              className="w-[min(16.25rem,85vw)] p-3"
             >
-              <SheetTitle className="sr-only">{t("title")}</SheetTitle>
+              <DrawerTitle className="sr-only">{t("title")}</DrawerTitle>
               {navContent}
-            </SheetContent>
-          </Sheet>
+            </DrawerContent>
+          </Drawer>
         )}
 
         <section className="flex-1 min-w-0 min-h-0 overflow-hidden">

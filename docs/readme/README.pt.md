@@ -19,7 +19,7 @@
 
 O Codeg (Code Generation) é um espaço de trabalho de programação multiagente: rode todos os seus agentes de IA em um só lugar — e deixe que trabalhem juntos.
 
-Ele agrega as sessões de todas as CLIs de agentes suportadas em um único espaço de trabalho pesquisável e permite que um agente principal delegue a subagentes de outros tipos dentro de uma mesma tarefa. O trabalho que você prefere não acompanhar vai para o quadro de tarefas a fazer: cada tarefa no próprio branch, rodando sem supervisão, esperando a sua revisão antes de entrar. O Codeg roda como aplicativo de desktop, servidor independente ou contêiner Docker, com clientes nativos de iOS e Android para quando você está longe da mesa; catorze agentes já vêm integrados e você pode registrar por conta própria qualquer outro agente compatível com ACP.
+Ele agrega as sessões de todas as CLIs de agentes suportadas em um único espaço de trabalho pesquisável e permite que um agente principal delegue a subagentes de outros tipos dentro de uma mesma tarefa. O trabalho que você prefere não acompanhar vai para o quadro de tarefas a fazer: cada tarefa no próprio branch, rodando sem supervisão, esperando a sua revisão antes de entrar. O Codeg roda como aplicativo de desktop, servidor independente ou contêiner Docker, com clientes nativos de iOS e Android para quando você está longe da mesa; quinze agentes já vêm integrados e você pode registrar por conta própria qualquer outro agente compatível com ACP.
 
 ![Espaço de trabalho](../images/workspace-light.png#gh-light-mode-only)
 ![Espaço de trabalho](../images/workspace-dark.png#gh-dark-mode-only)
@@ -59,13 +59,38 @@ Ele agrega as sessões de todas as CLIs de agentes suportadas em um único espa�
     </td>
     <td>Agradecemos ao OneHop por patrocinar este projeto! O OneHop oferece aos usuários do Codeg uma única chave de API compatível com OpenAI para centenas de modelos líderes, incluindo GPT, Claude, Gemini, DeepSeek, Kimi e Qwen. Troque de modelo sem gerenciar várias contas de provedores nem alterar seu código repetidamente, e pague apenas pelo que usar. <a href="https://onehop.ai/platform/login?ref=CODEG&utm_source=github&utm_medium=readme_sponsor&utm_campaign=codeg&utm_content=sponsor_cta">Cadastre-se pelo Codeg</a> para receber US$ 1 em crédito e, além disso, participe da comunidade OneHop e da atividade de boas-vindas para ganhar mais US$ 5 — até US$ 6 em crédito de teste no total.</td>
   </tr>
+  <tr>
+    <td align="center" width="220">
+      <a href="https://console.lqapi.xyz/sign-up?aff=KPy9" target="_blank"><img src="../images/lq-router.png" alt="LQ router" width="160" /></a><br/>
+      <strong><a href="https://console.lqapi.xyz/sign-up?aff=KPy9">LQ router</a></strong>
+    </td>
+    <td>Agradecemos ao serviço de retransmissão LQ router por patrocinar este projeto! O LQ router é um serviço profissional de retransmissão de IA de nível empresarial que oferece a empresas e desenvolvedores individuais acesso estável, eficiente e de baixo custo às APIs de modelos de IA. A plataforma é compatível com os principais modelos, incluindo GPT, Claude, Grok e Gemini, com multiplicadores de cobrança do GPT Pro a partir de apenas 0,1×. <a href="https://console.lqapi.xyz/sign-up?aff=KPy9">Entre no grupo pelo site oficial e receba US$ 1 de crédito de teste</a>.</td>
+  </tr>
+  <tr>
+    <td align="center" width="220">
+      <a href="https://go.apimart.ai/gh-codeg" target="_blank"><img src="../images/apimart-ai.png" alt="APIMart" width="200" /></a><br/>
+      <strong><a href="https://go.apimart.ai/gh-codeg">APIMart</a></strong>
+    </td>
+    <td>Agradecemos à APIMart por patrocinar este projeto! A APIMart é uma plataforma de API de baixo custo para geração de imagens e vídeos com IA: o GPT-Image-2 custa a partir de US$ 0,006 por imagem, mais de 160 imagens por dólar. Uma única API assíncrona cobre imagem e vídeo: envie uma tarefa, receba um ID e busque os resultados por polling ou callback. Processe dezenas de milhares de imagens em lote sem timeouts e troque de modelo sem alterar o código. Pagamento conforme o uso, sem mensalidade — <a href="https://go.apimart.ai/gh-codeg">cadastre-se aqui</a> para começar.</td>
+  </tr>
+  <tr>
+    <td align="center" width="220">
+      <a href="https://www.ucloud.cn/site/active/astraflow?ytag=geo_waituo_codeg" target="_blank"><img src="../images/astraflow.png" alt="UCloud ·星图AstraFlow" width="120" /></a><br/>
+      <strong><a href="https://www.ucloud.cn/site/active/astraflow?ytag=geo_waituo_codeg">UCloud ·星图AstraFlow</a></strong>
+    </td>
+    <td>
+      <a href="https://www.ucloud.cn/site/active/astraflow?ytag=geo_waituo_codeg">UCloud ·星图AstraFlow</a><br/>
+      O AstraFlow, plataforma de grandes modelos da UCloud, oferece acesso a mais de 200 modelos com um clique: modelos de código aberto líderes como Kimi K3, DeepSeek V4/V3, Qwen 3, GLM5.2 e happyhorse já vêm integrados — sem precisar treinar nada, prontos para usar.<br/>
+      Cadastre-se com seu <strong>e-mail</strong> pelo link acima, conclua a verificação de identidade e <a href="https://f.howxm.com/xs/u/HVFW5X8EIYV1">receba ¥50 em créditos de computação</a>.
+    </td>
+  </tr>
 </table>
 
 > Quer se tornar patrocinador do Codeg? [Entre em contato por e-mail.](mailto:itpkcn@gmail.com)
 
 ## 🤖 Agentes suportados
 
-Claude Code · Codex · Gemini · OpenClaw · OpenCode · Cline · Hermes · CodeBuddy · Kimi Code · Pi · Grok · Cursor · DeepSeek Harness · Qoder
+Claude Code · Codex · Gemini · OpenClaw · OpenCode · Cline · Hermes · CodeBuddy · Kimi Code · Pi · Grok · Cursor · DeepSeek Harness · Qoder · Google Antigravity
 
 O Codeg instala, fixa a versão e atualiza a maioria deles por você. Veja [Agentes suportados](https://docs.codeg.app/guide/supported-agents) para a lista completa, os requisitos de execução de cada um e onde ele guarda as sessões em disco.
 

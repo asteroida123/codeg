@@ -210,10 +210,82 @@ pub async fn refresh_auto_title(
         .col_expr(conversation::Column::Title, Expr::value(title))
         .filter(conversation::Column::Id.eq(conversation_id))
         .filter(conversation::Column::TitleLocked.eq(false))
+        .filter(conversation::Column::DeletedAt.is_null())
         .filter(
             sea_orm::Condition::any()
                 .add(conversation::Column::Title.is_null())
                 .add(conversation::Column::Title.ne(title)),
+        )
+        .exec(conn)
+        .await?;
+    Ok(res.rows_affected > 0)
+}
+
+/// First-prompt seed: write `title` ONLY when the row is unlocked AND still
+/// empty. Unlike [`refresh_auto_title`], this will not replace an existing
+/// name — a later user prompt must not overwrite the first one, and an
+/// agent-generated ACP title that already landed must not be clobbered by
+/// the next send. Returns `true` when a row was written so the caller can
+/// broadcast a sidebar upsert. Does not bump `updated_at` or set the lock.
+pub async fn seed_auto_title_if_empty(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    title: String,
+) -> Result<bool, DbError> {
+    use sea_orm::sea_query::Expr;
+    let title = title.trim();
+    if title.is_empty() {
+        return Ok(false);
+    }
+    let res = conversation::Entity::update_many()
+        .col_expr(conversation::Column::Title, Expr::value(title))
+        .filter(conversation::Column::Id.eq(conversation_id))
+        .filter(conversation::Column::TitleLocked.eq(false))
+        .filter(conversation::Column::DeletedAt.is_null())
+        .filter(
+            sea_orm::Condition::any()
+                .add(conversation::Column::Title.is_null())
+                .add(conversation::Column::Title.eq("")),
+        )
+        .exec(conn)
+        .await?;
+    Ok(res.rows_affected > 0)
+}
+
+/// Write the session's `model` ONLY when the row still has none. The sibling
+/// of [`seed_auto_title_if_empty`], and for the same reason: a conversation
+/// row is inserted before the agent has named a model, so the column is NULL
+/// for every session started in-app and only the transcript knows the answer.
+/// Without this the sidebar — which reads the row, not the transcript — could
+/// only show a model for imported sessions.
+///
+/// First value wins. The detail view re-reads the transcript on every open and
+/// stays exact, so the stored value is a cheap projection for the list rather
+/// than a second source of truth; re-writing it on every model switch would
+/// buy a row write per switch for a chip nobody reads mid-turn.
+///
+/// Returns `true` when a row was written so the caller can broadcast a sidebar
+/// upsert. Does not bump `updated_at` — the sidebar sorts on it, and merely
+/// opening a conversation must not float it to the top of Recent (same
+/// reasoning as [`update_pin`]).
+pub async fn seed_model_if_empty(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    model: &str,
+) -> Result<bool, DbError> {
+    use sea_orm::sea_query::Expr;
+    let model = model.trim();
+    if model.is_empty() {
+        return Ok(false);
+    }
+    let res = conversation::Entity::update_many()
+        .col_expr(conversation::Column::Model, Expr::value(model))
+        .filter(conversation::Column::Id.eq(conversation_id))
+        .filter(conversation::Column::DeletedAt.is_null())
+        .filter(
+            sea_orm::Condition::any()
+                .add(conversation::Column::Model.is_null())
+                .add(conversation::Column::Model.eq("")),
         )
         .exec(conn)
         .await?;
@@ -727,6 +799,13 @@ pub async fn bind_external_id(
                 // Release S1 first — the unique index leaves no other order.
                 let mut active: conversation::ActiveModel = current.into();
                 active.external_id = Set(Some(external_id.clone()));
+                // The model described the session being released, and `carried`
+                // has already taken it for the row that keeps S1's history. Left
+                // in place it would name S1's model on a row that is now S2 —
+                // and `seed_model_if_empty` only fills an EMPTY column, so
+                // nothing would ever correct it. Cleared, S2 seeds itself on its
+                // next open.
+                active.model = Set(None);
                 active.updated_at = Set(now);
                 active.update(txn).await?;
 
@@ -964,6 +1043,64 @@ pub async fn soft_delete(conn: &DatabaseConnection, conversation_id: i32) -> Res
     Ok(())
 }
 
+/// Undo [`soft_delete`] for a conversation the user re-selected in the
+/// import picker. Returns `true` when this call is the one that brought the row
+/// back, `false` when it was already live (or is a delegation child, which is
+/// never a sidebar row) — so a caller can count restores without double-
+/// counting a concurrent one.
+///
+/// Deleting a conversation in codeg never touches the agent's own session file
+/// and never removes the row: it only stamps `deleted_at`. Everything needed to
+/// bring it back is therefore still on both sides, which is what makes restore
+/// a single conditional UPDATE rather than a re-insert — the conversation keeps
+/// its id, so bound tabs, token-usage rows and delegation children all still
+/// point at it.
+///
+/// Three columns move, and only these:
+/// * `deleted_at → NULL` — the restore itself.
+/// * `folder_id → folder_id` — the folder the import is landing this session's
+///   group in, which `add_folder` has just made live AND open. The row's own
+///   `folder_id` is deliberately NOT preserved: it may point at a folder the
+///   user has since removed or closed, and restoring into an invisible folder
+///   looks exactly like a restore that did not work. This is also the folder
+///   header the user checked the row under in the picker. (Live rows are still
+///   never moved — see `import_service::refresh_existing`; this applies only to
+///   a row being brought back.)
+/// * `status → pending_review` — the same status a fresh import lands on, and
+///   for the same reason: the sidebar's "show completed" filter defaults OFF,
+///   so a conversation restored as `completed` would come back invisible.
+///
+/// `updated_at` is deliberately left alone: a restore is not activity, and the
+/// caller's `refresh_external_activity` pass adopts the transcript's real
+/// last-activity time right after, so the row sorts where it belongs.
+///
+/// The `deleted_at IS NOT NULL` guard is re-evaluated by the database at write
+/// time, so a row that was un-deleted between the caller's read and this write
+/// is not clobbered back to `pending_review`.
+pub async fn restore_soft_deleted(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    folder_id: i32,
+) -> Result<bool, DbError> {
+    use sea_orm::sea_query::Expr;
+    let res = conversation::Entity::update_many()
+        .col_expr(
+            conversation::Column::DeletedAt,
+            Expr::value(None::<chrono::DateTime<Utc>>),
+        )
+        .col_expr(conversation::Column::FolderId, Expr::value(folder_id))
+        .col_expr(
+            conversation::Column::Status,
+            Expr::value(conversation::ConversationStatus::PendingReview),
+        )
+        .filter(conversation::Column::Id.eq(conversation_id))
+        .filter(conversation::Column::DeletedAt.is_not_null())
+        .filter(conversation::Column::ParentId.is_null())
+        .exec(conn)
+        .await?;
+    Ok(res.rows_affected > 0)
+}
+
 fn parse_agent_type(s: &str) -> AgentType {
     match serde_json::from_value(serde_json::Value::String(s.to_string())) {
         Ok(at) => at,
@@ -1059,6 +1196,57 @@ pub async fn get_by_id(
     let mut summary = conv_to_summary(conv);
     fill_child_counts(conn, std::slice::from_mut(&mut summary)).await?;
     Ok(summary)
+}
+
+/// Resolve a `codeg://session/<ref>` path to a live (non-deleted) conversation.
+///
+/// `session_ref` is either Codeg's numeric primary key (what MCP and the
+/// `codeg://session/<id>` markdown mentions use) or the agent's own session
+/// id stored as `external_id` (a Grok UUID, a Codex thread id, …). Several
+/// rows can share an `external_id` across agents; the most recently updated
+/// live row wins. Missing rows return `Ok(None)` — a stale deep link is not
+/// an error.
+///
+/// A numeric ref is tried as a primary key *first* and as an `external_id`
+/// only if no live row carries that id: nothing stops an agent from handing
+/// out all-digit session ids, and silently resolving one to an unrelated
+/// conversation that happens to own that PK is worse than a second query.
+pub async fn find_live_by_session_ref(
+    conn: &DatabaseConnection,
+    session_ref: &str,
+) -> Result<Option<DbConversationSummary>, DbError> {
+    let session_ref = session_ref.trim();
+    if session_ref.is_empty() {
+        return Ok(None);
+    }
+    let by_pk = match session_ref.parse::<i32>() {
+        Ok(id) if id > 0 => {
+            conversation::Entity::find_by_id(id)
+                .filter(conversation::Column::DeletedAt.is_null())
+                .one(conn)
+                .await?
+        }
+        _ => None,
+    };
+    let conv = match by_pk {
+        Some(conv) => Some(conv),
+        None => {
+            conversation::Entity::find()
+                .filter(conversation::Column::ExternalId.eq(session_ref))
+                .filter(conversation::Column::DeletedAt.is_null())
+                .order_by_desc(conversation::Column::UpdatedAt)
+                .one(conn)
+                .await?
+        }
+    };
+    match conv {
+        Some(conv) => {
+            let mut summary = conv_to_summary(conv);
+            fill_child_counts(conn, std::slice::from_mut(&mut summary)).await?;
+            Ok(Some(summary))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Look up a child conversation by its `delegation_call_id` (the broker's
@@ -1453,6 +1641,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seed_model_fills_an_empty_column_once_without_bumping_updated_at() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-seed-model").await;
+        let conv = create(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("c".into()),
+            None,
+        )
+        .await
+        .expect("create");
+
+        // The gap this closes: a row created in-app carries no model at all,
+        // which is why the sidebar could only ever show one for imported
+        // sessions.
+        let before = get_by_id(&db.conn, conv.id).await.expect("get before");
+        assert!(before.model.is_none(), "a new row names no model");
+        let updated_at_before = before.updated_at;
+
+        assert!(
+            seed_model_if_empty(&db.conn, conv.id, "  gpt-5-codex  ")
+                .await
+                .expect("seed"),
+            "an empty column must be filled, and report that it was so the \
+             caller knows to broadcast"
+        );
+        let seeded = get_by_id(&db.conn, conv.id).await.expect("get seeded");
+        assert_eq!(seeded.model.as_deref(), Some("gpt-5-codex"), "trimmed");
+        assert_eq!(
+            seeded.updated_at, updated_at_before,
+            "seeding must not bump updated_at: the sidebar sorts on it, and \
+             merely opening a conversation must not float it to the top"
+        );
+
+        // First value wins. The detail view re-reads the transcript and stays
+        // exact; the column is a projection for the list, not a second source
+        // of truth that fights the parse.
+        assert!(
+            !seed_model_if_empty(&db.conn, conv.id, "gpt-5.2")
+                .await
+                .expect("second seed"),
+            "a populated column must be left alone, and say nothing was written"
+        );
+        assert_eq!(
+            get_by_id(&db.conn, conv.id)
+                .await
+                .expect("get after")
+                .model
+                .as_deref(),
+            Some("gpt-5-codex")
+        );
+
+        // A transcript that names no model asks for no write at all.
+        assert!(
+            !seed_model_if_empty(&db.conn, conv.id, "   ")
+                .await
+                .expect("blank seed")
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_model_skips_a_soft_deleted_row() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-seed-model-deleted").await;
+        let conv = create(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("c".into()),
+            None,
+        )
+        .await
+        .expect("create");
+        soft_delete(&db.conn, conv.id).await.expect("delete");
+
+        assert!(
+            !seed_model_if_empty(&db.conn, conv.id, "gpt-5-codex")
+                .await
+                .expect("seed"),
+            "a deleted conversation is not something an open can resurrect a \
+             column on"
+        );
+    }
+
+    #[tokio::test]
     async fn update_pin_sets_and_clears_without_bumping_updated_at() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/codeg-update-pin").await;
@@ -1591,6 +1865,9 @@ mod tests {
         bind_external_id(&db.conn, row.id, "S1", &[])
             .await
             .expect("first bind");
+        seed_model_if_empty(&db.conn, row.id, "gpt-5-codex")
+            .await
+            .expect("seed S1's model");
         let before = raw_row(&db.conn, row.id).await;
 
         let preserved_id = bind_external_id(&db.conn, row.id, "S2", &[])
@@ -1604,6 +1881,12 @@ mod tests {
             Some("S2"),
             "the live row advances to the new session"
         );
+        assert!(
+            current.model.is_none(),
+            "the model described S1; left behind it would name S1's model on a \
+             row that is now S2, and `seed_model_if_empty` only fills an EMPTY \
+             column, so nothing would ever correct it"
+        );
 
         let preserved = raw_row(&db.conn, preserved_id).await;
         assert_eq!(preserved.external_id.as_deref(), Some("S1"));
@@ -1615,6 +1898,11 @@ mod tests {
         assert_eq!(preserved.folder_id, before.folder_id);
         assert_eq!(preserved.agent_type, before.agent_type);
         assert_eq!(preserved.git_branch.as_deref(), Some("main"));
+        assert_eq!(
+            preserved.model.as_deref(),
+            Some("gpt-5-codex"),
+            "the model belongs to S1, and this row is what S1 becomes"
+        );
         assert_eq!(
             preserved.created_at, before.created_at,
             "created_at is carried, not stamped now — the preserved row IS the \
@@ -2234,6 +2522,112 @@ mod tests {
             summary.updated_at, before,
             "auto-title backfill is metadata, not activity — it must not bump updated_at"
         );
+    }
+
+    #[tokio::test]
+    async fn seed_auto_title_if_empty_writes_only_when_untitled() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-title-seed").await;
+        let row = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+        let before = row.updated_at;
+
+        assert!(
+            seed_auto_title_if_empty(&db.conn, row.id, "  First prompt  ".into())
+                .await
+                .expect("seed"),
+            "an empty unlocked title must be seeded"
+        );
+        let summary = get_by_id(&db.conn, row.id).await.expect("get");
+        assert_eq!(summary.title.as_deref(), Some("First prompt"));
+        assert!(!summary.title_locked);
+        assert_eq!(summary.updated_at, before, "seed must not bump updated_at");
+
+        assert!(
+            !seed_auto_title_if_empty(&db.conn, row.id, "Second prompt".into())
+                .await
+                .expect("seed-2"),
+            "a later prompt must not replace the first-prompt seed"
+        );
+        let summary = get_by_id(&db.conn, row.id).await.expect("get-2");
+        assert_eq!(summary.title.as_deref(), Some("First prompt"));
+    }
+
+    #[tokio::test]
+    async fn seed_auto_title_if_empty_skips_locked_and_empty() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-title-seed-skip").await;
+        let row = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+        update_title(&db.conn, row.id, "User pick".into())
+            .await
+            .expect("rename");
+
+        assert!(
+            !seed_auto_title_if_empty(&db.conn, row.id, "First prompt".into())
+                .await
+                .expect("seed-locked"),
+            "a locked title must not be seeded over"
+        );
+        assert!(
+            !seed_auto_title_if_empty(&db.conn, row.id, String::new())
+                .await
+                .expect("seed-empty")
+        );
+        let summary = get_by_id(&db.conn, row.id).await.expect("get");
+        assert_eq!(summary.title.as_deref(), Some("User pick"));
+    }
+
+    /// Neither auto-title primitive may write a soft-deleted row. Both are now
+    /// driven from the live ACP path (a title can land while the user is
+    /// deleting the conversation), and a late write to a deleted row is a
+    /// resurrection the sidebar can never show — `emit_conversation_upsert`
+    /// filters it out, so the row would silently diverge from every client.
+    #[tokio::test]
+    async fn auto_title_writes_skip_soft_deleted_rows() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-title-deleted").await;
+
+        // Untitled + deleted: the first-prompt seed must not name it.
+        let seeded = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+        soft_delete(&db.conn, seeded.id).await.expect("soft delete");
+        assert!(
+            !seed_auto_title_if_empty(&db.conn, seeded.id, "First prompt".into())
+                .await
+                .expect("seed"),
+            "a soft-deleted row must not be seeded"
+        );
+
+        // Titled + deleted: a live ACP title must not replace it either.
+        let refreshed = create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("Old name".into()),
+            None,
+        )
+        .await
+        .expect("create");
+        soft_delete(&db.conn, refreshed.id).await.expect("soft delete");
+        assert!(
+            !refresh_auto_title(&db.conn, refreshed.id, "Agent title".into())
+                .await
+                .expect("refresh"),
+            "a soft-deleted row must not be auto-retitled"
+        );
+
+        for (id, expected) in [(seeded.id, None), (refreshed.id, Some("Old name"))] {
+            let row = conversation::Entity::find_by_id(id)
+                .one(&db.conn)
+                .await
+                .expect("query")
+                .expect("row still present");
+            assert_eq!(row.title.as_deref(), expected);
+        }
     }
 
     /// The work-task / automation launch path: the seed IS the name, so locking

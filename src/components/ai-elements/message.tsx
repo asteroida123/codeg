@@ -30,10 +30,13 @@ import {
 } from "streamdown"
 import { markdownLinkComponents } from "./markdown-link"
 import { maskLiteralSpans } from "./markdown-mask"
+import { mermaidComponents } from "./mermaid-block"
 import { rehypePluginsAllowingCodeg } from "./rehype-allow-codeg"
 import { remarkTrimCjkAutolinkTail } from "./remark-cjk-autolink-tail"
 import { remarkRewriteFileUriLinks } from "./remark-file-uri-links"
 import { remarkRestoreWindowsPaths } from "./remark-windows-paths"
+import { remarkLocalImages } from "./remark-local-images"
+import { markdownLocalImageComponents } from "./markdown-local-image"
 import { MATH_FENCE_PAD, useStreamdownPlugins } from "./streamdown-plugins"
 
 export type MessageProps = HTMLAttributes<HTMLDivElement> & {
@@ -466,6 +469,7 @@ const remarkPlugins = [
   ...Object.values(defaultRemarkPlugins),
   // Before remarkRewriteFileUriLinks, which reshapes a drive path's url.
   remarkRestoreWindowsPaths,
+  remarkLocalImages,
   remarkRewriteFileUriLinks,
   remarkTrimCjkAutolinkTail,
 ]
@@ -475,9 +479,39 @@ const remarkPlugins = [
 // MarkdownLink → ReferenceBadge. See rehype-allow-codeg for the full rationale.
 const rehypePlugins = rehypePluginsAllowingCodeg(defaultRehypePlugins)
 
+/**
+ * How finished Markdown renders. Streamdown defaults to `mode="streaming"` +
+ * remend; remend 1.2.0 appends a closer after spans that are ALREADY complete —
+ * a glob inside code (`` `foo/*` ``), an identifier like `_meta` / `_blank` —
+ * so a finished reply grew a stray `*` / `_`. When the reply ends exactly at a
+ * closing fence that `_` lands after the final ```, the fence stops closing and
+ * the backticks become code content (#555).
+ *
+ * `mode` is the half that does the work, and it is NOT interchangeable with
+ * the other one. Streamdown runs remend only when `mode === "streaming" &&
+ * parseIncompleteMarkdown`, so static already bypasses it — but static is also
+ * the only half that repaints: Streamdown's own memo compares `mode` and NOT
+ * `parseIncompleteMarkdown`, so at the live → finished flip, with the text
+ * unchanged (the common case — the last delta already carried the whole
+ * reply), flipping only `parseIncompleteMarkdown` leaves the remended DOM on
+ * screen. `parseIncompleteMarkdown` is therefore redundant while `mode` is
+ * static, and kept as an explicit invariant: it is what keeps a caller who
+ * passes `mode="streaming"` for finished content from re-growing the closer.
+ *
+ * The impl default and the memo comparator below must agree on these, or a
+ * caller passing the default explicitly would compare unequal to one omitting
+ * it — hence the shared constants.
+ */
+const FINISHED_MODE = "static" as const
+const FINISHED_PARSE_INCOMPLETE_MARKDOWN = false
+
 function MessageResponseImpl({
   className,
   children,
+  // Finished content by default; a live turn opts back into remend by passing
+  // `mode="streaming" parseIncompleteMarkdown`. See FINISHED_MODE above.
+  mode = FINISHED_MODE,
+  parseIncompleteMarkdown = FINISHED_PARSE_INCOMPLETE_MARKDOWN,
   ...props
 }: MessageResponseProps) {
   const normalized = useMemo(
@@ -495,15 +529,35 @@ function MessageResponseImpl({
     <Streamdown
       className={cn(
         "size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&_ul]:list-disc [&_ol]:list-decimal [&_ul]:pl-3 [&_ol]:pl-3",
+        // Streamdown gives `blockquote` its own `border-l-4
+        // border-muted-foreground/30 … italic`, but those class names live in
+        // node_modules, which Tailwind v4 does not scan — so the two border
+        // utilities generate no CSS and a quote renders as bare indented text
+        // with no rule (the `pl-4`/`my-4`/`text-muted-foreground` on the same
+        // element only survive because they happen to be used elsewhere in src).
+        // Re-declare the rule here, where it IS scanned; the descendant selector
+        // also outranks Streamdown's plain utility class. No `pl-*` — its `pl-4`
+        // already works and a same-specificity duplicate would be a coin flip.
+        // Upright, not italic: CJK has no true italic, so a browser fakes it by
+        // skewing, which looks broken.
+        "[&_blockquote]:border-l-2 [&_blockquote]:border-border [&_blockquote]:not-italic",
         className
       )}
       plugins={plugins}
       remarkPlugins={remarkPlugins}
       rehypePlugins={rehypePlugins}
+      mode={mode}
+      parseIncompleteMarkdown={parseIncompleteMarkdown}
       {...props}
       // Merge after spreading props so a caller can still override other
-      // elements, but the link icon + safety routing on `a` always wins.
-      components={{ ...props.components, ...markdownLinkComponents }}
+      // elements, but the link icon + safety routing on `a` — and the diagram
+      // block on `pre` — always win.
+      components={{
+        ...props.components,
+        ...markdownLinkComponents,
+        ...markdownLocalImageComponents,
+        ...mermaidComponents,
+      }}
     >
       {normalized}
     </Streamdown>
@@ -512,7 +566,12 @@ function MessageResponseImpl({
 
 export const MessageResponse = memo(
   MessageResponseImpl,
-  (prevProps, nextProps) => prevProps.children === nextProps.children
+  (prevProps, nextProps) =>
+    prevProps.children === nextProps.children &&
+    (prevProps.mode ?? FINISHED_MODE) === (nextProps.mode ?? FINISHED_MODE) &&
+    (prevProps.parseIncompleteMarkdown ??
+      FINISHED_PARSE_INCOMPLETE_MARKDOWN) ===
+      (nextProps.parseIncompleteMarkdown ?? FINISHED_PARSE_INCOMPLETE_MARKDOWN)
 )
 
 MessageResponse.displayName = "MessageResponse"

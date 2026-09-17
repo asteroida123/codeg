@@ -402,7 +402,15 @@ describe("SuggestionPopup", () => {
       within(screen.getByTestId("mention-popup")).getByText("Loading")
     ).toBeInTheDocument()
 
-    act(() => ref.current?.onKeyDown(key("Enter")))
+    // Declined, not swallowed: with nothing to insert the key belongs to the
+    // editor. Android's soft keyboard reaches this path through a synthetic
+    // Enter that ProseMirror fires *after* applying the DOM change, and a
+    // `true` there would make it drop the change (the user's newline).
+    let handled: boolean | undefined
+    act(() => {
+      handled = ref.current?.onKeyDown(key("Enter"))
+    })
+    expect(handled).toBe(false)
     expect(onSelect).not.toHaveBeenCalled()
   })
 
@@ -445,8 +453,8 @@ describe("SuggestionPopup", () => {
     expect(container.style.visibility).toBe("visible")
     expect(container.style.position).toBe("fixed")
     expect(container.dataset.placement).toBeTruthy()
-    // The panel portals to `body`, which a modal Radix layer (a Dialog or Sheet
-    // hosting the composer) sets to `pointer-events: none`. Without its own
+    // The panel portals to `body`, which a modal Radix layer (a Dialog hosting
+    // the composer) sets to `pointer-events: none`. Without its own
     // `auto` the panel is click-dead inside one, and the press lands on the
     // document — which that layer reads as an outside press and closes itself.
     expect(container.style.pointerEvents).toBe("auto")

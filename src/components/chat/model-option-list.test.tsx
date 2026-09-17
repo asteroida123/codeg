@@ -15,6 +15,17 @@ import {
   type Ref,
 } from "react"
 
+// The list sizes its scroll window in rem, so it reads the live zoom level —
+// which throws outside an AppearanceProvider. Pin it at 100% (1rem = 16px), the
+// baseline every height assertion here is written against. Spread the real
+// module so the other appearance hooks keep their real (provider-requiring)
+// behaviour instead of silently resolving to `undefined` if something here
+// starts using one.
+vi.mock("@/hooks/use-appearance", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/use-appearance")>()),
+  useZoomLevel: () => ({ zoomLevel: 100, setZoomLevel: () => {} }),
+}))
+
 // virtua renders ZERO rows under jsdom (no layout), so mock the `Virtualizer` to
 // render every child directly — the established pattern (see logs-settings and
 // sidebar-conversation-list tests). Forward a no-op scrollToIndex handle so the
@@ -100,6 +111,39 @@ describe("ModelOptionList", () => {
       "aria-selected",
       "false"
     )
+  })
+
+  // codex-acp 1.11.0 names a recommended value per select
+  // (`_meta.jetbrains.air.recommendedValue`). It is worth its own row marker
+  // precisely because it is NOT the selection: codeg replays a persisted
+  // per-agent preference into every new session, so the selected model is
+  // routinely one the agent no longer defaults to.
+  it("badges the recommended row, independently of the selected one", () => {
+    renderList({
+      recommendedValue: "anthropic/sonnet",
+      recommendedLabel: "Recommended",
+    })
+    const recommended = screen.getByRole("option", { name: /sonnet/ })
+    expect(recommended).toHaveTextContent("Recommended")
+    // The recommendation says nothing about what is selected, and vice versa.
+    expect(recommended).toHaveAttribute("aria-selected", "false")
+    const selected = screen.getByRole("option", { name: /opus/ })
+    expect(selected).toHaveAttribute("aria-selected", "true")
+    expect(selected).not.toHaveTextContent("Recommended")
+  })
+
+  // A recommendation that matches no option marks nothing — the backend
+  // deliberately does not validate membership against the list, so this is the
+  // guard that makes that safe. Same for a recommendation with no label.
+  it("marks nothing for an unknown recommendation or a missing label", () => {
+    renderList({
+      recommendedValue: "anthropic/retired",
+      recommendedLabel: "Recommended",
+    })
+    expect(screen.queryByText("Recommended")).toBeNull()
+    cleanup()
+    renderList({ recommendedValue: "anthropic/sonnet" })
+    expect(screen.queryByText("Recommended")).toBeNull()
   })
 
   it("filters options as you type (matching name or value)", async () => {

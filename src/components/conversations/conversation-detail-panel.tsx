@@ -1,16 +1,9 @@
 "use client"
 
-import {
-  memo,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type PointerEvent as ReactPointerEvent,
-} from "react"
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   AlertCircle,
+  Check,
   Copy,
   Download,
   FileCode,
@@ -29,6 +22,7 @@ import {
   getCachedSelectors,
   useAcpActions,
   useAcpEvent,
+  useConnectionStore,
 } from "@/contexts/acp-connections-context"
 import { useAcpAgents } from "@/hooks/use-acp-agents"
 import { useActiveFolder } from "@/contexts/active-folder-context"
@@ -37,7 +31,14 @@ import { useTabActions, useTabStore } from "@/contexts/tab-context"
 import { groupOfTab, isReparentUnmount } from "@/stores/tab-store"
 import { computeRects, leafIds } from "@/lib/tab-group-layout"
 import { useTaskContext } from "@/contexts/task-context"
-import { cn, copyTextFromMenu, randomUUID } from "@/lib/utils"
+import { cn, copyTextToClipboard, randomUUID } from "@/lib/utils"
+import { buildAskPrompt, buildQuotedMarkdown } from "@/lib/message-quote"
+import {
+  ASK_SELECTION_PARKED_EVENT,
+  consumeAskSelectionPrompts,
+  parkAskSelectionPrompt,
+  type AskSelectionParkedDetail,
+} from "@/lib/ask-selection-handoff"
 import { useConnectionLifecycle } from "@/hooks/use-connection-lifecycle"
 import { useMessageQueue, type QueuedMessage } from "@/hooks/use-message-queue"
 import { MessageListView } from "@/components/message/message-list-view"
@@ -49,7 +50,6 @@ import { useAdvertisedGoalActions } from "@/hooks/use-goal-actions"
 import { ConversationShell } from "@/components/chat/conversation-shell"
 import { SessionConfigStaleBanner } from "@/components/chat/session-config-stale-banner"
 import { PiProjectTrustBanner } from "@/components/chat/pi-project-trust-banner"
-import { BackgroundTasksChip } from "@/components/chat/background-tasks-chip"
 import { FeedbackNotesDisplay } from "@/components/chat/feedback-notes-display"
 import { FeedbackDialog } from "@/components/chat/feedback-dialog"
 import { AgentDiagnosticsDialog } from "@/components/settings/agent-diagnostics-dialog"
@@ -62,6 +62,7 @@ import { QuickActions } from "@/components/chat/quick-actions"
 import type { ComposerInjectContent } from "@/components/chat/message-input"
 import { TileScrollContainer } from "@/components/conversations/tile-scroll-container"
 import { GroupSplitHandle } from "@/components/conversations/group-split-handle"
+import { OverlayHostHiddenProvider } from "@/components/ui/overlay-host-hidden"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { TabBar } from "@/components/tabs/tab-bar"
 import { TabDragGhost } from "@/components/tabs/tab-drag-ghost"
@@ -75,6 +76,7 @@ import { isDesktop } from "@/lib/platform"
 import { leftChromeReserve, rightChromeReserve } from "@/lib/window-chrome"
 import {
   acpFork,
+  acpStopAsyncTask,
   createChatConversation,
   createChatDir,
   createConversation,
@@ -83,13 +85,17 @@ import {
 } from "@/lib/api"
 import { isWindowedDetail } from "@/lib/turn-window"
 import {
+  hasTranscriptOverlay,
+  isOutOfTurnContentEvent,
+} from "@/lib/background-agent"
+import {
   flushRetryDelayMs,
-  forkSendBlockedByQueue,
   isConnectionReady,
   shouldQueueDirectSend,
   shouldRejectDuplicateCreate,
 } from "@/lib/queue-flush"
-import { TurnBusyError } from "@/lib/turn-busy"
+import { TurnBusyError, isNoActiveTurnRejection } from "@/lib/turn-busy"
+import { toErrorMessage } from "@/lib/app-error"
 import {
   getConversationIdByExternalIdFromStore,
   getRuntimeSession,
@@ -100,6 +106,7 @@ import {
 import { useShallow } from "zustand/react/shallow"
 import { useConversationDetail } from "@/hooks/use-conversation-detail"
 import {
+  buildSteerPayload,
   extractUserImagesFromDraft,
   getPromptDraftDisplayText,
 } from "@/lib/prompt-draft"
@@ -111,6 +118,7 @@ import {
   type MessageTurn,
   type PlanApprovalAnswer,
   type PromptDraft,
+  type PromptInputBlock,
   type QuestionAnswer,
   type UserMessageBlock,
 } from "@/lib/types"
@@ -119,6 +127,8 @@ import {
   lastUserPromptText,
   type SessionFailureAction,
 } from "@/lib/session-failures"
+import { userPromptHistory } from "@/lib/composer-history"
+import { contentBlocksFromUserMessage } from "@/lib/user-message-blocks"
 import { getAgentLabel } from "@/lib/custom-agents"
 import {
   getSavedModeId,
@@ -209,15 +219,10 @@ function buildUserTurnFromMessageBlocks(
   messageId: string,
   blocks: UserMessageBlock[]
 ): MessageTurn {
-  const contentBlocks: ContentBlock[] = blocks.map((b) =>
-    b.type === "image"
-      ? { type: "image", data: b.data, mime_type: b.mime_type, uri: null }
-      : { type: "text", text: b.text }
-  )
   return {
     id: messageId,
     role: "user",
-    blocks: contentBlocks,
+    blocks: contentBlocksFromUserMessage(blocks),
     timestamp: new Date().toISOString(),
   }
 }
@@ -242,10 +247,14 @@ const ConversationTabView = memo(function ConversationTabView({
   groupId,
 }: ConversationTabViewProps) {
   const t = useTranslations("Folder.conversation")
+  // Composer-namespace copy for the queue row's click-to-insert outcomes
+  // (same keys the composer's own mid-turn send reports).
+  const tCmp = useTranslations("Folder.chat.messageInput")
   const tWelcome = useTranslations("Folder.chat.welcomeInputPanel")
   const tDiag = useTranslations("DiagnosticsSettings")
   const sharedT = useTranslations("Folder.chat.shared")
   const tMessageList = useTranslations("Folder.chat.messageList")
+  const tAsyncTasks = useTranslations("Folder.chat.asyncTasks")
   const refreshConversations = useAppWorkspaceStore(
     (s) => s.refreshConversations
   )
@@ -286,6 +295,7 @@ const ConversationTabView = memo(function ConversationTabView({
     removeOptimisticTurn,
     appendViewerUserTurn,
     completeTurn,
+    markOutOfTurnContent,
     refetchDetail,
     syncTurnMetadata,
     removeConversation,
@@ -297,6 +307,9 @@ const ConversationTabView = memo(function ConversationTabView({
     setSyncState,
   } = useConversationRuntimeActions()
   const acpActions = useAcpActions()
+  // Stable store handle, for event-time status reads that must not go through
+  // an effect-refreshed ref (see the out-of-turn subscriber below).
+  const connectionStore = useConnectionStore()
 
   // Stable runtime session key — set once at mount, never changes.
   // For new conversations this is a virtual (negative) ID; for existing
@@ -331,7 +344,11 @@ const ConversationTabView = memo(function ConversationTabView({
     null
   )
   const [hasSentMessage, setHasSentMessage] = useState(false)
-  const [quickActionInject, setQuickActionInject] =
+  // One inbox for everything pushed into this tab's composer from outside it:
+  // welcome-page quick actions (replace) and quoted transcript selections
+  // (append). Exactly one composer is mounted at a time — the welcome one or the
+  // docked one — so a single slot can serve both.
+  const [composerInject, setComposerInject] =
     useState<ComposerInjectContent | null>(null)
 
   const hasPersistedConversation = dbConversationId != null
@@ -482,20 +499,37 @@ const ConversationTabView = memo(function ConversationTabView({
       })
     )
 
-  // Two-source resolution for the session id passed to acp_connect:
-  //   1. detail.summary.external_id — DB value, available for tabs opened
-  //      from the sidebar (effectiveConversationId equals the real cid).
-  //   2. runtimeExternalId — populated by the connSessionId effect
-  //      below when SessionStarted fires. This is the ONLY source for tabs
-  //      that started as a new conversation: their effectiveConversationId
-  //      is locked to a virtual negative id (line 186 useState initializer
-  //      runs once), useConversationDetail skips fetching for virtual ids,
-  //      and detail stays null forever. Without this fallback, every
-  //      reconnect on a new-conversation tab passes sessionId=undefined →
-  //      backend takes session/new → DB.external_id is overwritten on the
-  //      next prompt → original sid orphaned, agent loses prior context.
+  // Session id passed to acp_connect. `runtimeExternalId` is the single
+  // resolution point, NOT a fallback behind `detail`: it is fed by BOTH
+  // sources — the effect below writes `detail.summary.external_id` into it
+  // whenever the DB value changes, and the `connSessionId` effect writes the
+  // live session id — so it is always the more recently established of the
+  // two. `detail` remains as the fallback for the first render after a cold
+  // open, before that effect has run.
+  //
+  // Ordering it the other way round silently un-forked a conversation. A fork
+  // re-points THIS row at S2 and inserts a sibling row holding S1; the panel
+  // learns S2 immediately (`setExternalId` from the fork response) but
+  // `detail` still holds S1 until its refetch lands. With `detail` winning,
+  // the next reconnect asked for S1 — which the new sibling row now owns — so
+  // the tab re-homed onto the sibling and the user was looking at the pre-fork
+  // history again, `[Fork]` row abandoned. Forking from there forked S1 a
+  // second time, which is exactly the chain the conversation table records:
+  // each row created at one fork's timestamp, then itself forked at the next.
+  // Because the tab landed on a session it had not established, the composer's
+  // selectors came back as the agent's defaults too — the reported "model
+  // changed after forking".
+  //
+  // The `detail` fallback still matters for tabs that started as a new
+  // conversation: their `effectiveConversationId` is locked to a virtual
+  // negative id (line 186's useState initializer runs once),
+  // useConversationDetail skips fetching for virtual ids, and `detail` stays
+  // null forever — there, `runtimeExternalId` is the ONLY source, and without
+  // it every reconnect passes sessionId=undefined → backend takes session/new
+  // → DB.external_id is overwritten on the next prompt → original sid
+  // orphaned, agent loses prior context.
   const externalId =
-    detail?.summary.external_id ?? runtimeExternalId ?? undefined
+    runtimeExternalId ?? detail?.summary.external_id ?? undefined
   // For persisted conversations opened from the sidebar, wait until the
   // session's external_id has been resolved before auto-connecting.
   // Otherwise the auto-connect effect fires with sessionId=undefined and
@@ -579,6 +613,11 @@ const ConversationTabView = memo(function ConversationTabView({
     // Drives cross-client viewer discovery: when another client is already
     // live on this conversation, attach to its connection instead of spawning.
     conversationId: dbConversationId ?? undefined,
+    // The auto-connect gate above is a WAIT, not an idle state: report it so the
+    // composer and the status bar can show the conversation is opening instead
+    // of an empty, connection-less composer. Scoped to the active tab — the
+    // status bar is global.
+    preparing: isActive && awaitingHistoricalSessionId,
     // A cross-group move / unsplit reparents this view (React remounts it)
     // while the tab stays open — that unmount must not tear the connection
     // down. See `isReparentUnmount` for why "still open" alone is too broad.
@@ -636,13 +675,19 @@ const ConversationTabView = memo(function ConversationTabView({
   // No-op for normal conversations, whose connected cwd always equals intended.
   // A connection still bound to a different agent is never "ready" for the
   // selected one — it would otherwise let a send reach the previous agent.
-  const connectionReady =
-    !connIsForOtherAgent &&
-    isConnectionReady(
-      connStatus,
-      conn.connectedWorkingDir,
-      workingDirForConnection
-    )
+  const connectionReady = isConnectionReady(
+    connStatus,
+    conn.connectedWorkingDir,
+    workingDirForConnection,
+    conn.agentType,
+    selectedAgent
+  )
+  // Read by the queue auto-flush's deferred timer, which must not act on a
+  // readiness reading captured a tick ago.
+  const connectionReadyRef = useRef(connectionReady)
+  useEffect(() => {
+    connectionReadyRef.current = connectionReady
+  }, [connectionReady])
   // Present "connecting" to the composer while connected-but-not-ready, so it
   // disables its send affordance instead of inviting a submit handleSend rejects.
   // While the live connection still belongs to a different agent, present the
@@ -675,6 +720,12 @@ const ConversationTabView = memo(function ConversationTabView({
     }
     return effectiveModes?.current_mode_id ?? connectionModes[0]?.id ?? null
   }, [effectiveModes, connectionModes, modeId])
+  // Read by the queue auto-flush for items that were queued before this tab knew
+  // its modes (it runs from a timer, so it must not close over a stale value).
+  const selectedModeIdRef = useRef(selectedModeId)
+  useEffect(() => {
+    selectedModeIdRef.current = selectedModeId
+  }, [selectedModeId])
 
   // The single blocking message shown in the composer's inline banner (clicking
   // it opens Agent Settings). The not-installed prompt takes priority: it's the
@@ -756,6 +807,15 @@ const ConversationTabView = memo(function ConversationTabView({
   // another turn while this client believes it is idle) don't spin one failed
   // send per round-trip.
   const lastFlushBounceAtRef = useRef(0)
+  // Whether a queued row's click-to-insert (`handleQueueSteer`) is mid-flight.
+  // The row STAYS in the queue for the whole round-trip — it only leaves once
+  // the backend confirms delivery — so without this the turn-end edge would
+  // hand the same row to the flush below while the insert is still settling:
+  // admitted against the ending turn AND re-sent as the next turn's prompt,
+  // i.e. the agent reads the same instruction twice. Holding the flush for one
+  // round-trip is enough, and cannot strand the queue: `handleQueueSteer`
+  // always clears this in a `finally`, which re-runs the flush effect.
+  const [queueSteerInFlight, setQueueSteerInFlight] = useState(false)
 
   // Flush queued messages whenever the agent is idle. This is the queue's send
   // engine, covering BOTH:
@@ -770,41 +830,46 @@ const ConversationTabView = memo(function ConversationTabView({
   // bounces and rolls back to idle to retry the next item). A bounce backoff
   // rate-limits retries against a still-busy backend.
   useEffect(() => {
-    if (connStatus !== "connected") return
-    // Don't flush onto a connection whose cwd doesn't match the tab's intended
-    // working dir. This matters for a just-bound chat conversation: bind switches
-    // the tab's workingDir from the draft's previous folder to the scratch dir,
-    // and for one render `connStatus` can still read the stale "connected" of the
-    // old-folder session before the reconnect lands. Flushing then would deliver
-    // the queued prompt to the wrong folder's agent. (No-op for normal
-    // conversations, whose connection cwd always equals the intended one.)
-    if (
-      (conn.connectedWorkingDir ?? null) !== (workingDirForConnection ?? null)
-    ) {
-      return
-    }
+    // The SAME readiness predicate `handleSend` gates on — deliberately the one
+    // variable, not a re-spelling of it. This effect DEQUEUES before handing the
+    // message over, so any gate weaker than the send's own check takes a message
+    // off the queue and then watches `handleSend` silently drop it. Bare
+    // "connected" is two such weakenings: a just-bound chat conversation can
+    // read a stale "connected" for the PREVIOUS cwd, and a draft whose agent was
+    // switched keeps the OLD agent's connection live at the same cwd until the
+    // lifecycle reconnects — which, for a not-installed target, never happens.
+    if (!connectionReady) return
     if (runtimeSyncState === "awaiting_persist") return
+    // A row being inserted into the (just-ended) turn is still queued; sending
+    // it now would deliver it twice. See `queueSteerInFlight`.
+    if (queueSteerInFlight) return
     if (msgQueue.length === 0) return
     // setTimeout (not microtask) so a COMPLETE_TURN commit settles first AND so
     // a just-bounced retry waits out the backoff window before re-sending.
     const wait = flushRetryDelayMs(Date.now(), lastFlushBounceAtRef.current)
     const timer = setTimeout(() => {
-      if (connStatusRef.current !== "connected") return
+      if (!connectionReadyRef.current) return
       const next = autoSendQueueRef.current()
       if (next) {
         // Mark this as the queue auto-flush: it sends the dequeued head now and,
         // on a bounce, returns it to the FRONT (vs a direct send → tail).
-        handleSendRef.current(next.draft, next.modeId, { fromQueueFlush: true })
+        //
+        // `adoptSendTimeMode` items were queued before this tab could know its
+        // modes (an "ask about this selection" prompt parked on a brand-new
+        // draft), so they take the mode in effect NOW. A plain `modeId === null`
+        // is left alone — that is the answer / plan-notes retry paths saying
+        // "don't touch the agent's mode", which is a different intent.
+        handleSendRef.current(
+          next.draft,
+          next.adoptSendTimeMode ? selectedModeIdRef.current : next.modeId,
+          { fromQueueFlush: true }
+        )
       }
     }, wait)
     return () => clearTimeout(timer)
-  }, [
-    connStatus,
-    runtimeSyncState,
-    msgQueue.length,
-    conn.connectedWorkingDir,
-    workingDirForConnection,
-  ])
+    // `connectionReady` subsumes connStatus, the connection's cwd and its agent,
+    // so it is the only connection dependency this effect needs.
+  }, [connectionReady, runtimeSyncState, msgQueue.length, queueSteerInFlight])
 
   // Mirror the connection's liveMessage into the runtime session OUTSIDE React.
   // The connection dispatch invokes this sink synchronously whenever liveMessage
@@ -856,6 +921,49 @@ const ConversationTabView = memo(function ConversationTabView({
         )
       },
       [conn.connectionId, effectiveConversationId, appendViewerUserTurn]
+    )
+  )
+
+  // An agent can run a turn CODEG never started: CodeBuddy drains a finished
+  // background task by prompting itself, and streams a whole turn for it.
+  // `applyStreamingAction`'s out-of-turn guard drops that content because the
+  // `background_activity` overlay is supposed to own it — but that overlay only
+  // has a producer for Claude Code, so for every other agent the turn renders
+  // nowhere and the session looks frozen until it is reopened. The content IS
+  // on disk and the agent's own parser already reads it correctly, so flag the
+  // session and let the timeline offer a re-read.
+  //
+  // This runs per streamed token, so every step is O(1) and ordered cheapest
+  // first; the reducer also early-returns once the flag is set.
+  useAcpEvent(
+    useCallback(
+      (envelope: EventEnvelope) => {
+        if (!isOutOfTurnContentEvent(envelope)) return
+        if (envelope.connection_id !== conn.connectionId) return
+        // The same condition the guard drops on, read from the SAME place the
+        // guard read it. Not `connStatusRef`: that is refreshed in an effect,
+        // so it still says "connected" for any envelope that lands between the
+        // StatusChanged(prompting) dispatch and React committing — which is
+        // exactly the burst at the start of every turn, and would arm the pill
+        // on turns we started ourselves. `getConnection` reads the store the
+        // reducer just wrote, and subscribers fire after that write.
+        if (connectionStore.getConnection(tabId)?.status === "prompting") return
+        // Unknown agent (no connection bound yet) → no pill. A connection that
+        // is streaming content always carries its type, so this only degrades
+        // to today's behavior in a case that shouldn't arise.
+        if (conn.agentType == null || hasTranscriptOverlay(conn.agentType)) {
+          return
+        }
+        markOutOfTurnContent(effectiveConversationId)
+      },
+      [
+        conn.agentType,
+        conn.connectionId,
+        connectionStore,
+        tabId,
+        effectiveConversationId,
+        markOutOfTurnContent,
+      ]
     )
   )
 
@@ -1216,92 +1324,125 @@ const ConversationTabView = memo(function ConversationTabView({
     handleSendRef.current = handleSend
   }, [handleSend])
 
-  const handleForkSend = useCallback(
-    // Fire-and-forget: the input clears the draft synchronously on click (like a
-    // normal send), so there is no in-flight editable window. If the fork can't
-    // run right now — disconnected, or the queue is non-empty (a fork is an
-    // immediate session side effect and must not jump ahead of queued items) —
-    // the draft is NOT lost: it is queued as a normal send (it flushes after any
-    // queued items). The same on a fork failure.
-    async (draft: PromptDraft, selectedModeIdArg?: string | null) => {
+  // "Fork from here": fork at a rendered assistant turn, sending nothing. The
+  // ONLY fork entry point — the composer's fork-and-send was removed once this
+  // existed, since the tail is just one of the turns this can be aimed at.
+  //
+  // No draft is at stake, so a failure is simply reported: the session is
+  // untouched and the same click can be retried, or aimed elsewhere.
+  //
+  // Which turns the agent can actually name is the backend's call
+  // (`resolve_fork_point`): a turn it cannot name forks at the tail rather than
+  // failing, so this never has to reason about per-agent identity.
+  //
+  // Liveness is read off `connStatusRef` rather than captured: this callback is
+  // handed to every rendered reply, so taking `connStatus` as a dependency
+  // would swap its identity at both ends of every turn and re-render the whole
+  // mounted transcript window for nothing. The ref is also the fresher answer
+  // at click time.
+  const handleForkFromTurn = useCallback(
+    async (turnId: string) => {
       const connectionId = conn.connectionId
-      if (
-        !connectionId ||
-        connStatus !== "connected" ||
-        // Read the queue length SYNCHRONOUSLY so a draft re-queued by a same-
-        // tick bounce is seen even before React commits. The UI also hides the
-        // fork affordance while the queue is non-empty; this is the guard.
-        forkSendBlockedByQueue(mqGetQueueLength())
-      ) {
-        mqEnqueue(draft, selectedModeIdArg ?? null)
-        return
-      }
+      if (!connectionId || connStatusRef.current !== "connected") return
+      // Snapshot which live turns belong to the PRE-fork session, before the
+      // await. The fork RPC is a window in which a send can still start — a
+      // queued auto-flush, a fast typist, another client — and such a turn
+      // legitimately runs on the forked session, so it must not be swept away
+      // with the history it isn't part of. Naming the stale turns instead of
+      // clearing wholesale is what keeps that distinction.
+      //
+      // COMPLETED turns only. An optimistic user turn is one whose prompt has
+      // not reached the agent yet, and the backend refuses a fork while a turn
+      // is in flight (`AcpError::TurnInProgress`) — so a fork that SUCCEEDS
+      // proves any optimistic turn standing at this moment never started a
+      // turn on the old session, and it will therefore run on the forked one.
+      // Sweeping it would erase the user's own message while its reply streams
+      // in underneath.
+      const preForkSession = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(effectiveConversationId)
+      const staleLiveTurnIds = (preForkSession?.localTurns ?? []).map(
+        (t) => t.id
+      )
       try {
-        // Backend performs all DB writes in one transaction-shaped call:
-        // - current row: external_id=S2, title="[Fork] ..."
-        // - sibling row: created with external_id=S1, status=pending_review
-        // Pass (conversationId, folderId) so a conversation opened from history
-        // — whose connection resumed via session_id but isn't row-linked until
-        // its first prompt — is adopted by the backend before forking (a
-        // fork-send forks BEFORE that prompt). No-op once already linked. Use
-        // the real persisted DB id (`dbConvIdRef`, same as the send path below),
-        // NOT the runtime key `effectiveConversationId` which can be virtual.
         const { forkedSessionId } = await acpFork(
           connectionId,
           dbConvIdRef.current,
-          folderId
+          folderId,
+          turnId
         )
-        // Update runtime session id to S2 (frontend in-memory state only)
         sessionIdRef.current = forkedSessionId
         setExternalId(effectiveConversationId, forkedSessionId)
-
-        // NOTE: a fork is a transcript discontinuity — the row's session flips
-        // S1→S2, and S2 is a COPY of S1's transcript plus the turns to come.
-        // The pre-fork history is NOT re-surfaced here: the backend background
-        // watcher correctly excludes the fork-copied prefix from the out-of-turn
-        // overlay (see `baseline_offset_since`), so `detail.turns` (S1 parse) +
-        // the new local turns render each exchange exactly once. No detail
-        // refetch is needed or wanted — an early one races the forked turn and
-        // can drop the just-sent message.
+        // The backend's two-row reshuffle: the current row now points at S2
+        // and a freshly inserted sibling preserves S1.
         refreshConversations()
-        // Send the message on the forked session (S2)
-        handleSend(draft, selectedModeIdArg)
+        // This row's HISTORY just changed — the whole point is that S2 ends
+        // at the chosen turn. The turns rendered right now came
+        // from S1 — the persisted detail plus every turn this session streamed
+        // — so leaving them would show the fork with the parent's full history
+        // until the tab is closed and reopened.
+        //
+        // The removal rides ON the refetch rather than preceding it, so the
+        // two land as one dispatch: no frame shows S2's history beside S1's
+        // turns, and a refetch that FAILS removes nothing (it dispatches
+        // `FETCH_DETAIL_ERROR`, leaving the timeline as it was rather than
+        // stranding the row with neither the old turns nor new ones).
+        // `preserveLive` keeps everything else — the point of naming the stale
+        // turns is that a reply started during the fork survives.
+        refetchDetail(effectiveConversationId, {
+          preserveLive: true,
+          dropLiveTurnIds: staleLiveTurnIds,
+        })
       } catch (err) {
-        // Busy (a turn is in flight, e.g. another co-controlling client started
-        // one): NOT a fork failure — silently re-queue, like a normal bounce.
-        // It sends after the current turn.
-        if (err instanceof TurnBusyError) {
-          mqEnqueue(draft, selectedModeIdArg ?? null)
-          return
-        }
-        // Real fork failure: surface it. EXPLICIT product decision — fork-send
-        // is best-effort, so the draft is never lost; it is re-queued and sent
-        // on the current (un-forked) session.
+        // A turn in flight is transient here, not a failure to report as one —
+        // there is no draft to re-queue, so say so and let the user retry.
         toast.error(
-          t("forkSessionFailed", {
-            error:
-              err instanceof Error
-                ? err.message
-                : typeof err === "object" && err !== null
-                  ? JSON.stringify(err)
-                  : String(err),
-          })
+          err instanceof TurnBusyError
+            ? t("forkSessionBusy")
+            : t("forkSessionFailed", {
+                error:
+                  err instanceof Error
+                    ? err.message
+                    : typeof err === "object" && err !== null
+                      ? JSON.stringify(err)
+                      : String(err),
+              })
         )
-        mqEnqueue(draft, selectedModeIdArg ?? null)
       }
     },
     [
       conn.connectionId,
-      connStatus,
-      mqGetQueueLength,
-      mqEnqueue,
       effectiveConversationId,
       folderId,
-      handleSend,
+      refetchDetail,
       refreshConversations,
       setExternalId,
       t,
     ]
+  )
+
+  /** Stop one AIR async task. Returns the adapter's verdict so the strip can
+   *  release its button; `false` (the adapter declined) is reported, because
+   *  nothing else would tell the user their click did nothing — a successful
+   *  stop announces itself by the row disappearing. */
+  const handleStopAsyncTask = useCallback(
+    async (taskId: string) => {
+      const connectionId = conn.connectionId
+      if (!connectionId) return false
+      try {
+        const stopped = await acpStopAsyncTask(connectionId, taskId)
+        if (!stopped) toast.warning(tAsyncTasks("stopDeclined"))
+        return stopped
+      } catch (err) {
+        toast.error(
+          tAsyncTasks("stopFailed", {
+            error: err instanceof Error ? err.message : String(err),
+          })
+        )
+        return false
+      }
+    },
+    [conn.connectionId, tAsyncTasks]
   )
 
   const handleOpenAgentsSettings = useCallback(() => {
@@ -1541,12 +1682,108 @@ const ConversationTabView = memo(function ConversationTabView({
   const isWelcomeMode = showDraftHeader
 
   const handleQuickAction = useCallback((payload: ComposerInjectContent) => {
-    setQuickActionInject(payload)
+    setComposerInject(payload)
   }, [])
 
-  const handleQuickActionConsumed = useCallback(() => {
-    setQuickActionInject(null)
+  const handleComposerInjectConsumed = useCallback(() => {
+    setComposerInject(null)
   }, [])
+
+  // Quote a transcript selection into the composer. A fresh object every time so
+  // quoting the same passage twice still re-fires the composer's inject effect.
+  const handleQuoteSelection = useCallback((selected: string) => {
+    const quoted = buildQuotedMarkdown(selected)
+    if (!quoted) return
+    setComposerInject({ text: quoted, mode: "append" })
+  }, [])
+
+  /**
+   * "Ask about this selection": start a SEPARATE conversation for the question
+   * rather than appending to this one, so a side question doesn't derail (or
+   * pollute the context of) the thread the user is reading.
+   *
+   * The new conversation is pinned to THIS conversation's agent — the answer is
+   * a continuation of what that agent just said, so handing it to whichever
+   * agent the folder happens to default to would be wrong. Working dir and
+   * folder are inherited too, so the question lands in the same workspace.
+   *
+   * The composed prompt is parked against the draft tab rather than sent from
+   * here: that tab still has to spawn/connect its agent, and only its own panel
+   * can do the sending. See {@link parkAskSelectionPrompt}.
+   */
+  // Depends on the folder's ID, not the folder OBJECT: branch polling rewrites
+  // that row regularly, and this handler has to stay referentially stable (it is
+  // a MessageListView prop).
+  const askFolderId = folder?.id ?? null
+  const canAskSelection = askFolderId != null && workingDirForConnection != null
+  const handleAskSelection = useCallback(
+    (selected: string, question: string) => {
+      if (askFolderId == null || workingDirForConnection == null) return
+      const target = openNewConversationTab(
+        askFolderId,
+        workingDirForConnection,
+        { targetGroup: groupId, forceAgent: selectedAgent }
+      )
+      // Park against the identity the store PROMISED that tab, not against what
+      // it looks like right now — reusing a draft from another folder/agent
+      // retargets it asynchronously, and the prompt must not be taken until
+      // that has landed.
+      parkAskSelectionPrompt(target.tabId, {
+        prompt: buildAskPrompt(selected, question),
+        agentType: target.agentType,
+        folderId: target.folderId,
+      })
+    },
+    [
+      askFolderId,
+      groupId,
+      openNewConversationTab,
+      selectedAgent,
+      workingDirForConnection,
+    ]
+  )
+
+  // Receiving end of the hand-off above, for asks aimed at THIS tab. Draining on
+  // mount covers a brand-new draft tab; the event covers the case where the
+  // target draft tab was already open (each split group keeps one, and inactive
+  // tabs stay mounted). The prompt goes into the message queue rather than
+  // straight out: a just-opened draft is still connecting, and the queue is
+  // exactly the "send as soon as the agent is live" path — with the question
+  // visible above the composer, and recoverable by hand, if it never connects.
+  //
+  // `selectedAgent` and `folderId` are BOTH the match key and the dependencies:
+  // a prompt aimed at a reused draft stays parked until that draft's pending
+  // retarget lands, and the identity change is exactly what re-runs this and
+  // releases it. Without that, a still-connected draft on the previous
+  // folder/agent would drain and auto-flush the question to the wrong agent —
+  // its own readiness checks can't see the difference, because in that window
+  // the tab is self-consistently the OLD one.
+  useEffect(() => {
+    const drain = () => {
+      const prompts = consumeAskSelectionPrompts(tabId, {
+        agentType: selectedAgent,
+        folderId,
+      })
+      for (const text of prompts) {
+        // `adoptSendTimeMode`: this tab has no modes yet (it is still
+        // connecting), so the flush stamps the resolved one when it sends.
+        mqEnqueue(
+          { blocks: [{ type: "text", text }], displayText: text },
+          null,
+          { adoptSendTimeMode: true }
+        )
+      }
+    }
+    drain()
+    const onParked = (event: Event) => {
+      const detail = (event as CustomEvent<AskSelectionParkedDetail>).detail
+      if (detail?.tabId !== tabId) return
+      drain()
+    }
+    window.addEventListener(ASK_SELECTION_PARKED_EVENT, onParked)
+    return () =>
+      window.removeEventListener(ASK_SELECTION_PARKED_EVENT, onParked)
+  }, [folderId, mqEnqueue, selectedAgent, tabId])
 
   const canShowDetailErrorActions =
     hasPersistedConversation && dbConversationId != null && !!folder
@@ -1578,6 +1815,30 @@ const ConversationTabView = memo(function ConversationTabView({
     closeTab(tabId)
   }, [closeTab, folder, openNewConversationTab, tabId, workingDirForConnection])
 
+  // Some load failures come with a shell command that undoes them (today:
+  // `codex unarchive <id>`). The banner names it in prose, but prose here is
+  // one ellipsized line — so offer the exact string as a copy action too,
+  // rather than asking the user to retype a session id they may not even be
+  // able to see. Read off the connection, which is where the connections
+  // layer parks it beside the localized message.
+  const recoveryCommand = conn.loadErrorCommand
+  const [commandCopied, setCommandCopied] = useState(false)
+  const copiedResetRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(
+    () => () => {
+      if (copiedResetRef.current) clearTimeout(copiedResetRef.current)
+    },
+    []
+  )
+  const handleCopyRecoveryCommand = useCallback(async () => {
+    if (!recoveryCommand) return
+    const ok = await copyTextToClipboard(recoveryCommand)
+    if (!ok) return
+    setCommandCopied(true)
+    if (copiedResetRef.current) clearTimeout(copiedResetRef.current)
+    copiedResetRef.current = setTimeout(() => setCommandCopied(false), 1500)
+  }, [recoveryCommand])
+
   // A session/load failure no longer hijacks the whole message area (the
   // transcript stays readable — see message-list-view's blockingLoadError);
   // instead the failure lands here, as a banner docked where the composer
@@ -1585,17 +1846,45 @@ const ConversationTabView = memo(function ConversationTabView({
   // conversations only: drafts never session/load.
   const acpLoadErrorBanner =
     hasPersistedConversation && acpLoadError ? (
+      // `flex-wrap` + a message floor, because the actions are all `shrink-0`
+      // and the row has no other give: without them a third action pushes the
+      // message to zero width and shoves "New conversation" outside the
+      // banner (measured: 34-172px past the edge at 320-384px, worse in
+      // French/German). Wrapping costs a second row only when the panel is
+      // actually too narrow — at >=700px this lays out exactly as before.
       <div
         role="alert"
-        className="flex w-full items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+        className="flex w-full flex-wrap items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive"
       >
         <AlertCircle aria-hidden="true" className="h-4 w-4 shrink-0" />
         <span
-          className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap"
+          className="min-w-40 flex-1 overflow-hidden text-ellipsis whitespace-nowrap"
           title={acpLoadError}
         >
           {acpLoadError}
         </span>
+        {/* Deliberately outside `canShowDetailErrorActions`: that gate exists
+            because Reload refetches the DB detail and New session opens a tab
+            in the folder, so both need a conversation id and a folder. Copying
+            a string needs neither — withholding the one recovery the user can
+            still act on would be the wrong call. */}
+        {recoveryCommand && (
+          <button
+            type="button"
+            onClick={handleCopyRecoveryCommand}
+            title={recoveryCommand}
+            className="flex shrink-0 items-center gap-1 rounded border border-destructive/40 px-2 py-0.5 font-medium transition-colors hover:bg-destructive/10"
+          >
+            {commandCopied ? (
+              <Check aria-hidden="true" className="h-3 w-3" />
+            ) : (
+              <Copy aria-hidden="true" className="h-3 w-3" />
+            )}
+            {commandCopied
+              ? tMessageList("errorActionCommandCopied")
+              : tMessageList("errorActionCopyCommand")}
+          </button>
+        )}
         {canShowDetailErrorActions && (
           <>
             <button
@@ -1726,10 +2015,27 @@ const ConversationTabView = memo(function ConversationTabView({
     [acpActions, tabId]
   )
 
+  // The docked composer is the only place a quote can land, so the selection
+  // bubble offers "quote" exactly when that composer is on screen (see
+  // `hideInput` below). Without a composer the inject would never be consumed
+  // and the action would silently do nothing.
+  const composerAvailable = !isWelcomeMode && !acpLoadError
+
+  // Arrow-key history source: read lazily when the user actually steps into
+  // history, so streaming tokens neither recompute it nor re-render the panel.
+  const getSentHistory = useCallback(
+    () =>
+      userPromptHistory(
+        getTimelineTurns(effectiveConversationId).map((entry) => entry.turn)
+      ),
+    [effectiveConversationId]
+  )
+
   const messageListNode = (
     <GoalControlProvider value={goalControlValue}>
       <MessageListView
         conversationId={effectiveConversationId}
+        imageRoot={workingDirForConnection ?? null}
         agentType={selectedAgent}
         connStatus={connStatus}
         isActive={isActive}
@@ -1741,6 +2047,29 @@ const ConversationTabView = memo(function ConversationTabView({
         onReload={canShowDetailErrorActions ? handleReloadDetail : undefined}
         onNewSession={
           canShowDetailErrorActions ? handleOpenNewSession : undefined
+        }
+        onQuoteSelection={composerAvailable ? handleQuoteSelection : undefined}
+        // Asking opens its own conversation, so it needs a folder to open it in
+        // rather than a usable composer here — a transcript whose composer is
+        // blocked (session/load failure) can still spawn the question elsewhere.
+        onAskSelection={canAskSelection ? handleAskSelection : undefined}
+        // Fork carries no draft, so — unlike a send — a non-empty queue is
+        // not at risk of being jumped and needs no guard here. A turn in
+        // flight is still rejected, by the backend, which is the only place
+        // that can see it without racing.
+        //
+        // "prompting" belongs on this side of the gate (same shape as the
+        // goal-control gate above): this answers "can this surface fork at
+        // all", and a turn in flight is a passing "not right now" that the
+        // view greys the button out for. Dropping the handler instead made
+        // every reply's fork icon disappear for the length of each reply.
+        // `handleForkFromTurn` re-checks liveness at click time.
+        onForkFromTurn={
+          (connStatus === "connected" || connStatus === "prompting") &&
+          hasPersistedConversation &&
+          conn.supportsFork
+            ? handleForkFromTurn
+            : undefined
         }
       />
     </GoalControlProvider>
@@ -1767,21 +2096,69 @@ const ConversationTabView = memo(function ConversationTabView({
     connectionId: conn.connectionId,
     connStatus,
     enabled: feedbackEnabled,
+    // Notes the transcript adopted as mid-turn user turns show as messages,
+    // not as strips above the composer.
+    steeredMessageIds: conn.steeredMessageIds,
     onResendAsPrompt: resendFeedbackAsPrompt,
   })
-  // Composer "insert into current turn" (native steering only). Rethrows —
-  // MessageInput owns the enqueue fallback and draft-preservation policy, so
-  // this wrapper must not swallow the turn-end race the way `submit` does.
+  // Composer mid-turn send, over whichever live-feedback channel this session
+  // has (native push or the pull tool). Rethrows — MessageInput owns the
+  // enqueue fallback and draft-preservation policy, so this wrapper must not
+  // swallow the turn-end race the way `submit` does. `blocks` rides along when
+  // the draft carries attachments (images steer natively; the pull path
+  // rejects them into the composer's queue fallback); `text` stays the
+  // recorded/display form.
   const feedbackSteer = feedback.steer
   const handleSteer = useCallback(
-    async (text: string) => {
-      await feedbackSteer(text)
+    async (text: string, blocks?: PromptInputBlock[]) => {
+      await feedbackSteer(text, blocks)
     },
     [feedbackSteer]
   )
 
+  // Click-to-insert for a queued row: send THAT item into the running turn
+  // over the same live-feedback channel the composer's mid-turn dropdown uses.
+  // The block/text encoding is the shared `buildSteerPayload` — one call site,
+  // no policy here beyond the row's own lifecycle: success removes the row;
+  // the turn-end race leaves it queued so the auto-flush sends it with the
+  // next turn — never lost. Any other failure keeps the row untouched and
+  // surfaces the error.
+  const handleQueueSteer = useCallback(
+    async (id: string) => {
+      const item = msgQueue.find((m) => m.id === id)
+      if (!item) return
+      const payload = buildSteerPayload(item.draft)
+      // Nothing sendable in this row (no text, and no display text standing in
+      // for its attachments). Leave it alone: removing it would delete queued
+      // content — including whatever blocks it carries — on a button that
+      // promises to SEND it.
+      if (!payload) return
+      // Set before the first await so the flush effect above is already held
+      // when the turn-end edge lands mid-round-trip.
+      setQueueSteerInFlight(true)
+      try {
+        await feedbackSteer(payload.text, payload.blocks)
+        mqRemove(id)
+      } catch (err: unknown) {
+        if (isNoActiveTurnRejection(err)) {
+          // The turn ended mid-click — the queue flush will deliver it.
+          toast.info(tCmp("steerQueuedInstead"))
+          return
+        }
+        toast.error(
+          tCmp(feedback.channel === "pull" ? "steerNoteFailed" : "steerFailed"),
+          { description: toErrorMessage(err) }
+        )
+      } finally {
+        setQueueSteerInFlight(false)
+      }
+    },
+    [msgQueue, feedbackSteer, mqRemove, feedback.channel, tCmp]
+  )
+
   return (
     <ConversationShell
+      getSentHistory={getSentHistory}
       topBanner={
         <>
           <SessionConfigStaleBanner contextKey={tabId} />
@@ -1790,7 +2167,6 @@ const ConversationTabView = memo(function ConversationTabView({
             agentType={selectedAgent}
             workingDir={workingDirForConnection}
           />
-          <BackgroundTasksChip contextKey={tabId} />
         </>
       }
       status={connStatus}
@@ -1808,6 +2184,14 @@ const ConversationTabView = memo(function ConversationTabView({
           : undefined
       }
       onSessionFailureDismiss={handleSessionFailureDismiss}
+      asyncTasks={conn.asyncTasks}
+      onStopAsyncTask={
+        // Owners of a live connection only — same gate as the failure actions:
+        // a viewer has no connection to send the stop on.
+        conn.connectionId !== null && !conn.isViewer
+          ? handleStopAsyncTask
+          : undefined
+      }
       pendingPermission={conn.pendingPermission}
       pendingQuestion={conn.pendingQuestion}
       pendingAskQuestion={conn.pendingAskQuestion}
@@ -1832,10 +2216,20 @@ const ConversationTabView = memo(function ConversationTabView({
       attachmentTabId={tabId}
       draftStorageKey={draftStorageKey}
       hideInput={isWelcomeMode || Boolean(acpLoadError)}
+      injectContent={composerInject}
+      onInjectConsumed={handleComposerInjectConsumed}
       composerBanner={acpLoadErrorBanner}
       feedbackList={
         feedback.showList ? (
-          <FeedbackNotesDisplay notes={feedback.notes} />
+          <FeedbackNotesDisplay
+            notes={feedback.notes}
+            // Past the turn the list is the only place an unread note still
+            // exists on screen, so it carries its own recovery actions rather
+            // than disappearing with the turn that never read it.
+            expired={feedback.notesExpired}
+            onResend={feedback.resendNote}
+            onDismiss={feedback.dismissNote}
+          />
         ) : null
       }
       onAddFeedback={feedback.featureEnabled ? feedback.openDialog : undefined}
@@ -1847,28 +2241,34 @@ const ConversationTabView = memo(function ConversationTabView({
       onQueueReorder={mqReorder}
       onQueueEdit={handleQueueEdit}
       onQueueDelete={mqRemove}
+      onQueueSteer={
+        // Same gate as the composer's mid-turn send, plus a turn actually in
+        // flight: a queued row can only be inserted into a RUNNING turn —
+        // idle sessions have the queue's own auto-flush for that.
+        feedback.featureEnabled &&
+        feedback.steerAvailable &&
+        connStatus === "prompting"
+          ? handleQueueSteer
+          : undefined
+      }
       editingItemId={mqEditingItemId}
       editingDraftText={editingQueueDraftText}
       editingDraftBlocks={editingQueueDraftBlocks}
       isEditingQueueItem={mqEditingItemId != null}
       onSaveQueueEdit={handleSaveQueueEdit}
       onCancelQueueEdit={handleQueueCancelEdit}
-      onForkSend={
-        connStatus === "connected" &&
-        hasPersistedConversation &&
-        conn.supportsFork &&
-        !forkSendBlockedByQueue(msgQueue.length)
-          ? handleForkSend
-          : undefined
-      }
       onSteer={
-        // Native channel only: on pull sessions the prompting branch must
-        // stay pixel-identical (Stop button alone). The prompting scope
-        // itself is enforced where the button renders.
-        feedback.featureEnabled && feedback.channel === "native"
+        // Any working delivery channel, not just the native push: the pull
+        // tool records a waiting note the agent reads on its next check, and
+        // `steerChannel` swaps the copy so pull sessions never promise an
+        // instant insert. Sessions with NEITHER channel keep the historical
+        // prompting branch (Stop button alone, Enter queues). The prompting
+        // scope itself is enforced where the button renders.
+        feedback.featureEnabled && feedback.steerAvailable
           ? handleSteer
           : undefined
       }
+      steerChannel={feedback.channel}
     >
       {isWelcomeMode ? (
         // Same overlay scrollbar as the sidebar / file lists (os-theme-codeg)
@@ -1958,8 +2358,8 @@ const ConversationTabView = memo(function ConversationTabView({
                   feedback.featureEnabled ? feedback.openDialog : undefined
                 }
                 feedbackAddDisabled={!feedback.canSubmit}
-                injectContent={quickActionInject}
-                onInjectConsumed={handleQuickActionConsumed}
+                injectContent={composerInject}
+                onInjectConsumed={handleComposerInjectConsumed}
                 flush
                 tall
               />
@@ -2206,68 +2606,6 @@ export function ConversationDetailPanel() {
       [activeConversationTab.id]: (prev[activeConversationTab.id] ?? 0) + 1,
     }))
   }, [activeConversationTab])
-
-  const [contextMenuSelectedText, setContextMenuSelectedText] = useState("")
-  const savedSelectionRangeRef = useRef<Range | null>(null)
-  const isContextMenuOpenRef = useRef(false)
-
-  const handleContextMenuOpenChange = useCallback((open: boolean) => {
-    isContextMenuOpenRef.current = open
-    if (!open) {
-      savedSelectionRangeRef.current = null
-      return
-    }
-    const selection = window.getSelection()
-    const text = selection?.toString() ?? ""
-    setContextMenuSelectedText(text)
-    savedSelectionRangeRef.current =
-      selection && selection.rangeCount > 0 && !selection.isCollapsed
-        ? selection.getRangeAt(0).cloneRange()
-        : null
-  }, [])
-
-  const handleContextMenuTriggerPointerDown = useCallback(
-    (event: ReactPointerEvent<HTMLDivElement>) => {
-      if (event.button !== 2) return
-      const selection = window.getSelection()
-      if (selection && !selection.isCollapsed) {
-        event.preventDefault()
-      }
-    },
-    []
-  )
-
-  useEffect(() => {
-    const handler = () => {
-      if (!isContextMenuOpenRef.current) return
-      const range = savedSelectionRangeRef.current
-      if (!range) return
-      if (
-        !document.contains(range.startContainer) ||
-        !document.contains(range.endContainer)
-      ) {
-        savedSelectionRangeRef.current = null
-        return
-      }
-      const selection = window.getSelection()
-      if (!selection) return
-      if (selection.toString().length > 0) return
-      selection.removeAllRanges()
-      selection.addRange(range)
-    }
-    document.addEventListener("selectionchange", handler)
-    return () => document.removeEventListener("selectionchange", handler)
-  }, [])
-
-  const handleCopySelectedText = useCallback(async () => {
-    if (!contextMenuSelectedText) return
-    const ok = await copyTextFromMenu(contextMenuSelectedText)
-    if (ok) {
-      toast.success(t("copyTextSuccess"))
-    } else {
-      toast.error(t("copyTextFailed"))
-    }
-  }, [contextMenuSelectedText, t])
 
   const handleNewConversation = useCallback(() => {
     if (!folder) return
@@ -2527,7 +2865,14 @@ export function ConversationDetailPanel() {
         {(isSplit || canTileG) && active && (
           <span className="sr-only">{t("activeConversationIndicator")}</span>
         )}
-        {view}
+        {/* A backgrounded tab is kept mounted and merely hidden (its session is
+            still live), but a "查看会话" drawer opened from it portals to the
+            body — so without this it went on painting over whichever tab the
+            user switched to. The flag is additive, so a visible tab inside a
+            covered workspace stays hidden. */}
+        <OverlayHostHiddenProvider hidden={!canTileG && !visible}>
+          {view}
+        </OverlayHostHiddenProvider>
       </div>
     )
   }
@@ -2652,12 +2997,11 @@ export function ConversationDetailPanel() {
             status={activeTab.status as ConversationStatus | undefined}
           />
         )}
-        <ContextMenu onOpenChange={handleContextMenuOpenChange}>
+        <ContextMenu>
           <ContextMenuTrigger asChild>
             <div
               ref={groupContainerRef}
               className="relative min-h-0 flex-1 overflow-hidden"
-              onPointerDown={handleContextMenuTriggerPointerDown}
             >
               {/* Flat sibling shells keyed by stable group id + divider
                   overlays — stable across every split/tile flip, otherwise
@@ -2676,14 +3020,6 @@ export function ConversationDetailPanel() {
             </div>
           </ContextMenuTrigger>
           <ContextMenuContent>
-            <ContextMenuItem
-              disabled={!contextMenuSelectedText}
-              onSelect={handleCopySelectedText}
-            >
-              <Copy className="h-4 w-4" />
-              {t("copyText")}
-            </ContextMenuItem>
-            <ContextMenuSeparator />
             <ContextMenuItem
               disabled={!folder?.path}
               onSelect={handleNewConversation}
