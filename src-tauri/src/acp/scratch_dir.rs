@@ -71,10 +71,15 @@ const ROOT_ENV: &str = "CODEG_ACP_TMP_ROOT";
 /// not a `PATH_MAX`-sized budget: 104 bytes is barely twice a macOS per-user
 /// temp directory, so every byte this module prepends is a byte taken off what
 /// the child has left.
+///
+/// Shared with [`crate::acp::delegation::listener`], which has the same budget
+/// to keep for codeg's OWN broker socket. One definition rather than two
+/// because [`tests::sun_path_cap_matches_the_kernel`] checks this one against
+/// `libc`, and a second copy would be a number nothing verifies.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-const SUN_PATH_CAP: usize = 108;
+pub(crate) const SUN_PATH_CAP: usize = 108;
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-const SUN_PATH_CAP: usize = 104;
+pub(crate) const SUN_PATH_CAP: usize = 104;
 
 /// The longest name [`new_dir_name`] can mint: ten digits of `u32` pid, the
 /// separator, and eight hex.
@@ -443,7 +448,12 @@ pub fn create() -> Option<LaunchScratch> {
 /// `Ok(())` for a directory that already exists — leaving its mode and its
 /// owner exactly as they were. In a world-writable `/tmp` that is a directory
 /// another local user can win the race to create.
-fn create_root(root: &Path) -> std::io::Result<()> {
+///
+/// Shared with [`crate::acp::delegation::listener`], whose own `/tmp` fallback
+/// for the broker socket is waiting in the same world-writable directory for
+/// the same squatter. The guard is security-sensitive enough that a second copy
+/// of it is worse than a `pub(crate)`.
+pub(crate) fn create_root(root: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
