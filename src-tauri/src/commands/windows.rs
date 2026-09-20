@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 #[cfg(target_os = "macos")]
 use std::sync::atomic::AtomicU32;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 
 use sea_orm::DatabaseConnection;
 use tauri::{
     window::{Effect, EffectState, EffectsBuilder},
-    AppHandle, LogicalPosition, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder,
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder,
 };
 
 use crate::app_error::AppCommandError;
@@ -109,6 +111,14 @@ pub struct SettingsWindowState {
 
 pub struct CommitWindowState {
     owner_by_commit_label: Mutex<HashMap<String, String>>,
+}
+
+/// Owner tracking for the auxiliary windows that have no state of their own:
+/// stash, push, project boot and the session importer. They share one map
+/// because their labels are already distinct namespaces, and because the
+/// restore is the same three lines for all four.
+pub struct AuxWindowState {
+    owner_by_aux_label: Mutex<HashMap<String, String>>,
 }
 
 /// Detect macOS system dark mode via `defaults read`.
@@ -324,6 +334,33 @@ impl CommitWindowState {
 }
 
 impl Default for CommitWindowState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AuxWindowState {
+    pub fn new() -> Self {
+        Self {
+            owner_by_aux_label: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn set_owner(&self, aux_label: String, owner_label: String) {
+        if let Ok(mut owners) = self.owner_by_aux_label.lock() {
+            owners.insert(aux_label, owner_label);
+        }
+    }
+
+    fn take_owner(&self, aux_label: &str) -> Option<String> {
+        self.owner_by_aux_label
+            .lock()
+            .ok()
+            .and_then(|mut owners| owners.remove(aux_label))
+    }
+}
+
+impl Default for AuxWindowState {
     fn default() -> Self {
         Self::new()
     }
@@ -748,11 +785,14 @@ pub async fn open_settings_window(
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn open_import_sessions_window(
     app: AppHandle,
+    window: tauri::WebviewWindow,
     db: tauri::State<'_, AppDatabase>,
+    state: tauri::State<'_, AuxWindowState>,
     focus_path: Option<String>,
     locale: Option<crate::models::system::AppLocale>,
     remote_connection_id: Option<i32>,
 ) -> Result<(), AppCommandError> {
+    let owner_label = window.label().to_string();
     let label = match remote_connection_id {
         Some(remote_id) => format!("remote-import-sessions-{remote_id}"),
         None => "import-sessions".to_string(),
@@ -796,6 +836,7 @@ pub async fn open_import_sessions_window(
                     )
                 })?;
         }
+        state.set_owner(label.clone(), owner_label);
         let _ = existing.unminimize();
         existing.set_focus().map_err(|e| {
             AppCommandError::window("Failed to focus import sessions window", e.to_string())
@@ -824,6 +865,7 @@ pub async fn open_import_sessions_window(
     })?;
     register_remote_window_cleanup(&app, &import_window, remote_window_id.as_deref());
     post_window_setup(&import_window);
+    state.set_owner(label, owner_label);
     import_window.set_focus().map_err(|e| {
         AppCommandError::window("Failed to focus import sessions window", e.to_string())
     })?;
@@ -872,6 +914,16 @@ pub fn restore_window_after_commit(
     commit_window_label: &str,
 ) {
     if let Some(owner_label) = state.take_owner(commit_window_label) {
+        show_and_focus_window(app, &owner_label);
+    }
+}
+
+/// Owner restore for the stash / push / project-boot / import windows. Called
+/// for every closing window rather than from a list of label prefixes: a
+/// window that never registered an owner has none to hand back, so the map is
+/// the only place that has to know which labels take part.
+pub fn restore_window_after_aux(app: &AppHandle, state: &AuxWindowState, aux_window_label: &str) {
+    if let Some(owner_label) = state.take_owner(aux_window_label) {
         show_and_focus_window(app, &owner_label);
     }
 }
@@ -1037,11 +1089,14 @@ pub async fn cleanup_dangling_merge(app: &AppHandle, merge_window_label: &str) {
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn open_stash_window(
     app: AppHandle,
+    window: tauri::WebviewWindow,
     db: tauri::State<'_, AppDatabase>,
+    state: tauri::State<'_, AuxWindowState>,
     folder_id: i32,
     locale: Option<crate::models::system::AppLocale>,
     remote_connection_id: Option<i32>,
 ) -> Result<(), AppCommandError> {
+    let owner_label = window.label().to_string();
     let label = match remote_connection_id {
         Some(remote_id) => format!("remote-stash-{remote_id}-{folder_id}"),
         None => format!("stash-{folder_id}"),
@@ -1049,6 +1104,7 @@ pub async fn open_stash_window(
 
     if let Some(existing) = app.get_webview_window(&label) {
         post_window_setup(&existing);
+        state.set_owner(label.clone(), owner_label);
         let _ = existing.unminimize();
         existing
             .set_focus()
@@ -1082,6 +1138,7 @@ pub async fn open_stash_window(
         .map_err(|e| AppCommandError::window("Failed to open stash window", e.to_string()))?;
     register_remote_window_cleanup(&app, &stash_window, remote_window_id.as_deref());
     post_window_setup(&stash_window);
+    state.set_owner(label, owner_label);
 
     Ok(())
 }
@@ -1098,11 +1155,13 @@ pub async fn open_push_window(
     app: AppHandle,
     window: tauri::WebviewWindow,
     db: tauri::State<'_, AppDatabase>,
+    state: tauri::State<'_, AuxWindowState>,
     folder_id: i32,
     locale: Option<crate::models::system::AppLocale>,
     remote_connection_id: Option<i32>,
     branch: Option<String>,
 ) -> Result<(), AppCommandError> {
+    let owner_label = window.label().to_string();
     let label = match remote_connection_id {
         Some(remote_id) => format!("remote-push-{remote_id}-{folder_id}"),
         None => format!("push-{folder_id}"),
@@ -1111,6 +1170,7 @@ pub async fn open_push_window(
 
     if let Some(existing) = app.get_webview_window(&label) {
         post_window_setup(&existing);
+        state.set_owner(label.clone(), owner_label);
         let _ = existing.unminimize();
         existing
             .set_focus()
@@ -1177,6 +1237,7 @@ pub async fn open_push_window(
         .map_err(|e| AppCommandError::window("Failed to open push window", e.to_string()))?;
     register_remote_window_cleanup(&app, &push_window, remote_window_id.as_deref());
     post_window_setup(&push_window);
+    state.set_owner(label, owner_label);
 
     Ok(())
 }
@@ -1185,18 +1246,22 @@ pub async fn open_push_window(
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn open_project_boot_window(
     app: AppHandle,
+    window: tauri::WebviewWindow,
     db: tauri::State<'_, AppDatabase>,
+    state: tauri::State<'_, AuxWindowState>,
     source: Option<String>,
     locale: Option<crate::models::system::AppLocale>,
     remote_connection_id: Option<i32>,
 ) -> Result<(), AppCommandError> {
     let _ = source;
+    let owner_label = window.label().to_string();
     let label = match remote_connection_id {
         Some(id) => format!("remote-project-boot-{id}"),
         None => "project-boot".to_string(),
     };
     if let Some(existing) = app.get_webview_window(&label) {
         post_window_setup(&existing);
+        state.set_owner(label.clone(), owner_label);
         let _ = existing.unminimize();
         existing.set_focus().map_err(|e| {
             AppCommandError::window("Failed to focus project boot window", e.to_string())
@@ -1213,11 +1278,12 @@ pub async fn open_project_boot_window(
         .inner_size(1400.0, 900.0)
         .min_inner_size(1100.0, 700.0)
         .center();
-    let window = apply_platform_window_style(builder).build().map_err(|e| {
+    let boot_window = apply_platform_window_style(builder).build().map_err(|e| {
         AppCommandError::window("Failed to open project boot window", e.to_string())
     })?;
-    register_remote_window_cleanup(&app, &window, remote_window_id.as_deref());
-    post_window_setup(&window);
+    register_remote_window_cleanup(&app, &boot_window, remote_window_id.as_deref());
+    post_window_setup(&boot_window);
+    state.set_owner(label, owner_label);
 
     Ok(())
 }
@@ -1713,6 +1779,11 @@ pub async fn resize_pet_panel(app: AppHandle, height: f64) -> Result<(), AppComm
 /// Bring the main workspace to the foreground and ask it to focus a specific
 /// conversation. Uses an event (not a URL reload) so the in-memory tab/session
 /// state survives — `PetFocusBridge` in the main window calls `openTab`.
+///
+/// Only the pet panel calls this. A `codeg://` OS deep link cannot: the emit
+/// reaches only webviews that have *already* registered a JS listener, which
+/// on a cold start is none of them — see `deep_link::PENDING_FOCUS` for the
+/// handoff that path uses instead.
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn focus_conversation(
@@ -1721,7 +1792,6 @@ pub async fn focus_conversation(
     conversation_id: i32,
     agent: String,
 ) -> Result<(), AppCommandError> {
-    use tauri::Emitter;
     show_main_window(&app);
     let payload = serde_json::json!({
         "folderId": folder_id,
@@ -1729,9 +1799,7 @@ pub async fn focus_conversation(
         "agent": agent,
     });
     app.emit_to("main", "workspace://focus-conversation", payload)
-        .map_err(|e| {
-            AppCommandError::window("Failed to signal main window", e.to_string())
-        })?;
+        .map_err(|e| AppCommandError::window("Failed to signal main window", e.to_string()))?;
     Ok(())
 }
 
@@ -1966,6 +2034,302 @@ pub fn can_hide_to_tray() -> bool {
     TRAY_AVAILABLE.load(AtomicOrdering::Relaxed)
 }
 
+// ─── macOS native-fullscreen drain on close (issue #507) ───────────────
+//
+// Native fullscreen on macOS is a separate Space. `orderOut:` (what
+// `Window::hide` does) and process exit both leave that Space standing, as
+// a black blank with leftover toolbar chrome — so every close action that
+// hides or exits leaves fullscreen first and waits for AppKit to tear the
+// Space down.
+//
+// Two tao facts (0.34, macOS) set the shape of that wait. `is_fullscreen()`
+// reads `shared_state.fullscreen`, and exactly two things clear it:
+//
+//   * `restore_state_from_fullscreen`, called from `windowDidExitFullScreen`
+//     — the END of the animation. It is the only thing that clears the flag
+//     for an exit the *user* started (green button, ⌃⌘F, the View menu), so
+//     while their animation runs the flag is still up. Polling it is what
+//     covers a close pressed mid-animation, including the mid-transition
+//     case where tao parks our `set_fullscreen` in `target_fullscreen` and
+//     replays it at `windowDid{Enter,Exit}FullScreen`.
+//   * `set_fullscreen` itself, synchronously, BEFORE it dispatches
+//     `toggleFullScreen:` to the main queue. So on the path this code
+//     drives the flag is already down before the animation starts, and says
+//     nothing about the Space.
+//
+// Nothing in tao's public surface reports `windowDidExitFullScreen` for the
+// second case, so what follows the flag drop is a timer. Making it exact
+// would take an `NSWindowDidExitFullScreenNotification` observer via objc2.
+
+/// Whether a close action must drain native fullscreen first.
+///
+/// Other platforms treat fullscreen as a maximized window and hide/close
+/// tear it down correctly, so this is a no-op there.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn should_drain_macos_fullscreen_before_close(
+    is_macos: bool,
+    is_fullscreen: bool,
+) -> bool {
+    is_macos && is_fullscreen
+}
+
+/// How long to give AppKit's Space teardown once tao's fullscreen flag is
+/// down.
+///
+/// On the path this code drives the flag falls before `toggleFullScreen:`
+/// has even been dispatched, so this is measured from the start of the
+/// animation, not its end: ~0.5s is the system transition, 700ms is that
+/// plus slack so hide/exit does not race the last frames (issue #507;
+/// tauri-apps/tauri#10580, #12056).
+#[cfg(target_os = "macos")]
+const MACOS_FULLSCREEN_EXIT_SETTLE: std::time::Duration = std::time::Duration::from_millis(700);
+
+#[cfg(target_os = "macos")]
+const MACOS_FULLSCREEN_EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+#[cfg(target_os = "macos")]
+const MACOS_FULLSCREEN_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long one `is_fullscreen()` sample may take before the drain gives up
+/// on it and lets its own deadline decide. Generous next to a main thread
+/// that is merely busy, short next to one that is never coming back.
+#[cfg(target_os = "macos")]
+const MACOS_FULLSCREEN_EXIT_PROBE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long an in-flight drain keeps suppressing later close presses.
+///
+/// Comfortably past the longest honest drain (poll timeout + settle), and
+/// short enough that a stalled one costs a few seconds rather than the rest
+/// of the session — same bargain as `CLOSE_PROMPT_GRACE`.
+#[cfg(target_os = "macos")]
+const MACOS_FULLSCREEN_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The in-flight drain: which press owns it, and when it started.
+///
+/// A second press while one is in flight is dropped — the in-flight callback
+/// is the press that will be answered. Two details earn their keep:
+///
+///   * It is a timestamp, not a flag. The drain is bounded (see
+///     `wait_for_macos_fullscreen_space_release`), but a starved or panicked
+///     drain thread must still not leave the close button dead for good.
+///   * It carries a generation, because a stale claim is exactly when a
+///     later press takes over — and then the stale thread finishes and
+///     releases. Without the generation it would clear its successor's
+///     claim, and the press after THAT would act on a window whose Space is
+///     still going.
+#[cfg(target_os = "macos")]
+static MACOS_FULLSCREEN_DRAIN: Mutex<Option<(u64, std::time::Instant)>> = Mutex::new(None);
+
+#[cfg(target_os = "macos")]
+static MACOS_FULLSCREEN_DRAIN_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// `Some(generation)` when this press owns the drain, `None` when another one
+/// already does.
+#[cfg(target_os = "macos")]
+fn claim_macos_fullscreen_drain() -> Option<u64> {
+    let now = std::time::Instant::now();
+    let took_over;
+    let generation;
+    {
+        let mut drain = MACOS_FULLSCREEN_DRAIN
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        took_over = match *drain {
+            Some((_, started)) if now.duration_since(started) < MACOS_FULLSCREEN_DRAIN_GRACE => {
+                return None
+            }
+            Some(_) => true,
+            None => false,
+        };
+        generation = MACOS_FULLSCREEN_DRAIN_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+        *drain = Some((generation, now));
+    }
+    if took_over {
+        tracing::warn!("[close] previous fullscreen drain never finished; taking the press over");
+    }
+    Some(generation)
+}
+
+/// No-op unless `generation` still owns the drain, so a thread whose claim
+/// expired cannot clear the claim that replaced it.
+#[cfg(target_os = "macos")]
+fn release_macos_fullscreen_drain(generation: u64) {
+    let mut drain = MACOS_FULLSCREEN_DRAIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if matches!(*drain, Some((owner, _)) if owner == generation) {
+        *drain = None;
+    }
+}
+
+#[cfg(target_os = "macos")]
+type MacosDrainAction = Mutex<Option<Box<dyn FnOnce() + Send>>>;
+
+/// Take the close action out of the slot, run it, and only then hand the
+/// claim back.
+///
+/// The claim spans the action, not just the wait: handing it back first
+/// leaves a gap in which a second press sees a free drain and acts ahead of
+/// the press already being answered. `app.exit(0)` never returns, so the
+/// release is best-effort — which is what the grace on the claim is for.
+/// Every exit from a drain goes through here, and the `Option` is what makes
+/// "at most once" hold when two of those exits are reached.
+#[cfg(target_os = "macos")]
+fn finish_macos_fullscreen_drain(generation: u64, action: &std::sync::Arc<MacosDrainAction>) {
+    let action = action
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(action) = action {
+        action();
+    }
+    release_macos_fullscreen_drain(generation);
+}
+
+#[cfg(target_os = "macos")]
+fn macos_fullscreen_drain_in_flight() -> bool {
+    let now = std::time::Instant::now();
+    let drain = *MACOS_FULLSCREEN_DRAIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    drain.is_some_and(|(_, started)| now.duration_since(started) < MACOS_FULLSCREEN_DRAIN_GRACE)
+}
+
+/// Run `action` once the main window no longer owns a macOS
+/// native-fullscreen Space.
+///
+/// Off macOS, and on a window that is not fullscreen, `action` runs inline
+/// on the calling thread; otherwise it runs on the main thread once the
+/// Space is gone. Every close path that hides or exits goes through here.
+///
+/// Keyed off the `AppHandle` rather than a `Window` because the answers to
+/// the close dialog arrive on a command that has no window handle, and
+/// `Manager::get_window` is behind tauri's `unstable` feature — the webview
+/// window is the flavour every caller can reach.
+pub(crate) fn with_macos_fullscreen_drained(
+    app: &tauri::AppHandle,
+    action: impl FnOnce() + Send + 'static,
+) {
+    #[cfg(target_os = "macos")]
+    {
+        // The in-flight check is not redundant with the flag: `set_fullscreen`
+        // clears tao's flag before the animation even starts, so a second
+        // close press arriving mid-drain reads as windowed while the Space is
+        // still going. Hand it to the drain, which drops it as a duplicate of
+        // the press already being answered.
+        //
+        // The sample is the bounded one because the dialog's answer reaches
+        // here on a tokio worker, where the plain getter would park a runtime
+        // thread on the event loop indefinitely. An unanswered sample drains:
+        // being wrong that way costs a delay, being wrong the other way is
+        // the bug this whole module exists for.
+        if let Some(window) = app.get_webview_window("main") {
+            if should_drain_macos_fullscreen_before_close(
+                true,
+                sample_macos_fullscreen(&window) != Some(false),
+            ) || macos_fullscreen_drain_in_flight()
+            {
+                drain_macos_fullscreen_then(window, action);
+                return;
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
+    action();
+}
+
+/// Exit native fullscreen and wait until the Space is gone, then run `then`
+/// on the main thread.
+#[cfg(target_os = "macos")]
+fn drain_macos_fullscreen_then(
+    window: tauri::WebviewWindow,
+    then: impl FnOnce() + Send + 'static,
+) {
+    let Some(generation) = claim_macos_fullscreen_drain() else {
+        return;
+    };
+
+    let _ = window.set_fullscreen(false);
+    tracing::info!("[close] draining macOS native fullscreen before close behavior");
+
+    // Shared, and taken exactly once, so every way this can go wrong still
+    // answers the press: a close the user pressed and that this path then
+    // swallowed leaves a window nothing can dismiss, which is worse than
+    // acting on a Space that has not quite finished going.
+    let action: std::sync::Arc<MacosDrainAction> =
+        std::sync::Arc::new(Mutex::new(Some(Box::new(then) as Box<dyn FnOnce() + Send>)));
+
+    let app = window.app_handle().clone();
+    let spawned = std::thread::Builder::new()
+        .name("macos-fs-close-drain".into())
+        .spawn({
+            let action = action.clone();
+            move || {
+                wait_for_macos_fullscreen_space_release(&window);
+                let hop = {
+                    let action = action.clone();
+                    move || finish_macos_fullscreen_drain(generation, &action)
+                };
+                // `run_on_main_thread` consumes the closure either way, which
+                // is why the action lives behind the shared `Option` rather
+                // than being moved in: a rejected hop must not eat the press.
+                if let Err(err) = app.run_on_main_thread(hop) {
+                    tracing::warn!(
+                        "[close] failed to hop back to main thread after fullscreen drain: {err}"
+                    );
+                    finish_macos_fullscreen_drain(generation, &action);
+                }
+            }
+        });
+
+    if let Err(err) = spawned {
+        tracing::warn!("[close] failed to spawn fullscreen drain: {err}");
+        finish_macos_fullscreen_drain(generation, &action);
+    }
+}
+
+/// One `is_fullscreen()` sample that cannot outlive `MACOS_FULLSCREEN_EXIT_PROBE`.
+///
+/// `WebviewWindow::is_fullscreen` off the main thread posts to the event loop
+/// and then blocks on a channel with NO timeout, so a stalled or closing loop
+/// would hang the drain thread outright — a deadline around the loop cannot
+/// bound a call that never returns. Hopping the read onto the main thread
+/// (where the runtime answers it inline) and waiting on our own channel with
+/// a deadline is what makes the whole drain finite.
+///
+/// `None` is "no answer this round", never "not fullscreen": the caller's own
+/// deadline decides when to stop asking.
+#[cfg(target_os = "macos")]
+fn sample_macos_fullscreen(window: &tauri::WebviewWindow) -> Option<bool> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let probe = {
+        let window = window.clone();
+        move || {
+            let _ = tx.send(window.is_fullscreen().unwrap_or(false));
+        }
+    };
+    window.app_handle().run_on_main_thread(probe).ok()?;
+    rx.recv_timeout(MACOS_FULLSCREEN_EXIT_PROBE).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_macos_fullscreen_space_release(window: &tauri::WebviewWindow) {
+    let deadline = std::time::Instant::now() + MACOS_FULLSCREEN_EXIT_TIMEOUT;
+    while sample_macos_fullscreen(window) != Some(false) {
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "[close] timed out waiting for macOS fullscreen to drop; applying close behavior anyway"
+            );
+            break;
+        }
+        std::thread::sleep(MACOS_FULLSCREEN_EXIT_POLL);
+    }
+    // The flag is not the Space — see the module note above. Give AppKit
+    // the animation before anything calls `orderOut:` or exits.
+    std::thread::sleep(MACOS_FULLSCREEN_EXIT_SETTLE);
+}
+
 /// Bring the hidden / minimized main workspace window back to the
 /// foreground. Used by:
 ///   * single-instance plugin (second launch)
@@ -2155,7 +2519,7 @@ pub async fn set_tray_locale(
 
 #[cfg(test)]
 mod owner_window_tests {
-    use super::SettingsWindowState;
+    use super::{AuxWindowState, SettingsWindowState};
 
     // `lib.rs` runs the restore on both `CloseRequested` and `Destroyed`, so the
     // owner has to be handed back exactly once. That mattered less while the
@@ -2179,6 +2543,59 @@ mod owner_window_tests {
         state.set_owner("settings".to_string(), "remote-workspace-3".to_string());
 
         assert_eq!(state.take_owner("settings").as_deref(), Some("remote-workspace-3"));
+    }
+
+    // Same hand-back-once contract for the shared map, which stash, push,
+    // project boot and the importer all write into.
+    #[test]
+    fn aux_owner_is_handed_back_once() {
+        let state = AuxWindowState::new();
+        state.set_owner("stash-7".to_string(), "main".to_string());
+
+        assert_eq!(state.take_owner("stash-7").as_deref(), Some("main"));
+        assert_eq!(state.take_owner("stash-7"), None);
+    }
+
+    // The four window kinds share one map, so their labels must not collide:
+    // closing the stash window has to leave the push window's owner alone.
+    #[test]
+    fn aux_owners_are_kept_per_window_label() {
+        let state = AuxWindowState::new();
+        state.set_owner("stash-7".to_string(), "main".to_string());
+        state.set_owner("push-7".to_string(), "remote-workspace-3".to_string());
+        state.set_owner("project-boot".to_string(), "main".to_string());
+        state.set_owner("import-sessions".to_string(), "main".to_string());
+
+        assert_eq!(state.take_owner("stash-7").as_deref(), Some("main"));
+        assert_eq!(state.take_owner("push-7").as_deref(), Some("remote-workspace-3"));
+        assert_eq!(state.take_owner("project-boot").as_deref(), Some("main"));
+        assert_eq!(state.take_owner("import-sessions").as_deref(), Some("main"));
+    }
+
+    // `lib.rs` runs the aux restore for EVERY closing window, so a label that
+    // never registered an owner (main, pet, settings, a commit window) must
+    // come back empty rather than pull some other window forward.
+    #[test]
+    fn aux_restore_is_inert_for_unregistered_labels() {
+        let state = AuxWindowState::new();
+        state.set_owner("stash-7".to_string(), "main".to_string());
+
+        for label in ["main", "pet", "settings", "commit-7", "merge-7"] {
+            assert_eq!(state.take_owner(label), None, "{label} owns nothing");
+        }
+        assert_eq!(state.take_owner("stash-7").as_deref(), Some("main"));
+    }
+
+    // Re-opening from another window re-points the owner here too. The stash
+    // window is reused across workspaces, so the restore has to follow the
+    // window the user last came from.
+    #[test]
+    fn reopening_an_aux_window_repoints_the_owner() {
+        let state = AuxWindowState::new();
+        state.set_owner("stash-7".to_string(), "main".to_string());
+        state.set_owner("stash-7".to_string(), "remote-workspace-3".to_string());
+
+        assert_eq!(state.take_owner("stash-7").as_deref(), Some("remote-workspace-3"));
     }
 }
 
@@ -2301,5 +2718,72 @@ mod settings_route_tests {
         }
         // An unnamed section keeps its long-standing desktop landing spot.
         assert_eq!(resolve_settings_route(None), "settings/appearance");
+    }
+}
+
+#[cfg(test)]
+mod macos_fullscreen_close_tests {
+    use super::should_drain_macos_fullscreen_before_close;
+
+    /// Linux (and Windows) fullscreen is not a separate Space. Close must
+    /// not wait on it, or a maximized window would take the settle delay on
+    /// every hide/exit for nothing.
+    #[test]
+    fn non_macos_never_drains_fullscreen() {
+        assert!(!should_drain_macos_fullscreen_before_close(false, true));
+        assert!(!should_drain_macos_fullscreen_before_close(false, false));
+    }
+
+    /// The flag is up for the whole of a user-driven exit animation (tao
+    /// only clears it in `windowDidExitFullScreen`), so it is also what
+    /// covers a close pressed mid-animation. Windowed must not drain: that
+    /// would put the settle delay on every ordinary close.
+    #[test]
+    fn macos_drains_exactly_while_the_fullscreen_flag_is_up() {
+        assert!(should_drain_macos_fullscreen_before_close(true, true));
+        assert!(!should_drain_macos_fullscreen_before_close(true, false));
+    }
+
+    /// The drain is claimed once and answered once: a second press while one
+    /// is in flight is dropped rather than queueing a second hide. And while
+    /// it is in flight it stays observable, because tao's fullscreen flag is
+    /// already down by then and would otherwise read as "nothing to wait for".
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_drain_claim_is_exclusive_and_observable_until_released() {
+        use super::{
+            claim_macos_fullscreen_drain, macos_fullscreen_drain_in_flight,
+            release_macos_fullscreen_drain, MACOS_FULLSCREEN_DRAIN,
+        };
+
+        *MACOS_FULLSCREEN_DRAIN.lock().unwrap() = None;
+        assert!(!macos_fullscreen_drain_in_flight());
+
+        let first = claim_macos_fullscreen_drain().expect("first press claims the drain");
+        assert!(
+            macos_fullscreen_drain_in_flight(),
+            "a second press must be able to see the drain it should defer to"
+        );
+        assert!(
+            claim_macos_fullscreen_drain().is_none(),
+            "a press arriving mid-drain must not start a second one"
+        );
+
+        release_macos_fullscreen_drain(first);
+        assert!(!macos_fullscreen_drain_in_flight());
+        let second =
+            claim_macos_fullscreen_drain().expect("the next press is answerable once done");
+        assert_ne!(first, second);
+
+        // The wedge case the generation exists for: the thread that lost its
+        // claim to a takeover must not clear the claim that replaced it.
+        release_macos_fullscreen_drain(first);
+        assert!(
+            macos_fullscreen_drain_in_flight(),
+            "a stale release must leave the incumbent drain owning the press"
+        );
+
+        release_macos_fullscreen_drain(second);
+        assert!(!macos_fullscreen_drain_in_flight());
     }
 }
