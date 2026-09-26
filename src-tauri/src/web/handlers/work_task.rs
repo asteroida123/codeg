@@ -82,6 +82,9 @@ pub struct ReturnParams {
     /// Defaults, so an older client's body still deserializes.
     #[serde(default)]
     pub blocks: Vec<serde_json::Value>,
+    /// Explicit "run with a new session": skip the continuation anchor.
+    #[serde(default)]
+    pub fresh_session: bool,
 }
 
 /// A restart (retry / requeue) that may carry a note for the next run. `note`
@@ -99,6 +102,10 @@ pub struct RestartParams {
     /// work item that already has another active task).
     #[serde(default)]
     pub allow_duplicate_source: bool,
+    /// Retry only: explicitly start a new session instead of continuing the
+    /// recorded one. Ignored by requeue, which always starts from the top.
+    #[serde(default)]
+    pub fresh_session: bool,
 }
 
 /// Plan a to-do task's start. `scheduledAt` is RFC 3339; absent or null clears
@@ -228,6 +235,34 @@ pub async fn work_task_events(
     Ok(Json(result))
 }
 
+/// Params for the two task-detail ledger reads (`work_task_runs`,
+/// `task_delegations`) — both are scoped to the task row.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskIdParams {
+    pub task_id: i32,
+}
+
+pub async fn work_task_runs(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<TaskIdParams>,
+) -> Result<Json<Vec<crate::models::WorkTaskRunInfo>>, AppCommandError> {
+    let result = core::work_task_runs_core(&state.db, params.task_id)
+        .await
+        .map_err(AppCommandError::from)?;
+    Ok(Json(result))
+}
+
+pub async fn task_delegations(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<TaskIdParams>,
+) -> Result<Json<Vec<crate::models::WorkTaskDelegationInfo>>, AppCommandError> {
+    let result = core::task_delegations_core(&state.db, params.task_id)
+        .await
+        .map_err(AppCommandError::from)?;
+    Ok(Json(result))
+}
+
 pub async fn work_task_attention_count(
     Extension(state): Extension<Arc<AppState>>,
 ) -> Result<Json<u64>, AppCommandError> {
@@ -309,9 +344,15 @@ pub async fn work_task_start_all(
 pub async fn work_task_retry(
     Json(params): Json<RestartParams>,
 ) -> Result<Json<()>, AppCommandError> {
-    core::work_task_retry_core(params.id, params.note, params.blocks, params.allow_duplicate_source)
-        .await
-        .map_err(AppCommandError::from)?;
+    core::work_task_retry_core(
+        params.id,
+        params.note,
+        params.blocks,
+        params.allow_duplicate_source,
+        params.fresh_session,
+    )
+    .await
+    .map_err(AppCommandError::from)?;
     Ok(Json(()))
 }
 
@@ -345,9 +386,15 @@ pub async fn work_task_schedule(
 pub async fn work_task_return(
     Json(params): Json<ReturnParams>,
 ) -> Result<Json<()>, AppCommandError> {
-    core::work_task_return_core(params.id, params.feedback, params.intent, params.blocks)
-        .await
-        .map_err(AppCommandError::from)?;
+    core::work_task_return_core(
+        params.id,
+        params.feedback,
+        params.intent,
+        params.blocks,
+        params.fresh_session,
+    )
+    .await
+    .map_err(AppCommandError::from)?;
     Ok(Json(()))
 }
 

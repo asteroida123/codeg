@@ -9,7 +9,7 @@ use crate::app_error::AppCommandError;
 use crate::commands::folders::get_folder_core;
 use crate::db::entities::work_task::WorkTaskStatus;
 use crate::db::error::DbError;
-use crate::db::service::work_task_service;
+use crate::db::service::{work_task_run_service, work_task_service};
 use crate::db::AppDatabase;
 use crate::models::{
     FollowUpIntent, WorkTaskChangedFile, WorkTaskDraft, WorkTaskEventInfo, WorkTaskFolderSettings,
@@ -214,6 +214,25 @@ pub async fn work_task_events_core(
     limit: u64,
 ) -> Result<Vec<WorkTaskEventInfo>, DbError> {
     work_task_service::list_events(&db.conn, task_id, limit).await
+}
+
+/// The task's execution generations, newest first — the detail drawer's
+/// "rounds" list, including each run's session-continuation outcome.
+pub async fn work_task_runs_core(
+    db: &AppDatabase,
+    task_id: i32,
+) -> Result<Vec<crate::models::WorkTaskRunInfo>, DbError> {
+    work_task_run_service::list_for_task(&db.conn, task_id).await
+}
+
+/// The delegations admitted while this task executed, oldest first — the
+/// detail drawer's "sub-agent runs" list. Attribution is stored on the ledger
+/// row at admission, so a later fresh-session rework cannot repoint history.
+pub async fn task_delegations_core(
+    db: &AppDatabase,
+    task_id: i32,
+) -> Result<Vec<crate::models::WorkTaskDelegationInfo>, DbError> {
+    crate::db::service::delegation_task_service::list_for_task(&db.conn, task_id).await
 }
 
 pub async fn work_task_attention_count_core(db: &AppDatabase) -> Result<u64, DbError> {
@@ -448,14 +467,18 @@ pub async fn work_task_start_all_core(folder_id: Option<i32>) -> Result<u32, DbE
 /// failed → queued, optionally with a note explaining what to do differently.
 /// `blocks` carries whatever the note box attached out of band (images, pasted
 /// bytes) as raw prompt blocks.
+///
+/// `fresh_session` is the explicit "run with a new session" action: the launch
+/// ignores the recorded session instead of strictly continuing it.
 pub async fn work_task_retry_core(
     id: i32,
     note: Option<String>,
     blocks: Vec<serde_json::Value>,
     allow_duplicate_source: bool,
+    fresh_session: bool,
 ) -> Result<(), DbError> {
     engine()?
-        .retry(id, note, blocks, allow_duplicate_source)
+        .retry(id, note, blocks, allow_duplicate_source, fresh_session)
         .await
         .map_err(DbError::Validation)
 }
@@ -534,6 +557,7 @@ pub async fn work_task_return_core(
     feedback: String,
     intent: Option<String>,
     blocks: Vec<serde_json::Value>,
+    fresh_session: bool,
 ) -> Result<(), DbError> {
     let intent = FollowUpIntent::from_wire(intent.as_deref()).map_err(DbError::Validation)?;
     let feedback = feedback.trim().to_string();
@@ -543,7 +567,7 @@ pub async fn work_task_return_core(
         return Err(DbError::Validation("feedback is required".to_string()));
     }
     engine()?
-        .return_task(id, intent, feedback, blocks)
+        .return_task(id, intent, feedback, blocks, fresh_session)
         .await
         .map_err(DbError::Validation)
 }
@@ -865,6 +889,24 @@ pub async fn work_task_events(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_runs(
+    db: tauri::State<'_, AppDatabase>,
+    task_id: i32,
+) -> Result<Vec<crate::models::WorkTaskRunInfo>, DbError> {
+    work_task_runs_core(&db, task_id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn task_delegations(
+    db: tauri::State<'_, AppDatabase>,
+    task_id: i32,
+) -> Result<Vec<crate::models::WorkTaskDelegationInfo>, DbError> {
+    task_delegations_core(&db, task_id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn work_task_attention_count(
     db: tauri::State<'_, AppDatabase>,
 ) -> Result<u64, DbError> {
@@ -947,12 +989,14 @@ pub async fn work_task_retry(
     note: Option<String>,
     blocks: Option<Vec<serde_json::Value>>,
     allow_duplicate_source: Option<bool>,
+    fresh_session: Option<bool>,
 ) -> Result<(), DbError> {
     work_task_retry_core(
         id,
         note,
         blocks.unwrap_or_default(),
         allow_duplicate_source.unwrap_or(false),
+        fresh_session.unwrap_or(false),
     )
     .await
 }
@@ -996,8 +1040,16 @@ pub async fn work_task_return(
     feedback: String,
     intent: Option<String>,
     blocks: Option<Vec<serde_json::Value>>,
+    fresh_session: Option<bool>,
 ) -> Result<(), DbError> {
-    work_task_return_core(id, feedback, intent, blocks.unwrap_or_default()).await
+    work_task_return_core(
+        id,
+        feedback,
+        intent,
+        blocks.unwrap_or_default(),
+        fresh_session.unwrap_or(false),
+    )
+    .await
 }
 
 #[cfg(feature = "tauri-runtime")]

@@ -1498,6 +1498,14 @@ pub fn build_router(
             post(handlers::work_task::work_task_events),
         )
         .route(
+            "/work_task_runs",
+            post(handlers::work_task::work_task_runs),
+        )
+        .route(
+            "/task_delegations",
+            post(handlers::work_task::task_delegations),
+        )
+        .route(
             "/work_task_attention_count",
             post(handlers::work_task::work_task_attention_count),
         )

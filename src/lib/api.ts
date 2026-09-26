@@ -50,9 +50,11 @@ import type {
   WorkTask,
   WorkTaskChangedFile,
   WorkTaskConfig,
+  WorkTaskDelegation,
   WorkTaskDraft,
   WorkTaskEvent,
   WorkTaskFolderSettings,
+  WorkTaskRun,
   WorkTaskTemplate,
   ConversationSummary,
   ConversationDetail,
@@ -3604,6 +3606,20 @@ export async function workTaskEvents(
   return getTransport().call("work_task_events", { taskId, limit })
 }
 
+/** One task's execution generations, newest first — the detail drawer's
+ *  "rounds" list, each with its session-continuation outcome and cost. */
+export async function workTaskRuns(taskId: number): Promise<WorkTaskRun[]> {
+  return getTransport().call("work_task_runs", { taskId })
+}
+
+/** The delegations admitted while this task executed, oldest first — the
+ *  detail drawer's "sub-agent runs" list. */
+export async function taskDelegations(
+  taskId: number
+): Promise<WorkTaskDelegation[]> {
+  return getTransport().call("task_delegations", { taskId })
+}
+
 /**
  * Drop an uploaded image's base64 from a task's blocks in every mode where the
  * call leaves through an HTTP body, the same rule (and the same helper) a chat
@@ -3673,13 +3689,15 @@ export async function workTaskRetry(
   id: number,
   note?: string | null,
   blocks?: PromptInputBlock[] | null,
-  allowDuplicateSource?: boolean
+  allowDuplicateSource?: boolean,
+  freshSession?: boolean
 ): Promise<void> {
   return getTransport().call("work_task_retry", {
     id,
     note: note ?? null,
     blocks: stripUploadedTaskBlocks(blocks),
     allowDuplicateSource: allowDuplicateSource ?? false,
+    freshSession: freshSession ?? false,
   })
 }
 
@@ -3721,13 +3739,15 @@ export async function workTaskReturn(
   id: number,
   feedback: string,
   intent?: FollowUpIntent,
-  blocks?: PromptInputBlock[] | null
+  blocks?: PromptInputBlock[] | null,
+  freshSession?: boolean
 ): Promise<void> {
   return getTransport().call("work_task_return", {
     id,
     feedback,
     intent: intent ?? null,
     blocks: stripUploadedTaskBlocks(blocks),
+    freshSession: freshSession ?? false,
   })
 }
 

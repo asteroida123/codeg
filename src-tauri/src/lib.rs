@@ -1907,6 +1907,8 @@ mod tauri_app {
                 work_task_commands::work_task_list,
                 work_task_commands::work_task_get,
                 work_task_commands::work_task_events,
+                work_task_commands::work_task_runs,
+                work_task_commands::task_delegations,
                 work_task_commands::work_task_attention_count,
                 work_task_commands::work_task_create,
                 work_task_commands::work_task_update,
