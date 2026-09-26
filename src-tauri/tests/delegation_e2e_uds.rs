@@ -94,6 +94,19 @@ impl codeg_lib::acp::session_info::SessionInfoAccess for NoSessionInfo {
     }
 }
 
+/// No-op capability-catalog access — this e2e suite never drives
+/// `get_delegation_capabilities`.
+struct NoCapabilities;
+#[async_trait]
+impl codeg_lib::acp::capability_catalog::CapabilityCatalogAccess for NoCapabilities {
+    async fn resolve(
+        &self,
+        _agent_type: Option<&str>,
+    ) -> codeg_lib::acp::capability_catalog::CapabilitiesReport {
+        codeg_lib::acp::capability_catalog::CapabilitiesReport::default()
+    }
+}
+
 /// Task-tool stub: the e2e delegation tests never exercise the task arms.
 struct NoTaskTools;
 #[async_trait::async_trait]
@@ -227,6 +240,8 @@ async fn end_to_end_uds_happy_path() {
         Arc::new(NoAuthoring) as Arc<dyn codeg_lib::acp::chat_authoring::ChatAuthoringAccess>,
         Arc::new(codeg_lib::acp::browser_tools::NoBrowserTabs)
             as Arc<dyn codeg_lib::acp::browser_tools::BrowserToolAccess>,
+        Arc::new(NoCapabilities)
+            as Arc<dyn codeg_lib::acp::capability_catalog::CapabilityCatalogAccess>,
     );
 
     // Freshly-named directory per test — no clashes across test bins.
@@ -346,6 +361,8 @@ async fn end_to_end_uds_batch_status() {
         Arc::new(NoAuthoring) as Arc<dyn codeg_lib::acp::chat_authoring::ChatAuthoringAccess>,
         Arc::new(codeg_lib::acp::browser_tools::NoBrowserTabs)
             as Arc<dyn codeg_lib::acp::browser_tools::BrowserToolAccess>,
+        Arc::new(NoCapabilities)
+            as Arc<dyn codeg_lib::acp::capability_catalog::CapabilityCatalogAccess>,
     );
 
     let dir = socket_dir();
@@ -436,6 +453,8 @@ async fn end_to_end_uds_invalid_token_rejected() {
         Arc::new(NoAuthoring) as Arc<dyn codeg_lib::acp::chat_authoring::ChatAuthoringAccess>,
         Arc::new(codeg_lib::acp::browser_tools::NoBrowserTabs)
             as Arc<dyn codeg_lib::acp::browser_tools::BrowserToolAccess>,
+        Arc::new(NoCapabilities)
+            as Arc<dyn codeg_lib::acp::capability_catalog::CapabilityCatalogAccess>,
     );
 
     let dir = socket_dir();
@@ -505,6 +524,8 @@ async fn end_to_end_uds_ask_question_round_trip() {
         Arc::new(NoAuthoring) as Arc<dyn codeg_lib::acp::chat_authoring::ChatAuthoringAccess>,
         Arc::new(codeg_lib::acp::browser_tools::NoBrowserTabs)
             as Arc<dyn codeg_lib::acp::browser_tools::BrowserToolAccess>,
+        Arc::new(NoCapabilities)
+            as Arc<dyn codeg_lib::acp::capability_catalog::CapabilityCatalogAccess>,
     );
 
     let dir = socket_dir();
@@ -648,6 +669,8 @@ async fn end_to_end_uds_ask_revoked_after_register_declines() {
         Arc::new(NoAuthoring) as Arc<dyn codeg_lib::acp::chat_authoring::ChatAuthoringAccess>,
         Arc::new(codeg_lib::acp::browser_tools::NoBrowserTabs)
             as Arc<dyn codeg_lib::acp::browser_tools::BrowserToolAccess>,
+        Arc::new(NoCapabilities)
+            as Arc<dyn codeg_lib::acp::capability_catalog::CapabilityCatalogAccess>,
     );
 
     let dir = socket_dir();

@@ -321,6 +321,16 @@ mod tests {
     }
 
     #[async_trait]
+    impl crate::acp::capability_catalog::CapabilityCatalogAccess for Stub {
+        async fn resolve(
+            &self,
+            _agent_type: Option<&str>,
+        ) -> crate::acp::capability_catalog::CapabilitiesReport {
+            crate::acp::capability_catalog::CapabilitiesReport::default()
+        }
+    }
+
+    #[async_trait]
     impl crate::acp::work_task_tools::WorkTaskToolAccess for Stub {
         async fn report_progress(
             &self,
@@ -490,6 +500,7 @@ mod tests {
         let listener = DelegationListener::new(
             broker,
             Arc::new(TokenRegistry::default()),
+            Arc::new(Stub),
             Arc::new(Stub),
             Arc::new(Stub),
             Arc::new(Stub),

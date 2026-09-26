@@ -49,7 +49,8 @@ use crate::acp::delegation::transport::{
     client_browser_console_round_trip, client_browser_eval_round_trip,
     client_browser_snapshot_round_trip, client_browser_tab_op_round_trip,
     client_browser_tabs_round_trip,
-    client_cancel, client_cancel_task_round_trip, client_commit_feedback,
+    client_cancel, client_capabilities_round_trip, client_cancel_task_round_trip,
+    client_commit_feedback,
     client_create_automation_round_trip, client_create_work_task_round_trip,
     client_feedback_round_trip, client_resume_task_round_trip, client_round_trip,
     client_session_round_trip, client_status_round_trip, client_task_complete_round_trip,
@@ -57,8 +58,9 @@ use crate::acp::delegation::transport::{
     BrokerBrowserEvalRequest, BrokerBrowserSnapshotRequest, BrokerBrowserTabOpRequest,
     BrokerBrowserTabsRequest,
     BrokerCancelRequest,
-    BrokerCancelTaskRequest, BrokerCommitFeedbackRequest, BrokerCreateAutomationRequest,
-    BrokerCreateWorkTaskRequest, BrokerFeedbackRequest, BrokerRequest, BrokerResponse,
+    BrokerCancelTaskRequest, BrokerCapabilitiesRequest, BrokerCommitFeedbackRequest,
+    BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest, BrokerFeedbackRequest,
+    BrokerRequest, BrokerResponse,
     BrokerResumeTaskRequest, BrokerSessionRequest, BrokerStatusRequest,
     BrokerTaskCompleteRequest, BrokerTaskProgressRequest,
 };
@@ -250,7 +252,7 @@ impl CompanionFeatures {
             // cannot leave the strongest tool as the only one present.
             "browser_eval" => self.browser && self.browser_eval,
             "delegate_to_agent" | "get_delegation_status" | "cancel_delegation"
-            | "resume_delegation" => self.delegation,
+            | "resume_delegation" | "get_delegation_capabilities" => self.delegation,
             _ => false,
         }
     }
@@ -666,6 +668,36 @@ async fn build_tools_call_spawn(
                 render_task_report,
             )
             .await
+        }
+        "get_delegation_capabilities" => {
+            // Optional `agent_type` filter, the same slug `delegate_to_agent`
+            // takes. A non-string / whitespace-only value violates the schema
+            // contract and is rejected synchronously so the LLM can fix it;
+            // whitespace-only collapses to `None` (unfiltered listing).
+            let agent_type = match arguments.get("agent_type") {
+                None => None,
+                Some(Value::String(s)) => {
+                    let trimmed = s.trim();
+                    (!trimmed.is_empty()).then(|| trimmed.to_string())
+                }
+                Some(_) => {
+                    return LineAction::Respond(err(
+                        id,
+                        -32602,
+                        "get_delegation_capabilities `agent_type` must be a string slug \
+                         (the same value delegate_to_agent takes), or omitted",
+                    ));
+                }
+            };
+            let req = BrokerCapabilitiesRequest {
+                token: ctx.token.clone(),
+                agent_type,
+            };
+            // No external_handle: a read-only catalog lookup has nothing to
+            // cancel broker-side — canceling only suppresses the response.
+            let round_trip =
+                Box::pin(async move { client_capabilities_round_trip(&socket, &req).await });
+            register_and_spawn(inflight, id, None, round_trip, render_capabilities_result).await
         }
         "check_user_feedback" => {
             let req = BrokerFeedbackRequest {
@@ -1535,6 +1567,66 @@ pub fn render_session_result(outcome: &Value) -> Value {
             .unwrap_or("No matching session was found.")
             .to_string()
     };
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": false,
+        "structuredContent": outcome.clone(),
+    })
+}
+
+/// Map the `get_delegation_capabilities` round-trip outcome (a
+/// `{ agents: [..] }` envelope from the listener) into an MCP `tools/call`
+/// result.
+///
+/// The human-readable `content` text is one compact block per agent — name,
+/// source, and the three lists — so a host that persists only the text still
+/// carries the whole matrix; `structuredContent` carries the raw envelope.
+/// `isError` is always `false`: an unknown capability set is an honest
+/// answer, not a failure.
+pub fn render_capabilities_result(outcome: &Value) -> Value {
+    let agents = outcome
+        .get("agents")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut text = String::new();
+    if let Some(note) = outcome.get("note").and_then(|v| v.as_str()) {
+        text.push_str(note);
+        text.push('\n');
+    }
+    if agents.is_empty() {
+        text.push_str("No delegable agent capabilities are available to report.");
+    }
+    for agent in &agents {
+        let slug = agent.get("agent_type").and_then(|v| v.as_str()).unwrap_or("?");
+        let name = agent.get("display_name").and_then(|v| v.as_str()).unwrap_or(slug);
+        let source = agent.get("source").and_then(|v| v.as_str()).unwrap_or("unknown");
+        text.push_str(&format!("- {slug} ({name}) [source: {source}]\n"));
+        let list = |key: &str, label: &str| {
+            let values: Vec<&str> = agent
+                .get(key)
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if values.is_empty() {
+                format!("  {label}: unknown\n")
+            } else {
+                format!("  {label}: {}\n", values.join(", "))
+            }
+        };
+        text.push_str(&list("models", "models"));
+        text.push_str(&list("modes", "modes"));
+        text.push_str(&list("reasoning_levels", "reasoning levels"));
+        if let Some(notes) = agent.get("notes").and_then(|v| v.as_array()) {
+            for note in notes.iter().filter_map(|n| n.as_str()) {
+                text.push_str(&format!("  note: {note}\n"));
+            }
+        }
+    }
     json!({
         "content": [{ "type": "text", "text": text }],
         "isError": false,
@@ -2627,17 +2719,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_returns_four_delegation_tools() {
+    async fn tools_list_returns_five_delegation_tools() {
         let line = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
         let resp = unwrap_respond(dispatch_for_test(line).await);
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 5);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"delegate_to_agent"));
         assert!(names.contains(&"get_delegation_status"));
         assert!(names.contains(&"cancel_delegation"));
         assert!(names.contains(&"resume_delegation"));
+        assert!(names.contains(&"get_delegation_capabilities"));
         // resume_delegation requires only task_id; reason is optional and
         // there is deliberately NO task-text parameter (no new iterations).
         let resume = tools
@@ -2680,6 +2773,15 @@ mod tests {
         assert!(status["inputSchema"]["properties"]["wait_ms"].is_object());
         let required = status["inputSchema"]["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v == "task_ids"));
+        // get_delegation_capabilities takes only the OPTIONAL agent_type
+        // filter — nothing is required, so an unfiltered listing works.
+        let capabilities = tools
+            .iter()
+            .find(|t| t["name"] == "get_delegation_capabilities")
+            .unwrap();
+        assert!(capabilities["inputSchema"]["properties"]["agent_type"].is_object());
+        let required = capabilities["inputSchema"]["required"].as_array();
+        assert!(required.is_none(), "no argument should be required");
     }
 
     #[tokio::test]
@@ -3255,7 +3357,7 @@ mod tests {
             dispatch_for_test(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).await,
         );
         assert!(!names.contains(&"check_user_feedback".to_string()));
-        assert_eq!(names.len(), 4);
+        assert_eq!(names.len(), 5);
     }
 
     #[tokio::test]
@@ -3264,7 +3366,7 @@ mod tests {
             dispatch_with_features(BOTH, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).await,
         );
         assert!(names.contains(&"check_user_feedback".to_string()));
-        assert_eq!(names.len(), 5);
+        assert_eq!(names.len(), 6);
     }
 
     #[tokio::test]
@@ -3541,6 +3643,91 @@ mod tests {
         let e = resp.error.unwrap();
         assert_eq!(e.code, -32602);
         assert!(e.message.contains("unknown tool"));
+    }
+
+    // -- delegation capabilities: dispatch + rendering -----------------------
+
+    /// The tool rides the delegation group: it spawns with or without the
+    /// optional filter, and a whitespace-only filter collapses to an
+    /// unfiltered listing rather than being rejected.
+    #[tokio::test]
+    async fn get_delegation_capabilities_spawns_with_or_without_filter() {
+        for args in [json!({}), json!({ "agent_type": "codex" }), json!({ "agent_type": "  " })] {
+            let line = json!({
+                "jsonrpc": "2.0", "id": 34, "method": "tools/call",
+                "params": { "name": "get_delegation_capabilities", "arguments": args }
+            })
+            .to_string();
+            assert!(
+                matches!(dispatch_for_test(&line).await, LineAction::Spawn(_)),
+                "args {args}"
+            );
+        }
+    }
+
+    /// A non-string filter violates the schema contract — rejected
+    /// synchronously with a -32602 the LLM can act on.
+    #[tokio::test]
+    async fn get_delegation_capabilities_rejects_non_string_filter() {
+        let line = json!({
+            "jsonrpc": "2.0", "id": 35, "method": "tools/call",
+            "params": { "name": "get_delegation_capabilities",
+                        "arguments": { "agent_type": 7 } }
+        })
+        .to_string();
+        let resp = unwrap_respond(dispatch_for_test(&line).await);
+        let e = resp.error.expect("non-string filter must be rejected");
+        assert_eq!(e.code, -32602);
+        assert!(e.message.contains("agent_type"));
+    }
+
+    /// The rendered text carries every agent's matrix compactly — a host that
+    /// keeps only `content` text still holds the whole catalog — and unknown
+    /// lists are labeled as unknown, never silently blank.
+    #[test]
+    fn render_capabilities_result_texts_the_matrix() {
+        let outcome = json!({
+            "agents": [
+                {
+                    "agent_type": "codex",
+                    "display_name": "Codex",
+                    "models": ["gpt-6-astra", "gpt-6-sol"],
+                    "modes": [],
+                    "reasoning_levels": ["low", "high"],
+                    "source": "static",
+                    "notes": ["Reasoning levels are the union across models"]
+                },
+                {
+                    "agent_type": "gemini",
+                    "display_name": "Gemini CLI",
+                    "models": [],
+                    "modes": [],
+                    "reasoning_levels": [],
+                    "source": "unknown",
+                    "notes": ["No static catalog and no cached advertisement"]
+                }
+            ]
+        });
+        let rendered = render_capabilities_result(&outcome);
+        assert_eq!(rendered["isError"], false);
+        let text = rendered["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("- codex (Codex) [source: static]"));
+        assert!(text.contains("models: gpt-6-astra, gpt-6-sol"));
+        assert!(text.contains("reasoning levels: low, high"));
+        assert!(text.contains("note: Reasoning levels"));
+        assert!(text.contains("- gemini (Gemini CLI) [source: unknown]"));
+        assert!(text.contains("models: unknown"));
+        // The structured envelope rides along untouched.
+        assert_eq!(rendered["structuredContent"]["agents"].as_array().unwrap().len(), 2);
+    }
+
+    /// An empty report renders as a plain statement, not an error.
+    #[test]
+    fn render_capabilities_result_empty_report_is_not_an_error() {
+        let rendered = render_capabilities_result(&json!({ "agents": [] }));
+        assert_eq!(rendered["isError"], false);
+        let text = rendered["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("No delegable agent capabilities"));
     }
 
     // -- chat authoring: feature gating + parsing + rendering ---------------

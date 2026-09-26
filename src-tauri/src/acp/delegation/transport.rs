@@ -256,6 +256,25 @@ pub struct BrokerBrowserTabsRequest {
     pub token: String,
 }
 
+/// Resolve the capability matrix (models / modes / reasoning levels) of every
+/// delegable agent, or the one named by the optional filter. Backs the
+/// `get_delegation_capabilities` MCP tool. Authenticated by the per-launch
+/// `token`; like [`BrokerSessionRequest`] it is not parent-scoped — the
+/// catalog describes agents, not the caller's own tasks, and an invalid token
+/// gets the same empty report a runtime with no catalog access would return.
+///
+/// Read-only by construction: static sources are on-disk catalogs and the
+/// advertised source is a cache of what live sessions already published, so
+/// answering never launches an agent process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerCapabilitiesRequest {
+    pub token: String,
+    /// Optional `agent_type` filter, the same slug `delegate_to_agent` takes.
+    /// `None` reports every delegable agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+}
+
 /// Read one shared page. Backs the `browser_snapshot` MCP tool; the grant check
 /// and the audit line both happen behind it, in `agent_snapshot_core`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,6 +370,7 @@ pub enum BrokerMessage {
     CreateAutomation(BrokerCreateAutomationRequest),
     CreateWorkTask(BrokerCreateWorkTaskRequest),
     BrowserTabs(BrokerBrowserTabsRequest),
+    Capabilities(BrokerCapabilitiesRequest),
     BrowserSnapshot(BrokerBrowserSnapshotRequest),
     BrowserAct(BrokerBrowserActRequest),
     BrowserConsole(BrokerBrowserConsoleRequest),
@@ -567,6 +587,15 @@ pub async fn client_browser_tabs_round_trip(
     message_round_trip(socket_path, &BrokerMessage::BrowserTabs(req.clone())).await
 }
 
+/// Dispatch a `get_delegation_capabilities` request and read back the
+/// serialized [`crate::acp::capability_catalog::CapabilitiesReport`] envelope.
+pub async fn client_capabilities_round_trip(
+    socket_path: &str,
+    req: &BrokerCapabilitiesRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(socket_path, &BrokerMessage::Capabilities(req.clone())).await
+}
+
 /// Dispatch a `browser_snapshot` request and read back the serialized
 /// [`crate::acp::browser_tools::BrowserSnapshotOutcome`].
 pub async fn client_browser_snapshot_round_trip(
@@ -773,6 +802,36 @@ mod tests {
                 assert_eq!(req.external_handle.as_deref(), Some("h1"));
             }
             other => panic!("expected ResumeTask variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn capabilities_message_round_trip_in_memory() {
+        let (mut a, mut b) = duplex(8 * 1024);
+        let msg = BrokerMessage::Capabilities(BrokerCapabilitiesRequest {
+            token: "tok".into(),
+            agent_type: Some("codex".into()),
+        });
+        write_frame(&mut a, &msg).await.unwrap();
+        let got: BrokerMessage = read_frame(&mut b).await.unwrap();
+        match got {
+            BrokerMessage::Capabilities(req) => {
+                assert_eq!(req.token, "tok");
+                assert_eq!(req.agent_type.as_deref(), Some("codex"));
+            }
+            other => panic!("expected Capabilities variant, got {other:?}"),
+        }
+
+        // The filter is optional on the wire — an unfiltered listing omits it.
+        let unfiltered = BrokerMessage::Capabilities(BrokerCapabilitiesRequest {
+            token: "tok".into(),
+            agent_type: None,
+        });
+        write_frame(&mut b, &unfiltered).await.unwrap();
+        let back: BrokerMessage = read_frame(&mut a).await.unwrap();
+        match back {
+            BrokerMessage::Capabilities(req) => assert!(req.agent_type.is_none()),
+            other => panic!("expected Capabilities variant, got {other:?}"),
         }
     }
 

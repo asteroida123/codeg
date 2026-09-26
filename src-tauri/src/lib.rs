@@ -1065,6 +1065,11 @@ mod tauri_app {
                                 browser_tools_config.clone(),
                             ),
                         ),
+                        std::sync::Arc::new(
+                            crate::acp::manager::ConnectionManagerCapabilityCatalog {
+                                manager: std::sync::Arc::new(cm_state.clone_ref()),
+                            },
+                        ),
                     );
                     // Bind through the service handle rather than a bare
                     // `listener.run` spawn: it keeps the bind error and the
