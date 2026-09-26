@@ -3157,7 +3157,16 @@
         "mentionGroupAgent": "에이전트",
         "mentionGroupSession": "세션",
         "mentionGroupCommit": "커밋",
-        "mentionGroupSkill": "스킬"
+        "mentionGroupSkill": "스킬",
+        "mentionGroupDelegatedSession": "이 대화의 하위 에이전트",
+        "mentionDelegationRound": "{rounds}번째 라운드",
+        "mentionDelegationStatus": {
+          "running": "실행 중",
+          "completed": "완료",
+          "failed": "실패",
+          "canceled": "취소됨",
+          "interrupted": "복구 필요"
+        }
       },
       "messageQueue": {
         "addToQueue": "대기열에 추가",

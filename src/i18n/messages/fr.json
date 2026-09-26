@@ -3157,7 +3157,16 @@
         "mentionGroupAgent": "Agents",
         "mentionGroupSession": "Sessions",
         "mentionGroupCommit": "Commits",
-        "mentionGroupSkill": "Compétences"
+        "mentionGroupSkill": "Compétences",
+        "mentionGroupDelegatedSession": "Sous-agents de cette conversation",
+        "mentionDelegationRound": "Tour {rounds}",
+        "mentionDelegationStatus": {
+          "running": "En cours",
+          "completed": "Terminé",
+          "failed": "Échec",
+          "canceled": "Annulé",
+          "interrupted": "À récupérer"
+        }
       },
       "messageQueue": {
         "addToQueue": "Mettre en file",

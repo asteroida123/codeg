@@ -2226,6 +2226,10 @@ const ConversationTabView = memo(function ConversationTabView({
   return (
     <ConversationShell
       getSentHistory={getSentHistory}
+      // The `@` panel's delegated-children group (§14.4) is scoped to the
+      // conversation this composer sends into — null while the tab is still a
+      // draft (nothing delegated yet, so the group stays hidden).
+      conversationId={dbConversationId}
       topBanner={
         <>
           <SessionConfigStaleBanner contextKey={tabId} />
@@ -2395,6 +2399,7 @@ const ConversationTabView = memo(function ConversationTabView({
                 status={composerConnStatus}
                 promptCapabilities={conn.promptCapabilities}
                 defaultPath={workingDirForConnection}
+                conversationId={dbConversationId}
                 agentName={getAgentLabel(selectedAgent)}
                 onFocus={handleFocus}
                 onSend={handleSend}

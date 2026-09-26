@@ -756,6 +756,9 @@ export function CanvasConversationSurface({
           status={connStatus}
           promptCapabilities={conn.promptCapabilities}
           defaultPath={workingDir}
+          // The `@` panel's delegated-children group (§14.4) is scoped to this
+          // card's conversation — null while it is still a draft.
+          conversationId={dbConversationId}
           agentName={getAgentLabel(agentType)}
           claudeApiRetry={conn.claudeApiRetry}
           sessionFailures={conn.sessionFailures}

@@ -107,6 +107,7 @@ import type {
   WorktreeResolution,
   GitWorktreeRemoval,
   DbConversationSummary,
+  DelegatedChildSession,
   ImportResult,
   ImportSelectedResult,
   ScanResult,
@@ -2136,6 +2137,20 @@ export async function listChildConversations(
   parentConversationId: number
 ): Promise<DbConversationSummary[]> {
   return getTransport().call("list_child_conversations", {
+    parentConversationId,
+  })
+}
+
+/**
+ * `@Session` recall (§14.4): the delegated child sessions a parent
+ * conversation spawned, with their ledger-derived status projection. Returns
+ * an empty list for a parent with no children — the `@` panel then hides the
+ * group entirely.
+ */
+export async function listDelegatedChildSessions(
+  parentConversationId: number
+): Promise<DelegatedChildSession[]> {
+  return getTransport().call("list_delegated_child_sessions", {
     parentConversationId,
   })
 }

@@ -331,6 +331,59 @@ describe("SuggestionPopup", () => {
     expect(onSelect).not.toHaveBeenCalled()
   })
 
+  it("renders the delegated-children tab only when the group is present (§14.4)", async () => {
+    const delegatedSessionRef = {
+      refType: "session" as const,
+      id: "77",
+      label: "Hunt flaky test",
+      uri: "codeg://session/77",
+      meta: { agentType: "codex" as const, status: "running", branch: null },
+    }
+    const withChildren: ReferenceSearch = () => [
+      ...groups,
+      {
+        kind: "delegatedSession",
+        label: "Sub-agent sessions",
+        items: [
+          { reference: delegatedSessionRef, detail: "Round 3 · running" },
+        ],
+      },
+    ]
+    const { ref, onSelect } = mountPopup({
+      search: withChildren,
+      tabLabels: {
+        agent: "Agents",
+        file: "Files",
+        delegatedSession: "Sub-agent sessions",
+        session: "Sessions",
+        commit: "Commits",
+        skill: "Skills",
+      },
+    })
+    // Five tabs with the group present, sitting right above plain Sessions.
+    expect(await screen.findByRole("tab", { name: /Sub-agent sessions/ }))
+    expect(screen.getAllByRole("tab")).toHaveLength(5)
+    // Enter on the auto-targeted agent tab still inserts the agent reference.
+    await screen.findByText("Codex Helper")
+    act(() => ref.current?.onKeyDown(key("Enter")))
+    expect(onSelect).toHaveBeenCalledWith(agentRef, state.range)
+
+    // Pin the delegated tab and select its row: it inserts an ordinary
+    // session reference.
+    fireEvent.click(screen.getByRole("tab", { name: /Sub-agent sessions/ }))
+    const row = await screen.findByRole("option", { name: /Hunt flaky test/ })
+    expect(row).toBeInTheDocument()
+    act(() => ref.current?.onKeyDown(key("Enter")))
+    expect(onSelect).toHaveBeenLastCalledWith(delegatedSessionRef, state.range)
+  })
+
+  it("hides the delegated-children tab when the group is absent", async () => {
+    mountPopup({ search })
+    await screen.findByText("Codex Helper")
+    expect(screen.queryByRole("tab", { name: /Sub-agent sessions/ })).toBeNull()
+    expect(screen.getAllByRole("tab")).toHaveLength(4)
+  })
+
   it("wraps to the last tab with Shift+Tab", async () => {
     const { ref } = mountPopup()
     await screen.findByText("Codex Helper")

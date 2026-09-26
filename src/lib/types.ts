@@ -518,6 +518,40 @@ export interface DbConversationSummary {
   origin_cwd?: string | null
 }
 
+/** Wire-stable status projection of a delegated child session's LATEST round.
+ *  `interrupted` comes exclusively from boot-reconcile freezing a run the
+ *  process abandoned (see the backend @Session-recall projection). */
+export type DelegatedChildStatus =
+  | "running"
+  | "completed"
+  | "failed"
+  | "canceled"
+  | "interrupted"
+
+/** One `@Session`-recall row (design doc §14.4): a child session this parent
+ *  conversation spawned, projected from the delegation_task ledger. Mirrors
+ *  the Rust `DelegatedChildSession` in `delegation_task_service.rs`. */
+export interface DelegatedChildSession {
+  parent_conversation_id: number
+  child_conversation_id: number
+  agent_type: AgentType
+  title: string | null
+  git_branch: string | null
+  status: DelegatedChildStatus
+  /** A continuation can be admitted from the latest round right now
+   *  (terminal-or-interrupted AND released). Note an interrupted child is
+   *  continuable via recovery — bucket "needs recovery" off `status`, not this
+   *  flag. */
+  continuable: boolean
+  /** Rounds admitted against this child — every continuation round reserves
+   *  its own ledger row, so this is the per-child row count. */
+  rounds: number
+  /** The latest round's task text (the child's most recent prompt). */
+  latest_task: string
+  /** Max(child conversation updated_at, newest round updated_at), ISO string. */
+  last_activity_at: string
+}
+
 /** Payload for the global `conversation://changed` side-channel that keeps
  *  every client's sidebar list/status in sync across desktop + browsers.
  *  Mirrors the Rust `ConversationChange` enum (serde `tag = "kind"`). */

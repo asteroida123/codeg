@@ -16,34 +16,41 @@ import { isImeCompositionKey } from "@/lib/ime-composition"
 import { cn } from "@/lib/utils"
 
 import { ReferenceIcon } from "../badges/reference-badge"
-import type { ReferenceAttrs, ReferenceKind } from "../types"
+import type { ReferenceAttrs } from "../types"
 import type { MentionRenderState } from "./mention-suggestion"
 import { placeAnchoredPopup, readViewport } from "./popup-position"
 import type {
   ReferenceSearch,
   SuggestionGroup,
+  SuggestionGroupKind,
   SuggestionPopupHandle,
 } from "./types"
 
 const FETCH_DEBOUNCE_MS = 150
 
 // Tab order in the panel: agent first (per product decision), then the rest in
-// their usual order. This is a *display* order; the search provider keeps its
-// own (file-first) group order, which other code/tests depend on. `skill` is
-// intentionally absent — skills, commands and experts are inserted via the `/`
-// and `$` triggers, not the `@` panel.
-const TAB_ORDER: readonly ReferenceKind[] = [
+// their usual order — with one §14.4 addition: this conversation's sub-agent
+// sessions sit immediately ABOVE the plain global Sessions tab ("优先分组").
+// This is a *display* order; the search provider keeps its own (file-first)
+// group order, which other code/tests depend on. `skill` is intentionally
+// absent — skills, commands and experts are inserted via the `/` and `$`
+// triggers, not the `@` panel. `delegatedSession` renders as a tab ONLY when
+// the search returned that group (a parent with no children never shows it —
+// see `visibleTabs`).
+const TAB_ORDER: readonly SuggestionGroupKind[] = [
   "agent",
   "file",
+  "delegatedSession",
   "session",
   "commit",
 ]
 
 // English fallbacks for the tab labels; the host injects localized ones. `skill`
 // is kept for type completeness (`ReferenceKind`) though it is not a shown tab.
-const DEFAULT_TAB_LABELS: Record<ReferenceKind, string> = {
+const DEFAULT_TAB_LABELS: Record<SuggestionGroupKind, string> = {
   agent: "Agents",
   file: "Files",
+  delegatedSession: "Sub-agent sessions",
   session: "Sessions",
   commit: "Commits",
   skill: "Skills",
@@ -92,7 +99,7 @@ function isAnchorHidden(el: HTMLElement): boolean {
  * options are rendered). Only one panel is open at a time, so ids never collide.
  */
 export const MENTION_LISTBOX_ID = "mention-listbox"
-export const mentionOptionId = (kind: ReferenceKind, index: number) =>
+export const mentionOptionId = (kind: SuggestionGroupKind, index: number) =>
   `mention-option-${kind}-${index}`
 
 export interface SuggestionPopupProps {
@@ -116,7 +123,7 @@ export interface SuggestionPopupProps {
   /** Non-selectable hint shown under a tab whose matches were capped. */
   moreLabel?: string
   /** Localized per-kind tab labels (English fallbacks apply when omitted). */
-  tabLabels?: Record<ReferenceKind, string>
+  tabLabels?: Record<SuggestionGroupKind, string>
   /**
    * The composer box the panel lines up with. When given, the panel adopts that
    * box's width and left edge and opens above it — the same geometry as the
@@ -175,7 +182,7 @@ export const SuggestionPopup = forwardRef<
   // The tab the user explicitly chose (via Tab/click), or null to auto-follow
   // the first non-empty tab. Pinning survives subsequent keystrokes within this
   // open session; reopening the panel remounts and resets it to null.
-  const [pinnedTab, setPinnedTab] = useState<ReferenceKind | null>(null)
+  const [pinnedTab, setPinnedTab] = useState<SuggestionGroupKind | null>(null)
   const [pos, setPos] = useState<{
     left: number
     top: number
@@ -220,8 +227,20 @@ export const SuggestionPopup = forwardRef<
     () => new Map(result.groups.map((group) => [group.kind, group])),
     [result.groups]
   )
+  // The delegated-children group is only in the results when the conversation
+  // has children (§14.4), so its tab comes and goes with the data — every other
+  // tab always renders.
+  const visibleTabs = useMemo(
+    () =>
+      TAB_ORDER.filter(
+        (kind) => kind !== "delegatedSession" || groupByKind.has(kind)
+      ),
+    [groupByKind]
+  )
   // Auto-target the first non-empty tab (agent-first) until the user pins one,
   // so a file/session/… query never strands the user on an empty agent tab.
+  // With children present, "this conversation's sub-agents" outranks the plain
+  // global Sessions tab.
   const firstNonEmpty = useMemo(
     () =>
       TAB_ORDER.find(
@@ -417,12 +436,17 @@ export const SuggestionPopup = forwardRef<
             return true
           case "Tab": {
             // Tab / Shift+Tab move between tabs (pinning the choice); Enter still
-            // selects. Wraps around the five tabs.
+            // selects. Wraps around the VISIBLE tabs (the delegated-children tab
+            // may be absent for a childless conversation).
             const dir = event.shiftKey ? -1 : 1
-            const at = TAB_ORDER.indexOf(activeTab)
-            setPinnedTab(
-              TAB_ORDER[(at + dir + TAB_ORDER.length) % TAB_ORDER.length]
-            )
+            const at = visibleTabs.indexOf(activeTab)
+            const next =
+              at === -1
+                ? dir === 1
+                  ? 0
+                  : visibleTabs.length - 1
+                : (at + dir + visibleTabs.length) % visibleTabs.length
+            setPinnedTab(visibleTabs[next])
             setSelectedIndex(0)
             return true
           }
@@ -451,7 +475,15 @@ export const SuggestionPopup = forwardRef<
         }
       },
     }),
-    [flat, selectedIndex, activeTab, onSelect, onClose, state.range]
+    [
+      flat,
+      selectedIndex,
+      activeTab,
+      visibleTabs,
+      onSelect,
+      onClose,
+      state.range,
+    ]
   )
 
   const activeLabel = tabLabels[activeTab]
@@ -514,7 +546,7 @@ export const SuggestionPopup = forwardRef<
           aria-orientation="horizontal"
           className="flex shrink-0 gap-0.5 overflow-x-auto border-b border-border p-1"
         >
-          {TAB_ORDER.map((kind) => {
+          {visibleTabs.map((kind) => {
             const isActive = kind === activeTab
             const count = stale ? 0 : (groupByKind.get(kind)?.items.length ?? 0)
             return (

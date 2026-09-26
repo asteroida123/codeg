@@ -25,6 +25,9 @@ interface ChatInputProps {
   status: ConnectionStatus | null
   promptCapabilities: PromptCapabilitiesInfo
   defaultPath?: string
+  /** Pass-through: see `MessageInput.conversationId` (the `@` panel's
+   *  delegated-children group is scoped to this conversation). */
+  conversationId?: number | null
   agentName?: string
   onFocus?: () => void
   onSend: (draft: PromptDraft, modeId?: string | null) => void
@@ -104,6 +107,7 @@ export const ChatInput = memo(function ChatInput({
   status,
   promptCapabilities,
   defaultPath,
+  conversationId,
   agentName,
   onFocus,
   onSend,
@@ -205,6 +209,7 @@ export const ChatInput = memo(function ChatInput({
         promptCapabilities={promptCapabilities}
         onFocus={onFocus}
         defaultPath={defaultPath}
+        conversationId={conversationId}
         disabled={
           allowOfflineCompose
             ? false

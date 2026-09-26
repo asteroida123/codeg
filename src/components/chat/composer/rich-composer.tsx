@@ -44,9 +44,10 @@ import {
 import type {
   MentionUiLabels,
   ReferenceSearch,
+  SuggestionGroupKind,
   SuggestionPopupHandle,
 } from "./suggestion/types"
-import type { ReferenceAttrs, ReferenceKind } from "./types"
+import type { ReferenceAttrs } from "./types"
 
 /**
  * Imperative handle exposed to the parent (e.g. the message input that owns
@@ -151,7 +152,7 @@ export interface RichComposerProps {
    * Localized per-kind tab labels for the `@` panel (Agents/Files/Sessions/
    * Commits/Skills). English fallbacks apply when omitted. Render-only.
    */
-  tabLabels?: Record<ReferenceKind, string>
+  tabLabels?: Record<SuggestionGroupKind, string>
   /**
    * Box the `@` panel lines up with: it adopts this element's width and left
    * edge and opens above it. Point it at the composer's outer chrome so the

@@ -33,6 +33,25 @@ export function useComposerMentionLabels(): ComposerMentionLabels {
       session: t("mentionGroupSession"),
       commit: t("mentionGroupCommit"),
       skill: t("mentionGroupSkill"),
+      delegatedSession: t("mentionGroupDelegatedSession"),
+      delegationRound: (rounds) => t("mentionDelegationRound", { rounds }),
+      // Explicit switch rather than a template-literal key: the messages are
+      // strictly typed from en.json, and this keeps every status key
+      // compile-checked against it.
+      delegationStatus: (status) => {
+        switch (status) {
+          case "running":
+            return t("mentionDelegationStatus.running")
+          case "completed":
+            return t("mentionDelegationStatus.completed")
+          case "failed":
+            return t("mentionDelegationStatus.failed")
+          case "canceled":
+            return t("mentionDelegationStatus.canceled")
+          case "interrupted":
+            return t("mentionDelegationStatus.interrupted")
+        }
+      },
     }),
     [t]
   )

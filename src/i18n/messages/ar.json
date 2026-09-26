@@ -3157,7 +3157,16 @@
         "mentionGroupAgent": "الوكلاء",
         "mentionGroupSession": "الجلسات",
         "mentionGroupCommit": "عمليات الإيداع",
-        "mentionGroupSkill": "المهارات"
+        "mentionGroupSkill": "المهارات",
+        "mentionGroupDelegatedSession": "الوكلاء الفرعيون لهذه المحادثة",
+        "mentionDelegationRound": "الجولة {rounds}",
+        "mentionDelegationStatus": {
+          "running": "قيد التشغيل",
+          "completed": "مكتمل",
+          "failed": "فشل",
+          "canceled": "ملغى",
+          "interrupted": "يحتاج إلى استرداد"
+        }
       },
       "messageQueue": {
         "addToQueue": "إضافة للقائمة",

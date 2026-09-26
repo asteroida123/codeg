@@ -1,5 +1,14 @@
 import type { ReferenceAttrs, ReferenceKind } from "../types"
 
+/**
+ * The kinds of group the `@` panel can show. Extends the reference kinds with
+ * `delegatedSession` — a PANE-only grouping for "this conversation's
+ * sub-agents" (§14.4): its rows still insert ordinary `session` references
+ * (`codeg://session/<id>`), so `ReferenceKind` (the reference-node contract)
+ * stays closed while the panel gains a tab.
+ */
+export type SuggestionGroupKind = ReferenceKind | "delegatedSession"
+
 /** One selectable row: the reference to insert plus display hints. */
 export interface SuggestionItem {
   /** The reference inserted when this row is chosen. */
@@ -12,7 +21,7 @@ export interface SuggestionItem {
 
 /** A labeled group of suggestions, one per reference kind / data source. */
 export interface SuggestionGroup {
-  kind: ReferenceKind
+  kind: SuggestionGroupKind
   /** Display heading for the group. */
   label: string
   items: SuggestionItem[]

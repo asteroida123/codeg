@@ -3157,7 +3157,16 @@
         "mentionGroupAgent": "Agents",
         "mentionGroupSession": "Sessions",
         "mentionGroupCommit": "Commits",
-        "mentionGroupSkill": "Skills"
+        "mentionGroupSkill": "Skills",
+        "mentionGroupDelegatedSession": "Sub-agent sessions",
+        "mentionDelegationRound": "Round {rounds}",
+        "mentionDelegationStatus": {
+          "running": "Running",
+          "completed": "Completed",
+          "failed": "Failed",
+          "canceled": "Canceled",
+          "interrupted": "Needs recovery"
+        }
       },
       "messageQueue": {
         "addToQueue": "Queue message",
