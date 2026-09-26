@@ -9,6 +9,7 @@ import { followUpComposerTarget } from "@/lib/task-follow-up"
 import { useShortcutSettings } from "@/hooks/use-shortcut-settings"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { Button } from "@/components/ui/button"
+import { Checkbox } from "@/components/ui/checkbox"
 import {
   Dialog,
   DialogContent,
@@ -17,6 +18,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { Label } from "@/components/ui/label"
 import {
   TaskMessageComposer,
   type TaskMessageComposerHandle,
@@ -71,6 +73,10 @@ export function TaskRestartDialog({
   const submittingRef = useRef(false)
   /** Set when the resurrection guard refused — see `submit`'s catch. */
   const [duplicate, setDuplicate] = useState<DuplicateActiveSource | null>(null)
+  /** Retry only: explicitly start a new session instead of continuing the
+   *  recorded one (a strict continuation that cannot be restored stops the run
+   *  rather than silently cold-starting it). */
+  const [freshSession, setFreshSession] = useState(false)
 
   // A fresh box per open — a note belongs to one restart, not to the next.
   useEffect(() => {
@@ -78,6 +84,7 @@ export function TaskRestartDialog({
     setText("")
     setSubmitting(false)
     setDuplicate(null)
+    setFreshSession(false)
     submittingRef.current = false
   }, [open, task])
 
@@ -113,7 +120,13 @@ export function TaskRestartDialog({
     setSubmitting(true)
     try {
       if (kind === "retry") {
-        await workTaskRetry(task.id, note, blocks, allowDuplicateSource)
+        await workTaskRetry(
+          task.id,
+          note,
+          blocks,
+          allowDuplicateSource,
+          freshSession
+        )
       } else {
         await workTaskRequeue(task.id, note, blocks, allowDuplicateSource)
       }
@@ -182,29 +195,46 @@ export function TaskRestartDialog({
           </p>
         ) : null}
 
-        <DialogFooter>
-          <Button
-            type="button"
-            variant="ghost"
-            onClick={() => onOpenChange(false)}
-            disabled={submitting}
-          >
-            {t("cancel")}
-          </Button>
-          {/* Arrow-wrapped, never `onClick={submit}`: a bare handler hands the
+        <DialogFooter className="sm:justify-between">
+          {/* Continue-or-start-over, retry only: a requeue already starts from
+              the top (the canceled session link is dropped), so the choice
+              would be a lie there. */}
+          {isRetry ? (
+            <Label className="flex cursor-pointer items-center gap-1.5 text-xs font-normal text-muted-foreground">
+              <Checkbox
+                checked={freshSession}
+                onCheckedChange={(v) => setFreshSession(v === true)}
+                disabled={submitting}
+              />
+              {t("freshSessionLabel")}
+            </Label>
+          ) : (
+            <span />
+          )}
+          <span className="flex items-center gap-2">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => onOpenChange(false)}
+              disabled={submitting}
+            >
+              {t("cancel")}
+            </Button>
+            {/* Arrow-wrapped, never `onClick={submit}`: a bare handler hands the
               click event straight to `allowDuplicateSource`, and a MouseEvent
               is truthy — every restart would waive the guard. */}
-          <Button
-            type="button"
-            onClick={() => void submit(duplicate != null)}
-            disabled={submitting}
-          >
-            {duplicate
-              ? t("actionRestartAnyway")
-              : isRetry
-                ? t("actionRetry")
-                : t("actionRequeue")}
-          </Button>
+            <Button
+              type="button"
+              onClick={() => void submit(duplicate != null)}
+              disabled={submitting}
+            >
+              {duplicate
+                ? t("actionRestartAnyway")
+                : isRetry
+                  ? t("actionRetry")
+                  : t("actionRequeue")}
+            </Button>
+          </span>
         </DialogFooter>
       </DialogContent>
     </Dialog>

@@ -587,6 +587,7 @@ async fn delegation_performance_reports_ledger_rows_over_http() {
             task: "dashboard task".into(),
             requested_working_dir: None,
             resume_binding: binding,
+            work_task_id: None,
         },
     )
     .await
@@ -650,4 +651,173 @@ async fn delegation_performance_requires_a_token() {
         .json(&json!({}))
         .await;
     assert_eq!(resp.status_code(), 401);
+}
+
+// ── work-task run ledger + delegation attribution (phase 2, #731) ───────────
+
+/// The task detail's two ledger reads over HTTP: the run rows of a task and
+/// the delegations attributed to it. Both are scoped by `taskId` and return
+/// only that task's history.
+#[tokio::test]
+async fn work_task_runs_and_delegations_report_over_http() {
+    use codeg_lib::db::service::{
+        conversation_service, folder_service, work_task_run_service, work_task_service,
+    };
+    use codeg_lib::models::{AgentType, WorkTaskDraft};
+
+    let (server, _data, _static, conn) = build_test_server_with_db().await;
+
+    let folder = folder_service::add_folder(&conn, "/workspace/run-ledger")
+        .await
+        .expect("folder");
+    let conversation = conversation_service::create(
+        &conn,
+        folder.id,
+        AgentType::ClaudeCode,
+        None,
+        None,
+    )
+    .await
+    .expect("conversation");
+    let task = work_task_service::create(
+        &conn,
+        WorkTaskDraft {
+            folder_id: folder.id,
+            title: "ledger over http".to_string(),
+            config: json!({ "display_text": "ledger over http" }),
+        },
+    )
+    .await
+    .expect("task");
+    assert!(work_task_run_service::open(
+        &conn,
+        work_task_run_service::RunOpen {
+            task_id: task.id,
+            run_seq: 0,
+            kind: work_task_run_service::KIND_FRESH,
+            resume_outcome: Some(work_task_run_service::RESUME_FRESH_NO_SESSION),
+            resumed_from_run_seq: None,
+            agent_type: Some("claude_code"),
+            conversation_id: Some(conversation.id),
+            external_session_id: Some("session-http"),
+            working_dir: Some("/tmp/wt"),
+            effective_mode: Some("default"),
+            effective_model: Some("claude-sonnet"),
+            effective_reasoning_level: None,
+        },
+    )
+    .await
+    .expect("open run"));
+    assert!(work_task_run_service::close(
+        &conn,
+        task.id,
+        0,
+        work_task_run_service::STATUS_SETTLED,
+        None,
+        Some("success"),
+        None,
+    )
+    .await
+    .expect("close run"));
+
+    let resp = server
+        .post("/api/work_task_runs")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({ "taskId": task.id }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: Value = resp.json();
+    assert_eq!(body.as_array().map(Vec::len), Some(1), "got {body}");
+    assert_eq!(body[0]["run_seq"], 0);
+    assert_eq!(body[0]["kind"], "fresh");
+    assert_eq!(body[0]["status"], "settled");
+    assert_eq!(body[0]["resume_outcome"], "fresh_no_session");
+    assert_eq!(body[0]["external_session_id"], "session-http");
+    assert_eq!(body[0]["verdict"], "success");
+
+    // Another task's ledger is empty.
+    let resp = server
+        .post("/api/task_delegations")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({ "taskId": task.id }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: Value = resp.json();
+    assert_eq!(body.as_array().map(Vec::len), Some(0), "got {body}");
+}
+
+/// The delegation link is stored at admission and read back per task: the
+/// sub-agent runs a task's own agent spawned.
+#[tokio::test]
+async fn task_delegations_reports_the_attributed_ledger_rows() {
+    use codeg_lib::db::service::{conversation_service, delegation_task_service, folder_service};
+    use codeg_lib::models::AgentType;
+
+    let (server, _data, _static, conn) = build_test_server_with_db().await;
+
+    let folder = folder_service::add_folder(&conn, "/workspace/task-delegations")
+        .await
+        .expect("folder");
+    let parent = conversation_service::create(&conn, folder.id, AgentType::ClaudeCode, None, None)
+        .await
+        .expect("parent");
+    let child = conversation_service::create(&conn, folder.id, AgentType::Codex, None, None)
+        .await
+        .expect("child");
+    delegation_task_service::admit(
+        &conn,
+        delegation_task_service::AdmissionInput {
+            task_id: "linked".into(),
+            parent_conversation_id: parent.id,
+            child_conversation_id: child.id,
+            source_task_id: None,
+            task: "linked work".into(),
+            requested_working_dir: None,
+            resume_binding: delegation_task_service::ResumeBinding {
+                agent_type: AgentType::Codex,
+                external_session_id: "session-linked".into(),
+                child_conversation_id: child.id,
+                working_dir: "/workspace/task-delegations".into(),
+                preferred_mode_id: None,
+                preferred_config_values: Default::default(),
+                config_fingerprint: "fp".into(),
+            },
+            work_task_id: Some(77),
+        },
+    )
+    .await
+    .expect("admit");
+
+    let resp = server
+        .post("/api/task_delegations")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({ "taskId": 77 }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: Value = resp.json();
+    assert_eq!(body.as_array().map(Vec::len), Some(1), "got {body}");
+    assert_eq!(body[0]["task_id"], "linked");
+    assert_eq!(body[0]["task"], "linked work");
+    assert_eq!(body[0]["status"], "running");
+    assert_eq!(body[0]["child_conversation_id"], child.id);
+    assert_eq!(body[0]["agent_type"], "codex");
+
+    // An unattributed task sees nothing.
+    let resp = server
+        .post("/api/task_delegations")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({ "taskId": 78 }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: Value = resp.json();
+    assert_eq!(body.as_array().map(Vec::len), Some(0), "got {body}");
+}
+
+#[tokio::test]
+async fn work_task_ledger_reads_require_a_token() {
+    let (server, _data, _static, _conn) = build_test_server_with_db().await;
+    for route in ["/api/work_task_runs", "/api/task_delegations"] {
+        let resp = server.post(route).json(&json!({ "taskId": 1 })).await;
+        assert_eq!(resp.status_code(), 401, "{route}");
+    }
 }

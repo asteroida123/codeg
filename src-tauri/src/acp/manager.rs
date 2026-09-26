@@ -505,6 +505,39 @@ impl Default for ConnectionManager {
     }
 }
 
+/// What a strict continuation's connection must be to count as the one the
+/// spawn created.
+///
+/// A broker delegation carries its immutable `delegation_task_id`; a work-task
+/// run carries none, deliberately — that field routes turn completion to the
+/// broker and drives ledger release, and a task run has its own engine-owned
+/// settle path.
+#[derive(Debug, Clone, Copy)]
+enum StrictResumeIdentity<'a> {
+    Delegation(&'a str),
+    Plain,
+}
+
+impl<'a> StrictResumeIdentity<'a> {
+    /// The name the identity diagnostics report: the delegation task id, or a
+    /// fixed label for a task-run continuation.
+    fn label(self) -> &'a str {
+        match self {
+            Self::Delegation(task_id) => task_id,
+            Self::Plain => "work-task-run",
+        }
+    }
+
+    /// Whether `delegation_task_id` names the connection this strict resume
+    /// spawned.
+    fn matches(self, delegation_task_id: Option<&str>) -> bool {
+        match self {
+            Self::Delegation(task_id) => delegation_task_id == Some(task_id),
+            Self::Plain => delegation_task_id.is_none(),
+        }
+    }
+}
+
 impl ConnectionManager {
     pub fn new() -> Self {
         Self {
@@ -752,7 +785,7 @@ impl ConnectionManager {
             if let Err(error) = self
                 .wait_for_strict_resume_ready(
                     &conn_id,
-                    expected_task_id.as_str(),
+                    StrictResumeIdentity::Delegation(expected_task_id.as_str()),
                     agent_type,
                     expected_working_dir.as_ref(),
                     session_id,
@@ -776,6 +809,67 @@ impl ConnectionManager {
             return Err(error);
         }
 
+        Ok(conn_id)
+    }
+
+    /// Spawn a STRICT continuation that belongs to a work-task run rather than
+    /// to the delegation broker.
+    ///
+    /// Same recovery contract as [`Self::spawn_delegation_agent`] with
+    /// `SessionRecoveryPolicy::Strict` — the requested external session must
+    /// be restored and the returned identity verified, or the spawn fails —
+    /// but the connection carries NO `delegation_task_id`: that field routes
+    /// turn completion to the broker and drives ledger release, and a task run
+    /// must stay out of that path.
+    ///
+    /// The returned id is only handed back once the strict identity check
+    /// passed; on any failure the connection is torn down first, so no caller
+    /// can be left holding (or prompting) a connection the check rejected.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn spawn_agent_strict(
+        &self,
+        agent_type: AgentType,
+        working_dir: Option<String>,
+        session_id: String,
+        runtime_env: BTreeMap<String, String>,
+        owner_window_label: String,
+        emitter: EventEmitter,
+        preferred_mode_id: Option<String>,
+        preferred_config_values: BTreeMap<String, String>,
+    ) -> Result<String, AcpError> {
+        let expected_working_dir = working_dir.as_ref().map(PathBuf::from);
+        let expected_mode_id = preferred_mode_id.clone();
+        let expected_config_values = preferred_config_values.clone();
+        let conn_id = self
+            .spawn_agent_with_policy(
+                agent_type,
+                working_dir,
+                Some(session_id.clone()),
+                runtime_env,
+                owner_window_label,
+                emitter,
+                preferred_mode_id,
+                preferred_config_values,
+                SessionRecoveryPolicy::Strict,
+                None,
+            )
+            .await?;
+
+        if let Err(error) = self
+            .wait_for_strict_resume_ready(
+                &conn_id,
+                StrictResumeIdentity::Plain,
+                agent_type,
+                expected_working_dir.as_ref(),
+                &session_id,
+                expected_mode_id.as_deref(),
+                &expected_config_values,
+            )
+            .await
+        {
+            let _ = self.disconnect(&conn_id).await;
+            return Err(error);
+        }
         Ok(conn_id)
     }
 
@@ -2848,17 +2942,23 @@ impl ConnectionManager {
 
     /// Wait until recovery has applied its selector preferences, then verify
     /// the immutable session identity before a continuation prompt is sent.
+    ///
+    /// `identity` names what the connection must look like: a broker-owned
+    /// continuation carries its immutable delegation task id, a work-task run
+    /// carries none. Everything else (agent type, working dir, the returned
+    /// external session id) is checked identically for both.
     #[allow(clippy::too_many_arguments)]
     async fn wait_for_strict_resume_ready(
         &self,
         conn_id: &str,
-        task_id: &str,
+        identity: StrictResumeIdentity<'_>,
         agent_type: AgentType,
         working_dir: Option<&PathBuf>,
         session_id: &str,
         mode_id: Option<&str>,
         config_values: &BTreeMap<String, String>,
     ) -> Result<(), AcpError> {
+        let label = identity.label();
         let started = std::time::Instant::now();
         loop {
             let (ready, status, actual_session, actual_mode, options) = {
@@ -2867,7 +2967,7 @@ impl ConnectionManager {
                     .get(conn_id)
                     .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
                 if conn.agent_type != agent_type
-                    || conn.delegation_task_id.as_deref() != Some(task_id)
+                    || !identity.matches(conn.delegation_task_id.as_deref())
                 {
                     return Err(AcpError::protocol(
                         "strict resume execution identity changed during startup",
@@ -2904,7 +3004,7 @@ impl ConnectionManager {
                 }
                 if mode_id.is_some_and(|expected| actual_mode.as_deref() != Some(expected)) {
                     tracing::warn!(
-                        task_id,
+                        label,
                         expected_mode = ?mode_id,
                         actual_mode = ?actual_mode.as_deref(),
                         "[delegation] continuation resumed with a different mode"
@@ -2914,7 +3014,7 @@ impl ConnectionManager {
                 for (id, expected) in config_values {
                     let Some(option) = options.iter().find(|option| option.id == *id) else {
                         tracing::warn!(
-                            task_id,
+                            label,
                             config_id = id,
                             "[delegation] continuation did not expose a preferred config option"
                         );
@@ -2928,7 +3028,7 @@ impl ConnectionManager {
                     };
                     if !matches {
                         tracing::warn!(
-                            task_id,
+                            label,
                             config_id = id,
                             "[delegation] continuation resumed with a different config value"
                         );
@@ -4585,6 +4685,26 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                 (binding, Some(effective))
             }
         };
+        // Attribution: the live work task whose CURRENT conversation is the
+        // delegating parent. Resolved here, once, and stored on the ledger row
+        // — a later fresh-session rework repoints `work_task.conversation_id`,
+        // and this row must keep the task it actually ran for. Best-effort: an
+        // attribution read that fails must not fail the delegation itself.
+        let work_task_id = match crate::db::service::work_task_service::find_live_by_conversation(
+            &self.db.conn,
+            link.parent_conversation_id,
+        )
+        .await
+        {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::warn!(
+                    parent_conversation_id = link.parent_conversation_id,
+                    "[delegation] work-task attribution lookup failed: {error}"
+                );
+                None
+            }
+        };
         let input = crate::db::service::delegation_task_service::AdmissionInput {
             task_id: link.delegation_call_id.clone(),
             parent_conversation_id: link.parent_conversation_id,
@@ -4593,6 +4713,7 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
             task: admission.task,
             requested_working_dir: admission.requested_working_dir,
             resume_binding,
+            work_task_id,
         };
         let admission_result = if input.source_task_id.is_some() {
             crate::db::service::delegation_task_service::admit_continuation(&self.db.conn, input)
@@ -5282,6 +5403,59 @@ mod tests {
         assert!(mgr.connections.lock().await.contains_key("human"));
     }
 
+    /// A work-task-run strict continuation must find a connection with NO
+    /// delegation task id: that field routes turn completion to the broker and
+    /// drives ledger release, and a task run has its own settle path. A
+    /// connection carrying one is therefore a different execution, even with
+    /// the right session and directory.
+    #[tokio::test]
+    async fn strict_resume_for_a_task_run_requires_a_plain_connection() {
+        let mgr = ConnectionManager::new();
+        let plain = fake_connection("plain", None);
+        {
+            let mut state = plain.state.write().await;
+            state.working_dir = Some(PathBuf::from("/workspace/project"));
+            state.external_id = Some("session-plain".into());
+            state.selectors_ready = true;
+        }
+        mgr.connections.lock().await.insert("plain".into(), plain);
+        mgr.wait_for_strict_resume_ready(
+            "plain",
+            StrictResumeIdentity::Plain,
+            AgentType::ClaudeCode,
+            Some(&PathBuf::from("/workspace/project")),
+            "session-plain",
+            None,
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("a plain connection is what a task run spawns");
+
+        // The same connection, now broker-owned: no longer this launch's run.
+        let mut broker = fake_connection("broker", Some(7));
+        broker.delegation_task_id = Some("task-1".into());
+        {
+            let mut state = broker.state.write().await;
+            state.working_dir = Some(PathBuf::from("/workspace/project"));
+            state.external_id = Some("session-plain".into());
+            state.selectors_ready = true;
+        }
+        mgr.connections.lock().await.insert("broker".into(), broker);
+        let error = mgr
+            .wait_for_strict_resume_ready(
+                "broker",
+                StrictResumeIdentity::Plain,
+                AgentType::ClaudeCode,
+                Some(&PathBuf::from("/workspace/project")),
+                "session-plain",
+                None,
+                &BTreeMap::new(),
+            )
+            .await
+            .expect_err("a broker-owned connection is not a task run");
+        assert!(matches!(error, AcpError::Protocol(_)));
+    }
+
     #[tokio::test]
     async fn strict_resume_allows_mode_and_config_drift_after_identity_matches() {
         let mgr = ConnectionManager::new();
@@ -5302,7 +5476,7 @@ mod tests {
 
         mgr.wait_for_strict_resume_ready(
             "continued",
-            "task-2",
+            StrictResumeIdentity::Delegation("task-2"),
             AgentType::ClaudeCode,
             Some(&PathBuf::from("/workspace/project")),
             "session-2",

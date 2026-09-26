@@ -43,7 +43,7 @@ use crate::commands::folders::{
 use crate::db::entities::conversation::{self, ConversationStatus};
 use crate::db::entities::work_task::WorkTaskStatus;
 use crate::db::entities::{folder, folder_command};
-use crate::db::service::{conversation_service, tab_service, work_task_service};
+use crate::db::service::{conversation_service, tab_service, work_task_run_service, work_task_service};
 use crate::db::AppDatabase;
 use crate::forge::deliver::{
     adopt_pull_request, pull_request_body, writeback_comment_body, DeliveryCtx, ForgeDeliveryApi,
@@ -446,6 +446,16 @@ pub async fn run_task_engine(engine: Arc<TaskEngine>) {
         Ok(_) => {}
         Err(e) => tracing::warn!("[work_task] boot reconcile error: {e}"),
     }
+    // Every task that sweep failed lost its run ledger row's owner with the
+    // process: close the orphaned `running` generations as interrupted, so the
+    // rounds list never shows a run that the restart actually ended. Rows of
+    // tasks still active (a `merging` task recovering from git truth below)
+    // are left to their own settle path.
+    match work_task_run_service::close_orphan_running(&engine.db.conn).await {
+        Ok(n) if n > 0 => tracing::info!("[work_task] boot closed {n} interrupted run(s)"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("[work_task] boot run-ledger reconcile error: {e}"),
+    }
     match work_task_service::list_by_status(&engine.db.conn, &[WorkTaskStatus::Merging]).await {
         Ok(rows) => {
             for row in rows {
@@ -564,13 +574,17 @@ enum LaunchMode {
     /// First run: the task's own prompt blocks.
     Fresh,
     /// Retry after failure: resume the session if possible and ask to continue.
-    Retry,
+    /// `fresh_session` is the user's explicit "start over in a new session" —
+    /// it skips the continuation anchor entirely.
+    Retry { fresh_session: bool },
     /// A follow-up on a reviewed task: the user's text, framed by their intent,
     /// plus whatever the composer attached out of band (images, pasted bytes).
+    /// `fresh_session` as on [`LaunchMode::Retry`].
     Return {
         intent: FollowUpIntent,
         feedback: String,
         attachments: Vec<serde_json::Value>,
+        fresh_session: bool,
     },
     /// Merge generation: the agent lands the task onto the base branch itself
     /// (sync base into the worktree, resolve conflicts, merge into base). The
@@ -618,10 +632,36 @@ impl LaunchMode {
     fn round_kind(&self) -> &'static str {
         match self {
             LaunchMode::Fresh => "work",
-            LaunchMode::Retry => "retry",
+            LaunchMode::Retry { .. } => "retry",
             LaunchMode::Return { .. } => "return",
             LaunchMode::Merge { .. } => "merge",
         }
+    }
+
+    /// `work_task_run.kind` for this generation.
+    fn run_kind(&self) -> &'static str {
+        match self {
+            LaunchMode::Fresh => work_task_run_service::KIND_FRESH,
+            LaunchMode::Retry { .. } => work_task_run_service::KIND_RETRY,
+            LaunchMode::Return { .. } => work_task_run_service::KIND_RETURN,
+            LaunchMode::Merge { .. } => work_task_run_service::KIND_MERGE,
+        }
+    }
+
+    /// Whether the user explicitly asked for a NEW session on this rework.
+    /// True only for the two continuation-capable modes; a merge never asks.
+    fn fresh_session(&self) -> bool {
+        match self {
+            LaunchMode::Retry { fresh_session } | LaunchMode::Return { fresh_session, .. } => {
+                *fresh_session
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether this mode may continue a previous session at all.
+    fn may_continue(&self) -> bool {
+        !matches!(self, LaunchMode::Fresh)
     }
 
     /// The follow-up intent this launch carries, for the `round` marker.
@@ -644,6 +684,35 @@ impl LaunchMode {
         )
     }
 }
+
+/// Everything a launch resolved before the generation's prompt is composed,
+/// bundled so the body that owns the run ledger has exactly one exit — and
+/// therefore one place that closes the row.
+struct LaunchContext {
+    task: crate::db::entities::work_task::Model,
+    run_seq: i32,
+    mode: LaunchMode,
+    root: crate::models::FolderDetail,
+    settings: WorkTaskFolderSettings,
+    cfg: WorkTaskConfig,
+    agent_type: AgentType,
+    mode_id: Option<String>,
+    config_values: std::collections::BTreeMap<String, String>,
+    /// The continuation anchor this launch resumes, when it has one. `None`
+    /// means a fresh session — no session ever existed, the user asked for a
+    /// new one, or a merge had nothing to resume.
+    anchor: Option<work_task_run_service::ResumeAnchor>,
+}
+
+/// How the part of a launch that owns a run row ended.
+enum GenerationExit {
+    /// The prompt went out. The row stays `running` until the turn settles it.
+    Live,
+    /// The launch unwound before any prompt — a cancel, or a lost CAS that
+    /// handed the generation to newer work. Nothing ran.
+    Canceled,
+}
+
 
 impl TaskEngine {
     // ── user entry points ───────────────────────────────────────────────────
@@ -721,28 +790,36 @@ impl TaskEngine {
     /// reused by the launch), then pump. An optional note rides the claim's own
     /// transaction and reaches the retry prompt — a failure usually has a cause
     /// the user knows and the agent doesn't.
+    ///
+    /// `fresh_session` is the explicit "run with a new session" escape hatch:
+    /// the launch skips the continuation anchor instead of refusing (or
+    /// silently cold-starting) a rework whose session cannot be restored.
     pub async fn retry(
         self: &Arc<Self>,
         task_id: i32,
         note: Option<String>,
         attachments: Vec<serde_json::Value>,
         allow_duplicate_source: bool,
+        fresh_session: bool,
     ) -> Result<(), String> {
         let task = work_task_service::get_model(&self.db.conn, task_id)
             .await
             .map_err(|e| e.to_string())?;
         self.preflight_folder(task.folder_id).await?;
         let note = note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
-        // An attachment is an instruction on its own: a screenshot with no
-        // sentence still has to reach the retry prompt, so the action is
-        // recorded whenever EITHER part is present.
-        let action = (note.is_some() || !attachments.is_empty()).then(|| {
-            serde_json::json!({
-                "action": "retry",
-                "note": note.unwrap_or_default(),
-                "blocks": attachments,
-            })
-        });
+        // Recorded on EVERY retry, note or not: the action is how the
+        // pump-driven launch learns the `fresh_session` decision
+        // (`launch_mode_for` reads it back out of this log), and leaving one
+        // out would let a later plain retry inherit an older action's
+        // decision. An action with no note and no attachment is a decision,
+        // not an instruction — `instruction_scan` records its flag without
+        // taking the replay slot from anything older.
+        let action = Some(serde_json::json!({
+            "action": "retry",
+            "note": note.unwrap_or_default(),
+            "blocks": attachments,
+            "fresh_session": fresh_session,
+        }));
         match work_task_service::claim_for_run_with_action(
             &self.db.conn,
             task_id,
@@ -775,6 +852,7 @@ impl TaskEngine {
         intent: FollowUpIntent,
         feedback: String,
         attachments: Vec<serde_json::Value>,
+        fresh_session: bool,
     ) -> Result<(), String> {
         let task = work_task_service::get_model(&self.db.conn, task_id)
             .await
@@ -806,6 +884,7 @@ impl TaskEngine {
                 intent,
                 feedback,
                 attachments,
+                fresh_session,
             },
         );
         Ok(())
@@ -841,6 +920,21 @@ impl TaskEngine {
         if let Ok(task) = work_task_service::get_model(&self.db.conn, task_id).await {
             self.kill_setup_child(task_id, task.run_seq).await;
             self.abort_compaction(task_id, task.run_seq).await;
+            // Close the canceled generation's run row here rather than waiting
+            // for a `TurnComplete` a teardown may never deliver: the user's
+            // stop IS this generation's outcome. A launch still unwinding
+            // closes its own row as canceled too — the close is a
+            // first-writer-wins CAS, so whoever gets there first is the record.
+            let _ = work_task_run_service::close(
+                &self.db.conn,
+                task_id,
+                task.run_seq,
+                work_task_run_service::STATUS_CANCELED,
+                None,
+                None,
+                None,
+            )
+            .await;
         }
 
         // Serialize the teardown with a possibly in-flight launch: the launch
@@ -991,7 +1085,8 @@ impl TaskEngine {
             // Claimed synchronously: this loop iterates immediately, and the
             // task must already read as in-flight when it does.
             let token = self.claim_launch_slot(next.id, folder_id).await;
-            self.spawn_launch_owned(next.id, folder_id, launch_mode_for(&next), Some(token));
+            let mode = launch_mode_for(&self.db.conn, &next).await;
+            self.spawn_launch_owned(next.id, folder_id, mode, Some(token));
         }
     }
 
@@ -1089,6 +1184,11 @@ impl TaskEngine {
     /// waiting. Everything after it (the pre-prompt compaction turn, the
     /// prompt itself) belongs to the run, not to the click that asked for it.
     /// See [`DispatchSignal`]; `None` for the launches nobody awaits.
+    ///
+    /// The run ledger brackets the whole call: the generation's row is opened
+    /// once this launch owns it and closed on every exit — including the
+    /// unwinds that never reach a prompt. The prompt itself lives in
+    /// [`Self::launch_prompt`] so that "every exit" is one `match`.
     async fn launch(
         self: &Arc<Self>,
         task_id: i32,
@@ -1153,10 +1253,154 @@ impl TaskEngine {
             self.emit_upsert(task_id);
         }
 
+        // ── continuation anchor ─────────────────────────────────────────────
+        // A Retry/Return CONTINUES the session it is reworking: the anchor is
+        // the most recent run whose recorded session its conversation still
+        // carries, and the launch below refuses to start without it. A merge
+        // generation is mechanical — its prompt is self-contained — and keeps
+        // the best-effort fallback. `fresh_session` is the user's explicit
+        // "start over in a new session" and skips the anchor entirely.
+        //
+        // The task engine inherits mode/model/config LIVE by design (the
+        // `config_effective` event records what was applied), so the strict
+        // contract covers the SESSION identity — agent type, external session
+        // id, working directory — never a frozen selector snapshot.
+        let anchor = if mode.may_continue() && !mode.fresh_session() {
+            work_task_run_service::resolve_resume_anchor(
+                &self.db.conn,
+                task_id,
+                task.conversation_id,
+            )
+            .await
+            .map_err(|e| e.to_string())?
+        } else {
+            None
+        };
+        let resume_outcome = if anchor.is_some() {
+            work_task_run_service::RESUME_RESUMED
+        } else if mode.fresh_session() {
+            work_task_run_service::RESUME_FRESH_REQUESTED
+        } else {
+            work_task_run_service::RESUME_FRESH_NO_SESSION
+        };
+
+        // One row per generation. Best-effort: the ledger records the state
+        // machine, it never gates it, so a failed write must not cost the run —
+        // but it is attempted before any side effect so a crash mid-setup still
+        // leaves the generation visible.
+        let config = &config_values;
+        let agent_wire = agent_type.as_wire().to_string();
+        if let Err(e) = work_task_run_service::open(
+            &self.db.conn,
+            work_task_run_service::RunOpen {
+                task_id,
+                run_seq,
+                kind: mode.run_kind(),
+                resume_outcome: Some(resume_outcome),
+                resumed_from_run_seq: anchor.as_ref().and_then(|a| a.resumed_from_run_seq),
+                agent_type: Some(agent_wire.as_str()),
+                // The conversation this run intends to bind: the anchor's when
+                // continuing, the task's current one for a merge, NULL for a
+                // fresh session (`bind_session` fills it once it exists).
+                conversation_id: anchor
+                    .as_ref()
+                    .map(|a| a.conversation_id)
+                    .or(task.conversation_id),
+                external_session_id: anchor.as_ref().map(|a| a.external_session_id.as_str()),
+                working_dir: None,
+                effective_mode: mode_id.as_deref(),
+                effective_model: config.get("model").map(String::as_str),
+                effective_reasoning_level: config
+                    .get(crate::acp::capability_catalog::REASONING_EFFORT_CONFIG_OPTION_ID)
+                    .map(String::as_str),
+            },
+        )
+        .await
+        {
+            tracing::warn!("[work_task] task {task_id}: run ledger open failed: {e}");
+        }
+
+        let exit = self
+            .launch_prompt(
+                LaunchContext {
+                    task,
+                    run_seq,
+                    mode,
+                    root,
+                    settings,
+                    cfg,
+                    agent_type,
+                    mode_id,
+                    config_values,
+                    anchor,
+                },
+                dispatched,
+            )
+            .await;
+
+        // Every exit above closes the row. A live generation stays `running`
+        // until its turn settles it (`on_turn_complete`, or the merge settle);
+        // a canceled unwind and an error are terminal right here. `close` is a
+        // first-writer-wins CAS, so a strict refusal that already closed its
+        // row with `resume_failed` is NOT overwritten by the generic code
+        // below.
+        match &exit {
+            Ok(GenerationExit::Live) => {}
+            Ok(GenerationExit::Canceled) => {
+                let _ = work_task_run_service::close(
+                    &self.db.conn,
+                    task_id,
+                    run_seq,
+                    work_task_run_service::STATUS_CANCELED,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            }
+            Err(_) => {
+                let _ = work_task_run_service::close(
+                    &self.db.conn,
+                    task_id,
+                    run_seq,
+                    work_task_run_service::STATUS_FAILED,
+                    Some(work_task_run_service::ERROR_SETUP_ERROR),
+                    None,
+                    None,
+                )
+                .await;
+            }
+        }
+        exit.map(|_| ())
+    }
+
+    /// Everything the generation actually does, from worktree setup to the
+    /// prompt. Returns [`GenerationExit`] on the two ways a launch can end
+    /// without an error, `Err` when it unwound — the caller closes the ledger
+    /// row for all three.
+    async fn launch_prompt(
+        self: &Arc<Self>,
+        ctx: LaunchContext,
+        dispatched: Option<&DispatchSignal>,
+    ) -> Result<GenerationExit, String> {
+        let LaunchContext {
+            task,
+            run_seq,
+            mode,
+            root,
+            settings,
+            cfg,
+            agent_type,
+            mode_id,
+            config_values,
+            anchor,
+        } = ctx;
+        let task_id = task.id;
+
         // Cancel gate before the expensive part of setup, so a cancel that
         // landed while we were reading config never reaches `git worktree add`.
         if !still_expected(&self.db.conn, task_id, run_seq, mode.in_flight_status()).await {
-            return Ok(());
+            return Ok(GenerationExit::Canceled);
         }
 
         // Worktree: reuse the recorded one when it still exists (retry/return),
@@ -1189,6 +1433,7 @@ impl TaskEngine {
             wt
         };
 
+        let agent_str = agent_type.as_wire().to_string();
         let _ = work_task_service::record_event(
             &self.db.conn,
             task_id,
@@ -1208,86 +1453,189 @@ impl TaskEngine {
             emit_folder_upsert(&self.emitter, detail);
         }
 
-        // Resume the previous session for retry/return/merge when we have one.
-        let resume_session_id = match mode {
-            LaunchMode::Fresh => None,
-            LaunchMode::Retry | LaunchMode::Return { .. } | LaunchMode::Merge { .. } => {
-                match task.conversation_id {
-                    Some(conv_id) => conversation::Entity::find_by_id(conv_id)
-                        .one(&self.db.conn)
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|c| c.external_id),
-                    None => None,
-                }
-            }
-        };
-
-        let runtime_env =
-            build_session_runtime_env(&self.db, agent_type, resume_session_id.as_deref(), &self.data_dir)
-                .await
-                .map_err(|e| e.to_string())?;
+        let resume_session_id = anchor.as_ref().map(|a| a.external_session_id.as_str());
+        let runtime_env = build_session_runtime_env(
+            &self.db,
+            agent_type,
+            resume_session_id,
+            &self.data_dir,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         verify_agent_installed(agent_type)
             .await
             .map_err(|e| e.to_string())?;
 
         // Cancel gate before spawning the CLI.
         if !still_expected(&self.db.conn, task_id, run_seq, mode.in_flight_status()).await {
-            return Ok(());
+            return Ok(GenerationExit::Canceled);
         }
 
-        let mut resumed = resume_session_id.is_some();
-        let conn_id = match self
-            .manager
-            .spawn_agent(
-                agent_type,
-                Some(wt.path.clone()),
-                resume_session_id.clone(),
-                runtime_env.clone(),
-                "work_task".to_string(),
-                self.emitter.clone(),
-                mode_id.clone(),
-                config_values.clone(),
-            )
-            .await
-        {
-            Ok(id) => id,
-            Err(e) if resumed => {
-                // Resume failed (e.g. the agent lost the session) → fall back
-                // to a fresh session in the same worktree, recorded on the
-                // timeline.
-                tracing::info!("[work_task] resume failed for task {task_id}: {e}; falling back");
-                let _ = work_task_service::record_event(
-                    &self.db.conn,
-                    task_id,
-                    "resume_fallback",
-                    "engine",
-                    Some(serde_json::json!({ "error": e.to_string() })),
-                )
-                .await;
-                resumed = false;
-                self.manager
+        let mut resumed = anchor.is_some();
+        let conn_id = match anchor.as_ref() {
+            // A merge generation keeps the best-effort contract: its prompt is
+            // mechanical and self-contained, so a refused resume falls back to
+            // a cold session (recorded as `fallback_cold`) instead of failing
+            // the merge.
+            Some(anchor) if matches!(mode, LaunchMode::Merge { .. }) => {
+                match self
+                    .manager
                     .spawn_agent(
                         agent_type,
                         Some(wt.path.clone()),
-                        None,
-                        runtime_env,
+                        Some(anchor.external_session_id.clone()),
+                        runtime_env.clone(),
                         "work_task".to_string(),
                         self.emitter.clone(),
                         mode_id.clone(),
                         config_values.clone(),
                     )
                     .await
-                    .map_err(|e| e.to_string())?
+                {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::info!(
+                            "[work_task] resume failed for task {task_id}: {e}; falling back"
+                        );
+                        let _ = work_task_service::record_event(
+                            &self.db.conn,
+                            task_id,
+                            "resume_fallback",
+                            "engine",
+                            Some(serde_json::json!({ "error": e.to_string() })),
+                        )
+                        .await;
+                        let _ = work_task_run_service::set_resume_outcome(
+                            &self.db.conn,
+                            task_id,
+                            run_seq,
+                            work_task_run_service::RESUME_FALLBACK_COLD,
+                        )
+                        .await;
+                        resumed = false;
+                        self.manager
+                            .spawn_agent(
+                                agent_type,
+                                Some(wt.path.clone()),
+                                None,
+                                runtime_env,
+                                "work_task".to_string(),
+                                self.emitter.clone(),
+                                mode_id.clone(),
+                                config_values.clone(),
+                            )
+                            .await
+                            .map_err(|e| e.to_string())?
+                    }
+                }
             }
-            Err(e) => return Err(e.to_string()),
+            // STRICT continuation — the "no cold re-dispatch" contract. Any
+            // refusal fails this generation here: no conversation row is
+            // created and no cold session is spawned, so there is no path from
+            // this arm that re-runs the work without its session.
+            Some(anchor) => {
+                match self
+                    .manager
+                    .spawn_agent_strict(
+                        agent_type,
+                        Some(wt.path.clone()),
+                        anchor.external_session_id.clone(),
+                        runtime_env.clone(),
+                        "work_task".to_string(),
+                        self.emitter.clone(),
+                        mode_id.clone(),
+                        config_values.clone(),
+                    )
+                    .await
+                {
+                    Ok(id) => id,
+                    Err(e) => {
+                        let error = e.to_string();
+                        tracing::warn!(
+                            "[work_task] strict resume refused for task {task_id}: {error}"
+                        );
+                        let _ = work_task_service::record_event(
+                            &self.db.conn,
+                            task_id,
+                            "resume_failed",
+                            "engine",
+                            Some(serde_json::json!({
+                                "run_seq": run_seq,
+                                "resumed_from_run_seq": anchor.resumed_from_run_seq,
+                                "session": anchor.external_session_id,
+                                "error": error,
+                            })),
+                        )
+                        .await;
+                        let _ = work_task_run_service::close(
+                            &self.db.conn,
+                            task_id,
+                            run_seq,
+                            work_task_run_service::STATUS_FAILED,
+                            Some(work_task_run_service::ERROR_RESUME_FAILED),
+                            None,
+                            Some(work_task_run_service::RESUME_STRICT_FAILED),
+                        )
+                        .await;
+                        // The card has to read `resume_failed` for the UI to
+                        // offer the explicit "run with a new session" action.
+                        // `preparing` is the status this launch owns at spawn
+                        // time; `running`/`awaiting_input` keep the same
+                        // contract every other engine failure follows.
+                        let failed = work_task_service::fail(
+                            &self.db.conn,
+                            task_id,
+                            &[
+                                WorkTaskStatus::Queued,
+                                WorkTaskStatus::Preparing,
+                                WorkTaskStatus::Running,
+                                WorkTaskStatus::AwaitingInput,
+                            ],
+                            Some(run_seq),
+                            "resume_failed",
+                            Some(error.clone()),
+                        )
+                        .await
+                        .unwrap_or(false);
+                        if failed {
+                            self.emit_upsert(task_id);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            // Fresh session: no session ever existed, the user asked for a new
+            // one, or a merge had nothing to resume.
+            None => self
+                .manager
+                .spawn_agent(
+                    agent_type,
+                    Some(wt.path.clone()),
+                    None,
+                    runtime_env,
+                    "work_task".to_string(),
+                    self.emitter.clone(),
+                    mode_id.clone(),
+                    config_values.clone(),
+                )
+                .await
+                .map_err(|e| e.to_string())?,
         };
 
         // Conversation row: reuse when resuming the same session; otherwise a
-        // fresh row (fresh runs and resume fallbacks).
+        // fresh row (fresh runs and merge fallbacks).
         let conversation_id = if resumed {
-            task.conversation_id.expect("resumed implies conversation")
+            match anchor
+                .as_ref()
+                .map(|a| a.conversation_id)
+                .or(task.conversation_id)
+            {
+                Some(id) => id,
+                None => {
+                    let _ = self.manager.disconnect(&conn_id).await;
+                    return Err("resumed session has no conversation to bind".to_string());
+                }
+            }
         } else {
             let title = conversation_title_for_task(&task.title);
             let id = match create_conversation_core(
@@ -1321,6 +1669,19 @@ impl TaskEngine {
             }
             id
         };
+        // The run's session identity is now final on both halves: the worktree
+        // it executes in and the conversation it bound.
+        if let Err(e) = work_task_run_service::bind_session(
+            &self.db.conn,
+            task_id,
+            run_seq,
+            conversation_id,
+            &wt.path,
+        )
+        .await
+        {
+            tracing::warn!("[work_task] task {task_id}: run ledger session bind failed: {e}");
+        }
         emit_conversation_upsert(&self.emitter, &self.db.conn, conversation_id).await;
 
         // Publish the run's live coordinates NOW, while the status stays what
@@ -1362,7 +1723,7 @@ impl TaskEngine {
                 Ok(true) => self.emit_upsert(task_id),
                 Ok(false) => {
                     let _ = self.manager.disconnect(&conn_id).await;
-                    return Ok(());
+                    return Ok(GenerationExit::Canceled);
                 }
                 Err(e) => {
                     let _ = self.manager.disconnect(&conn_id).await;
@@ -1483,7 +1844,7 @@ impl TaskEngine {
             if !resumed {
                 self.cancel_conversation(conversation_id).await;
             }
-            return Ok(());
+            return Ok(GenerationExit::Canceled);
         }
         self.emit_upsert(task_id);
 
@@ -1517,7 +1878,7 @@ impl TaskEngine {
                     })),
                 )
                 .await;
-                Ok(())
+                Ok(GenerationExit::Live)
             }
             Err(e) => {
                 self.forget_connection(&conn_id).await;
@@ -2937,6 +3298,10 @@ impl TaskEngine {
             return;
         }
 
+        let verdict = task
+            .as_ref()
+            .filter(|t| t.run_seq == run_seq)
+            .and_then(|t| t.verdict.clone());
         let changed = match stop_reason {
             "end_turn" => {
                 // A `task_complete` report from this generation decides the
@@ -2945,10 +3310,6 @@ impl TaskEngine {
                 // claim, so a present verdict is always this generation's — and
                 // its summary (written with it) outranks the captured
                 // last-assistant text.
-                let verdict = task
-                    .as_ref()
-                    .filter(|t| t.run_seq == run_seq)
-                    .and_then(|t| t.verdict.clone());
                 if verdict.as_deref() == Some("blocked") {
                     let error = task
                         .as_ref()
@@ -3005,6 +3366,32 @@ impl TaskEngine {
             .await
             .unwrap_or(false),
         };
+        // The generation's own outcome, recorded whatever the task-level CAS
+        // decided: a late event for a generation the task has already moved
+        // past still describes how THAT generation ended (and if a cancel
+        // already closed its row, this close is a no-op).
+        let (run_status, error_code) = match stop_reason {
+            "end_turn" if verdict.as_deref() == Some("blocked") => (
+                work_task_run_service::STATUS_FAILED,
+                Some(work_task_run_service::ERROR_VERDICT_BLOCKED),
+            ),
+            "end_turn" => (work_task_run_service::STATUS_SETTLED, None),
+            "cancelled" => (work_task_run_service::STATUS_CANCELED, None),
+            _ => (
+                work_task_run_service::STATUS_FAILED,
+                Some(work_task_run_service::ERROR_AGENT_ERROR),
+            ),
+        };
+        let _ = work_task_run_service::close(
+            &self.db.conn,
+            task_id,
+            run_seq,
+            run_status,
+            error_code,
+            verdict.as_deref(),
+            None,
+        )
+        .await;
         if changed {
             self.emit_upsert(task_id);
         }
@@ -3826,12 +4213,16 @@ impl TaskEngine {
         else {
             self.back_to_review(task_id, "merge state lost — please merge again".to_string(), None)
                 .await;
+            self.close_merge_run(task_id, task.run_seq, stop_reason, Some("merge_state_lost"))
+                .await;
             return;
         };
         let root = match get_folder_core(&self.db, task.folder_id).await {
             Ok(r) => r,
             Err(e) => {
                 self.back_to_review(task_id, e.to_string(), None).await;
+                self.close_merge_run(task_id, task.run_seq, stop_reason, Some("setup_error"))
+                    .await;
                 return;
             }
         };
@@ -3852,6 +4243,8 @@ impl TaskEngine {
                         self.remove_worktree_locked(task_id, None).await;
                     }
                 }
+                self.close_merge_run(task_id, task.run_seq, stop_reason, None)
+                    .await;
             }
             Ok(None) => {
                 self.clean_merge_residue(&root.path).await;
@@ -3869,12 +4262,44 @@ impl TaskEngine {
                     other => format!("the merge run failed before landing: {other}"),
                 };
                 self.back_to_review(task_id, reason, None).await;
+                self.close_merge_run(task_id, task.run_seq, stop_reason, None)
+                    .await;
             }
             Err(e) => {
                 self.back_to_review(task_id, format!("could not verify the merge: {e}"), None)
                     .await;
+                self.close_merge_run(task_id, task.run_seq, stop_reason, Some("verify_failed"))
+                    .await;
             }
         }
+    }
+
+    /// Close a completed merge generation's run row: `settled` when the turn
+    /// ended and the task moved on (landed or back to review), `canceled` when
+    /// the user stopped it. The generation is over either way — what it
+    /// achieved is recorded by the task-level settle, not here.
+    async fn close_merge_run(
+        &self,
+        task_id: i32,
+        run_seq: i32,
+        stop_reason: &str,
+        error_code: Option<&str>,
+    ) {
+        let status = if stop_reason == "cancelled" {
+            work_task_run_service::STATUS_CANCELED
+        } else {
+            work_task_run_service::STATUS_SETTLED
+        };
+        let _ = work_task_run_service::close(
+            &self.db.conn,
+            task_id,
+            run_seq,
+            status,
+            error_code,
+            None,
+            None,
+        )
+        .await;
     }
 
     /// `Some(base HEAD)` when git truth says this task landed on the base.
@@ -5354,6 +5779,8 @@ impl TaskEngine {
                 None,
             )
             .await;
+            self.close_merge_run(task_id, task.run_seq, "interrupted", Some("merge_state_lost"))
+                .await;
             return;
         };
         // A `merging` row is one of two very different things. Read the op
@@ -5404,6 +5831,15 @@ impl TaskEngine {
                     .await;
             }
         }
+        // The process that owned this generation is gone; its row is closed as
+        // an interruption whatever git truth said about the work.
+        self.close_merge_run(
+            task_id,
+            current.run_seq,
+            "interrupted",
+            Some("interrupted"),
+        )
+        .await;
     }
 
     // ── worktree cleanup ────────────────────────────────────────────────────
@@ -5688,27 +6124,67 @@ impl TaskEngine {
                         // settle path.
                         self.spawn_post_review(task.id, task.run_seq);
                     }
+                    if settled {
+                        let _ = work_task_run_service::close(
+                            &self.db.conn,
+                            task.id,
+                            task.run_seq,
+                            work_task_run_service::STATUS_SETTLED,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await;
+                    }
                     settled
                 }
                 Some(ConversationStatus::Cancelled) => {
-                    work_task_service::cancel_running_generation(
+                    let canceled = work_task_service::cancel_running_generation(
                         &self.db.conn,
                         task.id,
                         task.run_seq,
                     )
                     .await
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+                    if canceled {
+                        let _ = work_task_run_service::close(
+                            &self.db.conn,
+                            task.id,
+                            task.run_seq,
+                            work_task_run_service::STATUS_CANCELED,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await;
+                    }
+                    canceled
                 }
-                _ => work_task_service::fail(
-                    &self.db.conn,
-                    task.id,
-                    &[WorkTaskStatus::Running, WorkTaskStatus::AwaitingInput],
-                    Some(task.run_seq),
-                    "interrupted",
-                    Some("task lost its worker".to_string()),
-                )
-                .await
-                .unwrap_or(false),
+                _ => {
+                    let failed = work_task_service::fail(
+                        &self.db.conn,
+                        task.id,
+                        &[WorkTaskStatus::Running, WorkTaskStatus::AwaitingInput],
+                        Some(task.run_seq),
+                        "interrupted",
+                        Some("task lost its worker".to_string()),
+                    )
+                    .await
+                    .unwrap_or(false);
+                    if failed {
+                        let _ = work_task_run_service::close(
+                            &self.db.conn,
+                            task.id,
+                            task.run_seq,
+                            work_task_run_service::STATUS_FAILED,
+                            Some(work_task_run_service::ERROR_INTERRUPTED),
+                            None,
+                            None,
+                        )
+                        .await;
+                    }
+                    failed
+                }
             };
             if changed {
                 self.emit_upsert(task.id);
@@ -6224,11 +6700,20 @@ fn pull_push_repo(meta: &ForgeSourceMeta) -> Result<String, String> {
 /// and therefore continues, while `requeue_canceled` drops it so a task the
 /// user put back on the board runs from the top. `compose_prompt` must not
 /// read `Fresh` as "this task has no history" — see its doc.
-fn launch_mode_for(task: &crate::db::entities::work_task::Model) -> LaunchMode {
-    if task.conversation_id.is_some() {
-        LaunchMode::Retry
-    } else {
-        LaunchMode::Fresh
+///
+/// `fresh_session` comes from the newest restart action still outstanding —
+/// exactly the retry that queued this generation. The pump is the only launch
+/// path for a retry, so the flag has to reach the launch through this log; a
+/// task with no action on record continues, which is the safe default.
+async fn launch_mode_for(
+    conn: &sea_orm::DatabaseConnection,
+    task: &crate::db::entities::work_task::Model,
+) -> LaunchMode {
+    if task.conversation_id.is_none() {
+        return LaunchMode::Fresh;
+    }
+    LaunchMode::Retry {
+        fresh_session: instruction_scan(conn, task.id).await.fresh_session,
     }
 }
 
@@ -6347,7 +6832,7 @@ async fn compose_prompt(
             blocks.extend(original);
             push_replay(&mut blocks, &scan, resumed, task.id);
         }
-        LaunchMode::Retry => {
+        LaunchMode::Retry { .. } => {
             blocks.push(PromptInputBlock::Text {
                 text: "The previous run of this task was interrupted. Continue working in \
                        this worktree and complete the task."
@@ -6377,6 +6862,7 @@ async fn compose_prompt(
             intent,
             feedback,
             attachments,
+            ..
         } => {
             if !resumed {
                 // Session resume failed — the fresh session has no context, so
@@ -6749,6 +7235,14 @@ struct InstructionScan {
     /// to take it into, and for a question it pairs a read-only licence with a
     /// question the agent was never shown.
     interrupted_instruction: Option<Outstanding>,
+    /// The NEWEST restart action asked for a new session — the explicit "run
+    /// with a new session" decision, read by `launch_mode_for` for the
+    /// pump-driven launch it queued.
+    ///
+    /// Tracked separately from `outstanding` because the flag can arrive with
+    /// no note at all, and such an action must not take the replay slot from
+    /// the instruction underneath it.
+    fresh_session: bool,
 }
 
 async fn instruction_scan(
@@ -6772,7 +7266,11 @@ async fn instruction_scan(
         outstanding: None,
         interrupted: None,
         interrupted_instruction: None,
+        fresh_session: false,
     };
+    // The scan walks newest-first: only the FIRST restart action seen is this
+    // generation's decision.
+    let mut restart_seen = false;
     for event in events {
         match event.kind.as_str() {
             "status_changed" => {
@@ -6827,14 +7325,25 @@ async fn instruction_scan(
                         break;
                     }
                     "retry" | "requeue" => {
-                        if scan.outstanding.is_none() {
-                            let Some(text) = payload.get("note").and_then(|v| v.as_str()) else {
-                                break;
-                            };
+                        if !restart_seen {
+                            restart_seen = true;
+                            scan.fresh_session = payload
+                                .get("fresh_session")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                        }
+                        // A flag-only action (the "run with a new session"
+                        // button with an empty note box) records no
+                        // instruction: it must not take the replay slot away
+                        // from the turn underneath it.
+                        let text = payload.get("note").and_then(|v| v.as_str()).unwrap_or("");
+                        let attachments = payload_blocks(&payload);
+                        if scan.outstanding.is_none() && (!text.is_empty() || !attachments.is_empty())
+                        {
                             scan.outstanding = Some(Outstanding {
                                 kind: OutstandingKind::Restart,
                                 text: text.to_string(),
-                                attachments: payload_blocks(&payload),
+                                attachments,
                             });
                         }
                         // Keep looking: the turn this note interrupted lies
@@ -7542,14 +8051,25 @@ mod tests {
     /// at an earlier run is dispatched as `Retry` no matter how it got back to
     /// the queue. `requeue_canceled` clears the link precisely so a task the
     /// user put back on the board comes through here as `Fresh`.
-    #[test]
-    fn launch_mode_follows_the_conversation_link() {
+    #[tokio::test]
+    async fn launch_mode_follows_the_conversation_link() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
         let mut task = task_row();
         task.conversation_id = None;
-        assert!(matches!(launch_mode_for(&task), LaunchMode::Fresh));
+        assert!(matches!(
+            launch_mode_for(&db.conn, &task).await,
+            LaunchMode::Fresh
+        ));
 
+        // The link alone means "continue"; `fresh_session` is only ever set by
+        // a recorded restart decision, and a row outside the DB has none.
         task.conversation_id = Some(41);
-        assert!(matches!(launch_mode_for(&task), LaunchMode::Retry));
+        assert!(matches!(
+            launch_mode_for(&db.conn, &task).await,
+            LaunchMode::Retry {
+                fresh_session: false
+            }
+        ));
     }
 
     /// The sweep's row-level gate: exactly the tasks whose merge button the
@@ -7802,6 +8322,7 @@ mod tests {
             intent,
             feedback: "please fix the copy".to_string(),
             attachments: Vec::new(),
+            fresh_session: false,
         }
     }
 
@@ -7970,7 +8491,7 @@ mod tests {
         let retry = compose_prompt(
             &report_cfg,
             &task_row(),
-            &LaunchMode::Retry,
+            &LaunchMode::Retry { fresh_session: false },
             &WorkTaskFolderSettings::default(),
             true,
             &db.conn,
@@ -8012,7 +8533,7 @@ mod tests {
         let retry_review = compose_prompt(
             &report_cfg,
             &row,
-            &LaunchMode::Retry,
+            &LaunchMode::Retry { fresh_session: false },
             &WorkTaskFolderSettings::default(),
             true,
             &db.conn,
@@ -8076,7 +8597,7 @@ mod tests {
         let blocks = compose_prompt(
             &task_config(),
             &row,
-            &LaunchMode::Retry,
+            &LaunchMode::Retry { fresh_session: false },
             &WorkTaskFolderSettings::default(),
             true,
             &db.conn,
@@ -8115,7 +8636,7 @@ mod tests {
         let blocks = compose_prompt(
             &report_cfg,
             &row,
-            &LaunchMode::Retry,
+            &LaunchMode::Retry { fresh_session: false },
             &WorkTaskFolderSettings::default(),
             true,
             &db.conn,
@@ -8139,7 +8660,7 @@ mod tests {
         )
         .await;
         row.id = fresh_note;
-        for (label, mode) in [("fresh", LaunchMode::Fresh), ("retry", LaunchMode::Retry)] {
+        for (label, mode) in [("fresh", LaunchMode::Fresh), ("retry", LaunchMode::Retry { fresh_session: false })] {
             let blocks = compose_prompt(
                 &report_cfg,
                 &row,
@@ -8168,6 +8689,7 @@ mod tests {
                 intent: FollowUpIntent::Verify,
                 feedback: String::new(),
                 attachments: Vec::new(),
+                fresh_session: false,
             },
             &WorkTaskFolderSettings::default(),
             true,
@@ -8200,7 +8722,7 @@ mod tests {
         let blocks = compose_prompt(
             &task_config(),
             &row,
-            &LaunchMode::Retry,
+            &LaunchMode::Retry { fresh_session: false },
             &WorkTaskFolderSettings::default(),
             true,
             &db.conn,
@@ -8507,7 +9029,7 @@ mod tests {
         let resumed = compose_prompt(
             &task_config(),
             &row,
-            &LaunchMode::Retry,
+            &LaunchMode::Retry { fresh_session: false },
             &WorkTaskFolderSettings::default(),
             true,
             &db.conn,
@@ -8525,7 +9047,7 @@ mod tests {
         let fell_back = compose_prompt(
             &task_config(),
             &row,
-            &LaunchMode::Retry,
+            &LaunchMode::Retry { fresh_session: false },
             &WorkTaskFolderSettings::default(),
             false,
             &db.conn,
@@ -8557,6 +9079,7 @@ mod tests {
                     // one bad attachment must not stop the run carrying the rest.
                     serde_json::json!({ "type": "not_a_block" }),
                 ],
+                fresh_session: false,
             },
             &WorkTaskFolderSettings::default(),
             true,
@@ -8617,7 +9140,7 @@ mod tests {
         let blocks = compose_prompt(
             &task_config(),
             &row,
-            &LaunchMode::Retry,
+            &LaunchMode::Retry { fresh_session: false },
             &WorkTaskFolderSettings::default(),
             true,
             &db.conn,
@@ -8841,7 +9364,7 @@ mod tests {
         ]);
         let modes = [
             (LaunchMode::Fresh, "WORK-ONLY"),
-            (LaunchMode::Retry, "RETRY-ONLY"),
+            (LaunchMode::Retry { fresh_session: false }, "RETRY-ONLY"),
             (return_mode(FollowUpIntent::Revise), "RETURN-ONLY"),
             // Every scenario shares the `return` stage, so the settings dialog
             // stays four stages wide however many scenarios exist.
@@ -12963,5 +13486,363 @@ mod tests {
 
         f.engine.release_compact_slot(f.task_id, f.run_seq).await;
         assert!(f.engine.compacting.lock().await.is_empty());
+    }
+
+    use crate::models::WorkTaskDraft;
+    use sea_orm::{ColumnTrait, QueryFilter};
+
+    /// A task driven to `running` on a live index entry, with `run_seq` the
+    /// generation the engine will settle.
+    async fn running_ledger_task() -> (Arc<TaskEngine>, i32, i32, i32) {
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/task-ledger").await;
+        let conversation_id = seed_conversation(&db, folder_id, AgentType::ClaudeCode).await;
+        let task = work_task_service::create(
+            &db.conn,
+            WorkTaskDraft {
+                folder_id,
+                title: "ledger".to_string(),
+                config: serde_json::json!({
+                    "display_text": "ledger",
+                    "prompt_blocks": [{ "type": "text", "text": "ledger" }],
+                }),
+            },
+        )
+        .await
+        .expect("task");
+        let run_seq = work_task_service::claim_for_run(
+            &db.conn,
+            task.id,
+            WorkTaskStatus::Todo,
+            "test",
+        )
+        .await
+        .expect("claim")
+        .expect("claimed");
+        assert!(work_task_service::begin_setup(&db.conn, task.id, run_seq)
+            .await
+            .expect("begin_setup"));
+        assert!(work_task_service::mark_running(
+            &db.conn,
+            task.id,
+            run_seq,
+            conversation_id,
+            "conn-ledger",
+        )
+        .await
+        .expect("mark_running"));
+
+        let engine = test_engine(db);
+        engine
+            .index
+            .lock()
+            .await
+            .insert("conn-ledger".into(), (task.id, run_seq));
+        (engine, task.id, conversation_id, run_seq)
+    }
+
+    async fn open_row(engine: &TaskEngine, task_id: i32, run_seq: i32, kind: &str) {
+        work_task_run_service::open(
+            &engine.db.conn,
+            work_task_run_service::RunOpen {
+                task_id,
+                run_seq,
+                kind,
+                resume_outcome: Some(work_task_run_service::RESUME_FRESH_NO_SESSION),
+                resumed_from_run_seq: None,
+                agent_type: Some("claude_code"),
+                conversation_id: None,
+                external_session_id: None,
+                working_dir: None,
+                effective_mode: None,
+                effective_model: None,
+                effective_reasoning_level: None,
+            },
+        )
+        .await
+        .expect("open run");
+    }
+
+    async fn runs(engine: &TaskEngine, task_id: i32) -> Vec<crate::models::WorkTaskRunInfo> {
+        work_task_run_service::list_for_task(&engine.db.conn, task_id)
+            .await
+            .expect("runs")
+    }
+
+    /// A settled turn closes its generation as `settled`: the row is history,
+    /// not a second state machine.
+    #[tokio::test]
+    async fn a_turn_that_settles_into_review_closes_its_run() {
+        let (engine, task_id, _, run_seq) = running_ledger_task().await;
+        open_row(&engine, task_id, run_seq, work_task_run_service::KIND_FRESH).await;
+
+        engine.on_turn_complete("conn-ledger", "end_turn").await;
+
+        let rows = runs(&engine, task_id).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, work_task_run_service::STATUS_SETTLED);
+        assert_eq!(rows[0].error_code, None);
+        assert!(rows[0].finished_at.is_some());
+    }
+
+    /// A canceled stop reason closes the row as canceled — a user's stop is
+    /// not an agent failure.
+    #[tokio::test]
+    async fn a_cancelled_turn_closes_its_run_as_canceled() {
+        let (engine, task_id, _, run_seq) = running_ledger_task().await;
+        open_row(&engine, task_id, run_seq, work_task_run_service::KIND_FRESH).await;
+
+        engine.on_turn_complete("conn-ledger", "cancelled").await;
+
+        let rows = runs(&engine, task_id).await;
+        assert_eq!(rows[0].status, work_task_run_service::STATUS_CANCELED);
+        assert_eq!(rows[0].error_code, None);
+    }
+
+    /// Any other stop reason is an agent error, recorded as one.
+    #[tokio::test]
+    async fn a_failed_turn_closes_its_run_as_agent_error() {
+        let (engine, task_id, _, run_seq) = running_ledger_task().await;
+        open_row(&engine, task_id, run_seq, work_task_run_service::KIND_FRESH).await;
+
+        engine.on_turn_complete("conn-ledger", "error").await;
+
+        let rows = runs(&engine, task_id).await;
+        assert_eq!(rows[0].status, work_task_run_service::STATUS_FAILED);
+        assert_eq!(
+            rows[0].error_code.as_deref(),
+            Some(work_task_run_service::ERROR_AGENT_ERROR)
+        );
+    }
+
+    /// The user's stop closes the live generation's row immediately: no
+    /// `TurnComplete` is guaranteed after a teardown, and a row left `running`
+    /// would claim the run is still doing something.
+    #[tokio::test]
+    async fn cancel_closes_the_live_runs_row() {
+        let (engine, task_id, _, run_seq) = running_ledger_task().await;
+        open_row(&engine, task_id, run_seq, work_task_run_service::KIND_RETRY).await;
+
+        engine.cancel(task_id, Some("stop".to_string())).await.expect("cancel");
+
+        let rows = runs(&engine, task_id).await;
+        assert_eq!(rows[0].status, work_task_run_service::STATUS_CANCELED);
+    }
+
+    /// A launch that unwinds after it opened its row closes it as a setup
+    /// failure — the row must never outlive the generation it describes.
+    #[tokio::test]
+    async fn a_launch_that_unwinds_closes_its_run_as_a_setup_error() {
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = fresh_in_memory_db().await;
+        // A real directory that is NOT a git repository: the worktree step is
+        // where this launch dies.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let folder_id = seed_folder(&db, &dir.path().to_string_lossy()).await;
+        let task = work_task_service::create(
+            &db.conn,
+            WorkTaskDraft {
+                folder_id,
+                title: "will unwind".to_string(),
+                config: serde_json::json!({
+                    "display_text": "will unwind",
+                    "agent_type": "claude_code",
+                    "prompt_blocks": [{ "type": "text", "text": "will unwind" }],
+                }),
+            },
+        )
+        .await
+        .expect("task");
+        let run_seq = work_task_service::claim_for_run(
+            &db.conn,
+            task.id,
+            WorkTaskStatus::Todo,
+            "test",
+        )
+        .await
+        .expect("claim")
+        .expect("claimed");
+
+        let engine = test_engine(db);
+        let result = engine
+            .launch(
+                task.id,
+                LaunchMode::Fresh,
+                &LaunchSeq::default(),
+                None,
+            )
+            .await;
+        assert!(result.is_err(), "a non-repository folder cannot launch");
+
+        let rows = runs(&engine, task.id).await;
+        assert_eq!(rows.len(), 1, "the generation opened exactly one row");
+        assert_eq!(rows[0].run_seq, run_seq);
+        assert_eq!(rows[0].kind, work_task_run_service::KIND_FRESH);
+        assert_eq!(
+            rows[0].resume_outcome.as_deref(),
+            Some(work_task_run_service::RESUME_FRESH_NO_SESSION)
+        );
+        assert_eq!(rows[0].status, work_task_run_service::STATUS_FAILED);
+        assert_eq!(
+            rows[0].error_code.as_deref(),
+            Some(work_task_run_service::ERROR_SETUP_ERROR)
+        );
+        assert!(rows[0].finished_at.is_some());
+    }
+
+    /// The explicit "run with a new session" reaches the launch through the
+    /// restart log: the newest retry action decides, and a flag-only action
+    /// never takes the replay slot from the instruction underneath it.
+    #[tokio::test]
+    async fn a_retry_action_carries_the_fresh_session_decision_to_the_launch() {
+        use crate::db::test_helpers::fresh_in_memory_db;
+
+        let db = fresh_in_memory_db().await;
+        let folder_id = crate::db::test_helpers::seed_folder(&db, "/tmp/task-fresh").await;
+        let task = work_task_service::create(
+            &db.conn,
+            WorkTaskDraft {
+                folder_id,
+                title: "fresh".to_string(),
+                config: serde_json::json!({
+                    "display_text": "fresh",
+                    "prompt_blocks": [{ "type": "text", "text": "fresh" }],
+                }),
+            },
+        )
+        .await
+        .expect("task");
+        // A bound session is what makes the launch a continuation at all.
+        crate::db::entities::work_task::Entity::update_many()
+            .col_expr(
+                crate::db::entities::work_task::Column::ConversationId,
+                sea_orm::sea_query::Expr::value(Some(3)),
+            )
+            .filter(crate::db::entities::work_task::Column::Id.eq(task.id))
+            .exec(&db.conn)
+            .await
+            .expect("bind conversation");
+        let row = work_task_service::get_model(&db.conn, task.id)
+            .await
+            .expect("row");
+
+        assert!(matches!(
+            launch_mode_for(&db.conn, &row).await,
+            LaunchMode::Retry {
+                fresh_session: false
+            }
+        ));
+
+        work_task_service::record_event(
+            &db.conn,
+            task.id,
+            "user_action",
+            "user",
+            Some(serde_json::json!({ "action": "retry", "note": "", "blocks": [] })),
+        )
+        .await
+        .expect("action");
+        assert!(
+            matches!(
+                launch_mode_for(&db.conn, &row).await,
+                LaunchMode::Retry {
+                    fresh_session: false
+                }
+            ),
+            "a plain retry stays a continuation"
+        );
+
+        work_task_service::record_event(
+            &db.conn,
+            task.id,
+            "user_action",
+            "user",
+            Some(
+                serde_json::json!({ "action": "retry", "note": "go", "blocks": [],
+                                    "fresh_session": true }),
+            ),
+        )
+        .await
+        .expect("action");
+        assert!(matches!(
+            launch_mode_for(&db.conn, &row).await,
+            LaunchMode::Retry {
+                fresh_session: true
+            }
+        ));
+        // The flag-only action replays nothing, so the note underneath it is
+        // still the outstanding instruction.
+        let scan = instruction_scan(&db.conn, task.id).await;
+        assert_eq!(
+            scan.outstanding.map(|o| o.text).as_deref(),
+            Some("go"),
+            "the newest note is the outstanding instruction"
+        );
+
+        // Reaching review consumes every older instruction — including the
+        // decision.
+        work_task_service::record_event(
+            &db.conn,
+            task.id,
+            "status_changed",
+            "engine",
+            Some(serde_json::json!({ "to": "review" })),
+        )
+        .await
+        .expect("settle");
+        assert!(!instruction_scan(&db.conn, task.id).await.fresh_session);
+    }
+
+    /// A flag-only retry action (the "run with a new session" button with an
+    /// empty note box) is a decision, not an instruction: it must not hide the
+    /// turn underneath it.
+    #[tokio::test]
+    async fn a_flag_only_retry_keeps_an_older_instruction_outstanding() {
+        use crate::db::test_helpers::fresh_in_memory_db;
+
+        let db = fresh_in_memory_db().await;
+        let folder_id = crate::db::test_helpers::seed_folder(&db, "/tmp/task-flag").await;
+        let task = work_task_service::create(
+            &db.conn,
+            WorkTaskDraft {
+                folder_id,
+                title: "flag".to_string(),
+                config: serde_json::json!({ "display_text": "flag" }),
+            },
+        )
+        .await
+        .expect("task");
+
+        work_task_service::record_event(
+            &db.conn,
+            task.id,
+            "user_action",
+            "user",
+            Some(serde_json::json!({ "action": "return", "intent": "revise",
+                                    "feedback": "fix the copy", "blocks": [] })),
+        )
+        .await
+        .expect("return");
+        work_task_service::record_event(
+            &db.conn,
+            task.id,
+            "user_action",
+            "user",
+            Some(serde_json::json!({ "action": "retry", "note": "", "blocks": [],
+                                    "fresh_session": true })),
+        )
+        .await
+        .expect("retry");
+
+        let scan = instruction_scan(&db.conn, task.id).await;
+        assert!(scan.fresh_session);
+        assert_eq!(
+            scan.outstanding.map(|o| o.text).as_deref(),
+            Some("fix the copy"),
+            "the flag-only action must not take the replay slot"
+        );
     }
 }

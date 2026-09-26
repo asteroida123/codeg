@@ -84,6 +84,8 @@ import {
   type TaskMessageComposerHandle,
 } from "./task-message-composer"
 import { TaskTranscriptDialog } from "./task-transcript-dialog"
+import { TaskDelegationsList } from "./task-delegations-list"
+import { TaskRunRounds } from "./task-run-rounds"
 import {
   duplicateActiveSource,
   duplicateActiveSourceLabel,
@@ -237,6 +239,9 @@ export function TaskDetailSheet({
   /** Set when the resurrection guard refused a restart — see `submitRestart`. */
   const [restartDuplicate, setRestartDuplicate] =
     useState<DuplicateActiveSource | null>(null)
+  /** "Start a new session" on the open composer: skip the continuation anchor
+   *  instead of continuing the recorded session. */
+  const [freshSession, setFreshSession] = useState(false)
   const [intent, setIntent] = useState<FollowUpIntent>(DEFAULT_FOLLOW_UP_INTENT)
   const [deleteOpen, setDeleteOpen] = useState(false)
   const [deleteWorktree, setDeleteWorktree] = useState(false)
@@ -336,6 +341,7 @@ export function TaskDetailSheet({
     setComposerText("")
     setComposerAttachments(0)
     setRestartDuplicate(null)
+    setFreshSession(false)
     setIntent(DEFAULT_FOLLOW_UP_INTENT)
     void reload()
     let unsub: (() => void) | undefined
@@ -627,12 +633,13 @@ export function TaskDetailSheet({
       if (submittingRef.current) return
       submittingRef.current = true
       try {
-        await workTaskReturn(task.id, feedback, intent, blocks)
+        await workTaskReturn(task.id, feedback, intent, blocks, freshSession)
       } finally {
         submittingRef.current = false
       }
       setComposerOpen(false)
       setComposerText("")
+      setFreshSession(false)
       setIntent(DEFAULT_FOLLOW_UP_INTENT)
     })
 
@@ -658,7 +665,13 @@ export function TaskDetailSheet({
     return runRestart(async () => {
       try {
         if (task.status === "failed") {
-          await workTaskRetry(task.id, note, blocks, allowDuplicateSource)
+          await workTaskRetry(
+            task.id,
+            note,
+            blocks,
+            allowDuplicateSource,
+            freshSession
+          )
         } else {
           await workTaskRequeue(task.id, note, blocks, allowDuplicateSource)
         }
@@ -669,6 +682,30 @@ export function TaskDetailSheet({
         // refuses EVERY restart of this card while the other task lives — a
         // toast would leave the user with no next move. Everything else keeps
         // `run`'s toast: there is nothing there to decide.
+        const dup = duplicateActiveSource(e)
+        if (!dup) throw e
+        setRestartDuplicate(dup)
+        return false
+      } finally {
+        submittingRef.current = false
+      }
+    })
+  }
+
+  /// The `resume_failed` remedy: retry this task explicitly WITHOUT continuing
+  /// its session. Same guard handling as the composer's restart — the forge
+  /// resurrection guard refuses every restart of this card while the other
+  /// task lives, and a toast would leave the user with no next move.
+  const runWithNewSession = () => {
+    if (!isRestart || task.status !== "failed") return
+    if (submittingRef.current) return
+    submittingRef.current = true
+    return runRestart(async () => {
+      try {
+        await workTaskRetry(task.id, null, [], false, true)
+        setRestartDuplicate(null)
+        return true
+      } catch (e) {
         const dup = duplicateActiveSource(e)
         if (!dup) throw e
         setRestartDuplicate(dup)
@@ -1029,6 +1066,18 @@ export function TaskDetailSheet({
                           </Select>
                         ) : null}
                         <div className="flex-1" />
+                        {/* Continue-or-start-over. Offered on both restart
+                            (failed) and follow-up (review) turns: a strict
+                            continuation that cannot be restored stops the run
+                            rather than silently cold-starting it, and this is
+                            the user's explicit way past that. */}
+                        <Label className="flex cursor-pointer items-center gap-1.5 text-xs font-normal text-muted-foreground">
+                          <Checkbox
+                            checked={freshSession}
+                            onCheckedChange={(v) => setFreshSession(v === true)}
+                          />
+                          {t("freshSessionLabel")}
+                        </Label>
                         <Button
                           type="button"
                           size="sm"
@@ -1232,6 +1281,19 @@ export function TaskDetailSheet({
                   )}
                 </section>
               ) : null}
+
+              {/* Rounds: one row per execution generation, with how each
+                  continued the previous session and what it cost. */}
+              <TaskRunRounds
+                open={open}
+                task={task}
+                onRunWithNewSession={runWithNewSession}
+                busy={busy}
+              />
+
+              {/* Sub-agent runs: the delegation ledger rows attributed to
+                  this task at admission. */}
+              <TaskDelegationsList open={open} task={task} />
 
               {/* Progress timeline (work_task_event, append-only). */}
               <section className="flex flex-col gap-1.5">

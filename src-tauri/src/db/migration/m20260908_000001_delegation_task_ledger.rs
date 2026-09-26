@@ -375,6 +375,7 @@ mod tests {
                 task: "Verify the upgraded ledger".into(),
                 requested_working_dir: None,
                 resume_binding: binding.clone(),
+                work_task_id: None,
             },
         )
         .await
