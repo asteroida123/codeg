@@ -5039,6 +5039,43 @@ export async function setDelegationSettings(
   return getTransport().call("set_delegation_settings", { settings })
 }
 
+// ─── Delegation performance (sub-agent dashboard) ──────────────────────
+
+/** One grouping bucket (or the all-up totals row) of the delegation
+ * performance report. Mirrors Rust `DelegationDimensionStats`; NULL
+ * metric columns are absent on the wire, hence the optional fields. */
+export interface DelegationDimensionStats {
+  /** Agent slug for by-agent rows, model id for by-model rows.
+   * `null` = not recorded (pre-metrics rows / calls without selectors). */
+  key: string | null
+  task_count: number
+  completed: number
+  failed: number
+  canceled: number
+  unknown: number
+  running: number
+  /** completed / terminal rows; 0 when nothing finished yet. */
+  success_rate: number
+  /** Mean duration over rows that reported one; null when none did. */
+  avg_duration_ms: number | null
+  input_tokens: number
+  output_tokens: number
+  /** Terminal tasks that a successor continued (rework rounds). */
+  reworked: number
+  /** reworked / terminal rows; 0 when nothing finished yet. */
+  rework_rate: number
+}
+
+export interface DelegationPerformanceReport {
+  totals: DelegationDimensionStats
+  by_agent: DelegationDimensionStats[]
+  by_model: DelegationDimensionStats[]
+}
+
+export async function getDelegationPerformance(): Promise<DelegationPerformanceReport> {
+  return getTransport().call("get_delegation_performance")
+}
+
 // ─── codeg-mcp service status ──────────────────────────────────────────
 
 /** Headline verdict from Rust `CodegMcpServiceState`. Ordered by which problem

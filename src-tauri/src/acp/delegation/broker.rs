@@ -838,12 +838,16 @@ fn report_from_outcome(
     selectors: Option<DelegationSelectorReport>,
 ) -> DelegationTaskReport {
     let (status, text, error_code, message) = terminal_fields(outcome);
-    let child_conversation_id = match outcome {
-        DelegationOutcome::Ok(ok) => Some(ok.child_conversation_id),
+    let (child_conversation_id, turn_count, token_usage) = match outcome {
+        DelegationOutcome::Ok(ok) => (
+            Some(ok.child_conversation_id),
+            Some(ok.turn_count),
+            ok.token_usage.clone(),
+        ),
         DelegationOutcome::Err {
             child_conversation_id,
             ..
-        } => *child_conversation_id,
+        } => (*child_conversation_id, None, None),
     };
     DelegationTaskReport {
         task_id,
@@ -854,6 +858,8 @@ fn report_from_outcome(
         error_code,
         message,
         duration_ms,
+        turn_count,
+        token_usage,
         // Terminal by construction — nothing is waiting on the user anymore.
         blocked_on: None,
         selectors,
@@ -898,6 +904,8 @@ fn running_ack(
         error_code: None,
         message: Some(message),
         duration_ms: None,
+        turn_count: None,
+        token_usage: None,
         blocked_on: None,
         selectors,
     }
@@ -967,6 +975,8 @@ fn resume_ack(
         error_code: None,
         message: Some(message),
         duration_ms: None,
+        turn_count: None,
+        token_usage: None,
         blocked_on: None,
         selectors: None,
     }
@@ -997,6 +1007,8 @@ fn not_resumable_report(
         error_code: Some(NOT_RESUMABLE_CODE.to_string()),
         message: Some(format!("Not resumed: {why}")),
         duration_ms: None,
+        turn_count: None,
+        token_usage: None,
         blocked_on: None,
         selectors: None,
     }
@@ -1079,6 +1091,8 @@ fn running_report(task_id: &str, task: &RunningTask) -> DelegationTaskReport {
         // "Running.\nLatest sub-agent reply: …" when the child has live output.
         message: Some("Running.".to_string()),
         duration_ms: None,
+        turn_count: None,
+        token_usage: None,
         blocked_on: None,
         selectors: task.selectors.clone(),
     }
@@ -1095,6 +1109,8 @@ fn completed_report(task_id: &str, c: &CompletedTask) -> DelegationTaskReport {
         error_code: c.error_code.clone(),
         message: c.message.clone(),
         duration_ms: Some(c.duration_ms),
+        turn_count: None,
+        token_usage: None,
         blocked_on: None,
         selectors: c.selectors.clone(),
     }
@@ -1116,6 +1132,8 @@ fn unknown_report(task_id: &str) -> DelegationTaskReport {
                 .to_string(),
         ),
         duration_ms: None,
+        turn_count: None,
+        token_usage: None,
         blocked_on: None,
         selectors: None,
     }
@@ -1136,6 +1154,8 @@ fn interrupted_ledger_report(
                 .into(),
         ),
         duration_ms: None,
+        turn_count: None,
+        token_usage: None,
         blocked_on: None,
         selectors: None,
     }
@@ -1156,6 +1176,8 @@ fn db_report(task_id: &str, rec: &ChildStatusRecord) -> DelegationTaskReport {
             rec.child_conversation_id
         )),
         duration_ms: None,
+        turn_count: None,
+        token_usage: None,
         blocked_on: None,
         selectors: None,
     }
@@ -1263,9 +1285,9 @@ fn report_to_outcome(report: &DelegationTaskReport) -> DelegationOutcome {
             text: report.text.clone().unwrap_or_default(),
             child_conversation_id: report.child_conversation_id.unwrap_or(0),
             child_agent_type: report.agent_type.unwrap_or(AgentType::ClaudeCode),
-            turn_count: 1,
+            turn_count: report.turn_count.unwrap_or(1),
             duration_ms: report.duration_ms.unwrap_or(0),
-            token_usage: None,
+            token_usage: report.token_usage.clone(),
         }),
         // Running never reaches here (the shim loops until terminal); the other
         // states all project onto Err.
@@ -6012,6 +6034,8 @@ mod tests {
             error_code: None,
             message: None,
             duration_ms: Some(1),
+            turn_count: None,
+            token_usage: None,
             blocked_on: None,
         };
         ledger::finish(&db.conn, parent.id, "durable-running", &terminal)
@@ -6821,6 +6845,8 @@ mod tests {
                 error_code: None,
                 message: None,
                 duration_ms: Some(1),
+                turn_count: None,
+                token_usage: None,
                 blocked_on: None,
                 selectors: None,
             },

@@ -505,7 +505,10 @@ async fn deepseek_model_catalog_is_readable_and_shaped_for_the_panel() {
     assert!(body["exists"].is_boolean(), "got {body}");
     assert!(body["configured"].is_boolean(), "got {body}");
     assert!(body["models"].is_array(), "got {body}");
-    assert!(body["error"].is_string() || body["error"].is_null(), "got {body}");
+    assert!(
+        body["error"].is_string() || body["error"].is_null(),
+        "got {body}"
+    );
 }
 
 #[tokio::test]
@@ -513,6 +516,137 @@ async fn deepseek_model_catalog_requires_a_token() {
     let (server, _data, _static) = build_test_server().await;
     let resp = server
         .post("/api/acp_load_deepseek_model_catalog")
+        .json(&json!({}))
+        .await;
+    assert_eq!(resp.status_code(), 401);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Delegation performance dashboard (#724)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Like [`build_test_server`], but hands back the DB connection so a test can
+/// seed the delegation ledger through the real service before hitting the
+/// endpoint — the ledger is written by the broker, not by any HTTP route.
+async fn build_test_server_with_db() -> (
+    TestServer,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    sea_orm::DatabaseConnection,
+) {
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let static_dir = tempfile::tempdir().expect("static dir");
+
+    let db = fresh_in_memory_db().await;
+    let conn = db.conn.clone();
+    let state = Arc::new(AppState::new_for_test(db, data_dir.path().to_path_buf()));
+    let shutdown = Arc::new(ShutdownSignal::new());
+    let router = build_router(
+        state,
+        TEST_TOKEN.to_string(),
+        static_dir.path().to_path_buf(),
+        shutdown,
+    );
+    let server = TestServer::new(router).expect("test server");
+    (server, data_dir, static_dir, conn)
+}
+
+#[tokio::test]
+async fn delegation_performance_reports_ledger_rows_over_http() {
+    use codeg_lib::acp::delegation::types::{DelegationTaskReport, TaskStatus};
+    use codeg_lib::db::service::{conversation_service, delegation_task_service, folder_service};
+    use codeg_lib::models::AgentType;
+
+    let (server, _data, _static, conn) = build_test_server_with_db().await;
+
+    let folder = folder_service::add_folder(&conn, "/workspace/delegation")
+        .await
+        .expect("folder");
+    let parent = conversation_service::create(&conn, folder.id, AgentType::ClaudeCode, None, None)
+        .await
+        .expect("parent");
+    let child = conversation_service::create(&conn, folder.id, AgentType::Codex, None, None)
+        .await
+        .expect("child");
+    let binding = delegation_task_service::ResumeBinding {
+        agent_type: AgentType::Codex,
+        external_session_id: "session-1".into(),
+        child_conversation_id: child.id,
+        working_dir: "/workspace/delegation".into(),
+        preferred_mode_id: None,
+        preferred_config_values: Default::default(),
+        config_fingerprint: "fingerprint-1".into(),
+    };
+    delegation_task_service::admit(
+        &conn,
+        delegation_task_service::AdmissionInput {
+            task_id: "t0".into(),
+            parent_conversation_id: parent.id,
+            child_conversation_id: child.id,
+            source_task_id: None,
+            task: "dashboard task".into(),
+            requested_working_dir: None,
+            resume_binding: binding,
+        },
+    )
+    .await
+    .expect("admit");
+    let report = DelegationTaskReport {
+        task_id: Some("t0".into()),
+        status: TaskStatus::Completed,
+        child_conversation_id: Some(child.id),
+        agent_type: Some(AgentType::Codex),
+        text: Some("done".into()),
+        error_code: None,
+        message: None,
+        duration_ms: Some(1_234),
+        turn_count: Some(2),
+        token_usage: None,
+        blocked_on: None,
+        selectors: None,
+    };
+    assert!(
+        delegation_task_service::finish(&conn, parent.id, "t0", &report)
+            .await
+            .expect("finish")
+    );
+
+    let resp = server
+        .post("/api/get_delegation_performance")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({}))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: Value = resp.json();
+    assert_eq!(body["totals"]["task_count"], 1, "got {body}");
+    assert_eq!(body["totals"]["completed"], 1);
+    assert_eq!(body["totals"]["success_rate"], 1.0);
+    assert_eq!(body["totals"]["rework_rate"], 0.0);
+    assert_eq!(body["totals"]["avg_duration_ms"], 1_234.0);
+    assert_eq!(body["by_agent"][0]["key"], "codex");
+    assert_eq!(body["by_agent"][0]["task_count"], 1);
+    assert_eq!(body["by_model"][0]["key"], Value::Null);
+}
+
+#[tokio::test]
+async fn delegation_performance_on_empty_ledger_returns_zeroed_totals() {
+    let (server, _data, _static, _conn) = build_test_server_with_db().await;
+    let resp = server
+        .post("/api/get_delegation_performance")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({}))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: Value = resp.json();
+    assert_eq!(body["totals"]["task_count"], 0, "got {body}");
+    assert_eq!(body["by_agent"].as_array().map(Vec::len), Some(0));
+}
+
+#[tokio::test]
+async fn delegation_performance_requires_a_token() {
+    let (server, _data, _static, _conn) = build_test_server_with_db().await;
+    let resp = server
+        .post("/api/get_delegation_performance")
         .json(&json!({}))
         .await;
     assert_eq!(resp.status_code(), 401);

@@ -537,6 +537,8 @@ fn durable_continuation_reopens_the_source_session_and_admits_one_successor() {
             error_code: None,
             message: None,
             duration_ms: Some(1),
+            turn_count: None,
+            token_usage: None,
             blocked_on: None,
             selectors: None,
         };

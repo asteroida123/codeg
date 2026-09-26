@@ -754,6 +754,7 @@
       "loadFailed": "위임 설정 로드 실패: {detail}",
       "tabGeneral": "일반",
       "tabAgentDefaults": "하위 에이전트 설정",
+      "tabPerformance": "성과",
       "agentDefaultsDescription": "다중 에이전트 협업이 위임 호출을 위해 하위 에이전트를 시작할 때 적용되는 재정의 항목입니다. 아래 옵션은 실시간 프로브로 가져오므로 선택한 항목이 그대로 에이전트에 전달됩니다.",
       "probing": "에이전트에서 사용 가능한 옵션을 로드 중…",
       "probeFailed": "옵션 로드 실패: {detail}",
@@ -761,7 +762,29 @@
       "noConfigAvailable": "이 에이전트에는 구성 가능한 옵션이 없습니다.",
       "modeLabel": "모드",
       "agentDefaultHint": "에이전트 기본값: {value}",
-      "defaultOptionLabel": "기본값 ({value})"
+      "defaultOptionLabel": "기본값 ({value})",
+      "performance": {
+        "loading": "위임 기록을 불러오는 중…",
+        "loadFailed": "성과 데이터를 불러오지 못했습니다: {detail}",
+        "empty": "아직 기록된 위임이 없습니다. 멀티 에이전트 협업으로 위임한 서브 에이전트 작업이 여기에 표시됩니다.",
+        "notRecorded": "기록 없음",
+        "totalTasks": "작업 수",
+        "totalSuccess": "성공률",
+        "totalRework": "재작업률",
+        "totalAvgDuration": "평균 소요",
+        "totalTokens": "토큰",
+        "totalRunning": "실행 중",
+        "byAgent": "에이전트별",
+        "byModel": "모델별",
+        "colAgent": "에이전트",
+        "colModel": "모델",
+        "colTasks": "작업 수",
+        "colSuccess": "성공률",
+        "colAvgDuration": "평균 시간",
+        "colTokens": "토큰",
+        "colRework": "재작업",
+        "footnote": "성공률과 재작업률은 종료된 작업만 기준으로 계산합니다. 후속 위임이 같은 서브 에이전트에서 이어진 작업을 재작업으로 센습니다. 토큰과 소요 시간은 서브 에이전트가 보고한 경우에만 표시됩니다."
+      }
     },
     "actions": {
       "dragSort": "드래그하여 순서 변경",

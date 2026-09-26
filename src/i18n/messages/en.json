@@ -754,6 +754,7 @@
       "loadFailed": "Failed to load delegation settings: {detail}",
       "tabGeneral": "General",
       "tabAgentDefaults": "Agent defaults",
+      "tabPerformance": "Performance",
       "agentDefaultsDescription": "Per-agent overrides applied when Multi-Agent Collaboration spawns a subagent for a delegation call. Options shown here come from a live probe — what you pick is exactly what the agent will accept.",
       "probing": "Loading available options from the agent…",
       "probeFailed": "Failed to load options: {detail}",
@@ -761,7 +762,29 @@
       "noConfigAvailable": "This agent has no configurable options.",
       "modeLabel": "Mode",
       "agentDefaultHint": "Agent default: {value}",
-      "defaultOptionLabel": "Default ({value})"
+      "defaultOptionLabel": "Default ({value})",
+      "performance": {
+        "loading": "Loading delegation history…",
+        "loadFailed": "Failed to load performance data: {detail}",
+        "empty": "No delegations recorded yet. Delegated sub-agent runs will show up here once Multi-Agent Collaboration is used.",
+        "notRecorded": "Not recorded",
+        "totalTasks": "Tasks",
+        "totalSuccess": "Success rate",
+        "totalRework": "Rework rate",
+        "totalAvgDuration": "Avg duration",
+        "totalTokens": "Tokens",
+        "totalRunning": "Running",
+        "byAgent": "By agent",
+        "byModel": "By model",
+        "colAgent": "Agent",
+        "colModel": "Model",
+        "colTasks": "Tasks",
+        "colSuccess": "Success",
+        "colAvgDuration": "Avg time",
+        "colTokens": "Tokens",
+        "colRework": "Rework",
+        "footnote": "Success and rework rates are computed over finished tasks only; a task counts as reworked when a follow-up delegation continued it on the same sub-agent. Token and duration data appear only when the sub-agent reported them."
+      }
     },
     "actions": {
       "dragSort": "Drag to reorder",

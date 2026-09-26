@@ -754,6 +754,7 @@
       "loadFailed": "Delegationseinstellungen konnten nicht geladen werden: {detail}",
       "tabGeneral": "Allgemein",
       "tabAgentDefaults": "Subagent-Standards",
+      "tabPerformance": "Leistung",
       "agentDefaultsDescription": "Pro-Agent-Überschreibungen, die angewendet werden, wenn die Multi-Agent-Zusammenarbeit einen Subagenten für einen Delegationsaufruf startet. Die hier gezeigten Optionen stammen aus einer Live-Abfrage – Ihre Auswahl ist exakt das, was der Agent akzeptiert.",
       "probing": "Verfügbare Optionen vom Agenten werden geladen…",
       "probeFailed": "Optionen konnten nicht geladen werden: {detail}",
@@ -761,7 +762,29 @@
       "noConfigAvailable": "Dieser Agent hat keine konfigurierbaren Optionen.",
       "modeLabel": "Modus",
       "agentDefaultHint": "Agent-Standard: {value}",
-      "defaultOptionLabel": "Standard ({value})"
+      "defaultOptionLabel": "Standard ({value})",
+      "performance": {
+        "loading": "Delegationsverlauf wird geladen…",
+        "loadFailed": "Leistungsdaten konnten nicht geladen werden: {detail}",
+        "empty": "Noch keine Delegationen aufgezeichnet. Delegierte Sub-Agenten-Läufe erscheinen hier, sobald die Multi-Agenten-Zusammenarbeit genutzt wird.",
+        "notRecorded": "Nicht erfasst",
+        "totalTasks": "Aufgaben",
+        "totalSuccess": "Erfolgsquote",
+        "totalRework": "Nacharbeitsquote",
+        "totalAvgDuration": "Ø Dauer",
+        "totalTokens": "Tokens",
+        "totalRunning": "Laufend",
+        "byAgent": "Je Agent",
+        "byModel": "Je Modell",
+        "colAgent": "Agent",
+        "colModel": "Modell",
+        "colTasks": "Aufgaben",
+        "colSuccess": "Erfolg",
+        "colAvgDuration": "Ø Zeit",
+        "colTokens": "Tokens",
+        "colRework": "Nacharbeit",
+        "footnote": "Erfolgs- und Nacharbeitsquoten werden nur über abgeschlossene Aufgaben berechnet; eine Aufgabe gilt als nachgearbeitet, wenn eine Folge-Delegation sie im selben Sub-Agenten fortgesetzt hat. Tokens und Laufzeiten erscheinen nur, wenn der Sub-Agent sie gemeldet hat."
+      }
     },
     "actions": {
       "dragSort": "Zum Neuordnen ziehen",

@@ -754,6 +754,7 @@
       "loadFailed": "加载委托设置失败：{detail}",
       "tabGeneral": "通用",
       "tabAgentDefaults": "子智能体配置",
+      "tabPerformance": "表现",
       "agentDefaultsDescription": "多智能体协同在为委托调用启动子智能体时使用这些覆盖项。下方选项通过实时探测获取，所选即所用。",
       "probing": "正在加载该智能体的可用配置项…",
       "probeFailed": "加载配置项失败：{detail}",
@@ -761,7 +762,29 @@
       "noConfigAvailable": "该智能体没有可配置项。",
       "modeLabel": "模式",
       "agentDefaultHint": "智能体默认：{value}",
-      "defaultOptionLabel": "默认（{value}）"
+      "defaultOptionLabel": "默认（{value}）",
+      "performance": {
+        "loading": "正在加载委托历史…",
+        "loadFailed": "加载表现数据失败：{detail}",
+        "empty": "还没有委托记录。使用多智能体协作委派的子智能体任务会显示在这里。",
+        "notRecorded": "未记录",
+        "totalTasks": "任务数",
+        "totalSuccess": "成功率",
+        "totalRework": "返工率",
+        "totalAvgDuration": "平均时长",
+        "totalTokens": "Token",
+        "totalRunning": "进行中",
+        "byAgent": "按智能体",
+        "byModel": "按模型",
+        "colAgent": "智能体",
+        "colModel": "模型",
+        "colTasks": "任务数",
+        "colSuccess": "成功率",
+        "colAvgDuration": "平均时长",
+        "colTokens": "Token",
+        "colRework": "返工率",
+        "footnote": "成功率与返工率仅统计已结束的任务；任务被后续委托在同一子智能体上继续时计为返工。Token 与时长只在子智能体上报时才会显示。"
+      }
     },
     "actions": {
       "dragSort": "拖拽排序",

@@ -754,6 +754,7 @@
       "loadFailed": "Falha ao carregar configurações de delegação: {detail}",
       "tabGeneral": "Geral",
       "tabAgentDefaults": "Padrões do subagente",
+      "tabPerformance": "Desempenho",
       "agentDefaultsDescription": "Substituições por agente aplicadas quando a Colaboração multiagente inicia um subagente para uma chamada de delegação. As opções mostradas vêm de uma sondagem ao vivo: o que você escolhe é exatamente o que o agente aceitará.",
       "probing": "Carregando opções disponíveis do agente…",
       "probeFailed": "Falha ao carregar opções: {detail}",
@@ -761,7 +762,29 @@
       "noConfigAvailable": "Este agente não possui opções configuráveis.",
       "modeLabel": "Modo",
       "agentDefaultHint": "Padrão do agente: {value}",
-      "defaultOptionLabel": "Padrão ({value})"
+      "defaultOptionLabel": "Padrão ({value})",
+      "performance": {
+        "loading": "Carregando o histórico de delegações…",
+        "loadFailed": "Falha ao carregar os dados de desempenho: {detail}",
+        "empty": "Ainda não há delegações registradas. As execuções de subagentes delegadas aparecerão aqui quando a colaboração multiagente for usada.",
+        "notRecorded": "Não registrado",
+        "totalTasks": "Tarefas",
+        "totalSuccess": "Taxa de sucesso",
+        "totalRework": "Taxa de retrabalho",
+        "totalAvgDuration": "Duração média",
+        "totalTokens": "Tokens",
+        "totalRunning": "Em execução",
+        "byAgent": "Por agente",
+        "byModel": "Por modelo",
+        "colAgent": "Agente",
+        "colModel": "Modelo",
+        "colTasks": "Tarefas",
+        "colSuccess": "Sucesso",
+        "colAvgDuration": "Tempo médio",
+        "colTokens": "Tokens",
+        "colRework": "Retrabalho",
+        "footnote": "As taxas de sucesso e retrabalho são calculadas apenas sobre tarefas concluídas; uma tarefa conta como retrabalho quando uma delegação posterior a continuou no mesmo subagente. Tokens e durações só aparecem quando o subagente os relatou."
+      }
     },
     "actions": {
       "dragSort": "Arraste para reordenar",
