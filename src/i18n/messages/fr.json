@@ -754,6 +754,7 @@
       "loadFailed": "Échec du chargement des paramètres de délégation : {detail}",
       "tabGeneral": "Général",
       "tabAgentDefaults": "Valeurs par défaut du sous-agent",
+      "tabPerformance": "Performance",
       "agentDefaultsDescription": "Remplacements par agent appliqués lorsque la Collaboration multi-agent démarre un sous-agent pour un appel de délégation. Les options affichées proviennent d’une sonde en direct : votre sélection correspond exactement à ce que l’agent acceptera.",
       "probing": "Chargement des options disponibles depuis l’agent…",
       "probeFailed": "Échec du chargement des options : {detail}",
@@ -761,7 +762,29 @@
       "noConfigAvailable": "Cet agent n’a aucune option configurable.",
       "modeLabel": "Mode",
       "agentDefaultHint": "Valeur par défaut de l’agent : {value}",
-      "defaultOptionLabel": "Par défaut ({value})"
+      "defaultOptionLabel": "Par défaut ({value})",
+      "performance": {
+        "loading": "Chargement de l'historique des délégations…",
+        "loadFailed": "Échec du chargement des données de performance : {detail}",
+        "empty": "Aucune délégation enregistrée pour l'instant. Les exécutions de sous-agents déléguées apparaîtront ici dès que la collaboration multi-agents sera utilisée.",
+        "notRecorded": "Non consigné",
+        "totalTasks": "Tâches",
+        "totalSuccess": "Taux de réussite",
+        "totalRework": "Taux de reprise",
+        "totalAvgDuration": "Durée moy.",
+        "totalTokens": "Tokens",
+        "totalRunning": "En cours",
+        "byAgent": "Par agent",
+        "byModel": "Par modèle",
+        "colAgent": "Agent",
+        "colModel": "Modèle",
+        "colTasks": "Tâches",
+        "colSuccess": "Réussite",
+        "colAvgDuration": "Temps moy.",
+        "colTokens": "Tokens",
+        "colRework": "Reprise",
+        "footnote": "Les taux de réussite et de reprise ne portent que sur les tâches terminées ; une tâche est comptée reprise quand une délegation suivante l'a poursuivie sur le même sous-agent. Les tokens et durées n'apparaissent que si le sous-agent les a signalés."
+      }
     },
     "actions": {
       "dragSort": "Glisser pour réordonner",

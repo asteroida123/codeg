@@ -45,6 +45,7 @@ import { subscribe } from "@/lib/platform"
 import { DELEGATION_SETTINGS_CHANGED_EVENT } from "@/lib/types"
 import type { AgentDelegationDefaults, AgentType } from "@/lib/types"
 import { DelegationAgentDefaultsPanel } from "./delegation-agent-defaults"
+import { DelegationPerformancePanel } from "./delegation-performance"
 
 const DEPTH_MIN = 1
 const DEPTH_MAX = 8
@@ -234,6 +235,7 @@ export function DelegationSettingsSection() {
           <TabsTrigger value="agentDefaults">
             {t("tabAgentDefaults")}
           </TabsTrigger>
+          <TabsTrigger value="performance">{t("tabPerformance")}</TabsTrigger>
         </TabsList>
 
         {/* The kill switch and the two valves it gates are one decision, so
@@ -320,6 +322,12 @@ export function DelegationSettingsSection() {
             onChange={setAgentDefaults}
             disabled={loading || !enabled}
           />
+        </TabsContent>
+
+        {/* Read-only stats: delegation can be off while its history stays
+            meaningful, so this tab is not gated on the kill switch. */}
+        <TabsContent value="performance" className="pt-2">
+          <DelegationPerformancePanel />
         </TabsContent>
       </Tabs>
 

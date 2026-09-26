@@ -754,6 +754,7 @@
       "loadFailed": "Error al cargar la configuración de delegación: {detail}",
       "tabGeneral": "General",
       "tabAgentDefaults": "Valores por defecto del agente",
+      "tabPerformance": "Rendimiento",
       "agentDefaultsDescription": "Anulaciones por agente que se aplican cuando Colaboración multiagente inicia un subagente para una llamada de delegación. Las opciones mostradas provienen de un sondeo en vivo: lo que selecciones es exactamente lo que el agente aceptará.",
       "probing": "Cargando las opciones disponibles del agente…",
       "probeFailed": "Error al cargar las opciones: {detail}",
@@ -761,7 +762,29 @@
       "noConfigAvailable": "Este agente no tiene opciones configurables.",
       "modeLabel": "Modo",
       "agentDefaultHint": "Predeterminado del agente: {value}",
-      "defaultOptionLabel": "Predeterminado ({value})"
+      "defaultOptionLabel": "Predeterminado ({value})",
+      "performance": {
+        "loading": "Cargando el historial de delegaciones…",
+        "loadFailed": "Error al cargar los datos de rendimiento: {detail}",
+        "empty": "Aún no hay delegaciones registradas. Las ejecuciones de subagentes delegadas aparecerán aquí cuando uses la colaboración multiagente.",
+        "notRecorded": "Sin registrar",
+        "totalTasks": "Tareas",
+        "totalSuccess": "Tasa de éxito",
+        "totalRework": "Tasa de rehacer",
+        "totalAvgDuration": "Duración media",
+        "totalTokens": "Tokens",
+        "totalRunning": "En curso",
+        "byAgent": "Por agente",
+        "byModel": "Por modelo",
+        "colAgent": "Agente",
+        "colModel": "Modelo",
+        "colTasks": "Tareas",
+        "colSuccess": "Éxito",
+        "colAvgDuration": "Tiempo medio",
+        "colTokens": "Tokens",
+        "colRework": "Rehacer",
+        "footnote": "Las tasas de éxito y de rehacer se calculan solo sobre tareas terminadas; una tarea cuenta como rehecha cuando una delegación posterior la continuó en el mismo subagente. Los tokens y duraciones solo aparecen cuando el subagente los informó."
+      }
     },
     "actions": {
       "dragSort": "Arrastrar para reordenar",

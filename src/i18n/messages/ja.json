@@ -754,6 +754,7 @@
       "loadFailed": "委任設定の読み込みに失敗しました: {detail}",
       "tabGeneral": "一般",
       "tabAgentDefaults": "サブエージェント設定",
+      "tabPerformance": "パフォーマンス",
       "agentDefaultsDescription": "マルチエージェント連携が委任呼び出しのためにサブエージェントを起動するときに適用される上書き設定です。ここに表示されるオプションはライブプローブで取得しており、選択した内容がそのままエージェントに渡されます。",
       "probing": "エージェントの利用可能な設定項目を読み込み中…",
       "probeFailed": "設定項目の読み込みに失敗しました: {detail}",
@@ -761,7 +762,29 @@
       "noConfigAvailable": "このエージェントには設定可能な項目がありません。",
       "modeLabel": "モード",
       "agentDefaultHint": "エージェント既定: {value}",
-      "defaultOptionLabel": "既定（{value}）"
+      "defaultOptionLabel": "既定（{value}）",
+      "performance": {
+        "loading": "デリゲーション履歴を読み込み中…",
+        "loadFailed": "パフォーマンスデータの読み込みに失敗しました：{detail}",
+        "empty": "デリゲーション記録はまだありません。マルチエージェント連携で委譲したサブエージェントの実行がここに表示されます。",
+        "notRecorded": "未記録",
+        "totalTasks": "タスク数",
+        "totalSuccess": "成功率",
+        "totalRework": "手戻り率",
+        "totalAvgDuration": "平均時間",
+        "totalTokens": "トークン",
+        "totalRunning": "実行中",
+        "byAgent": "エージェント別",
+        "byModel": "モデル別",
+        "colAgent": "エージェント",
+        "colModel": "モデル",
+        "colTasks": "タスク数",
+        "colSuccess": "成功率",
+        "colAvgDuration": "平均時間",
+        "colTokens": "トークン",
+        "colRework": "手戻り",
+        "footnote": "成功率と手戻り率は終了したタスクのみから算出します。後続のデリゲーションが同じサブエージェントで続きを行ったタスクを手戻りと数えます。トークンと所要時間はサブエージェントが報告した場合のみ表示されます。"
+      }
     },
     "actions": {
       "dragSort": "ドラッグして並べ替え",

@@ -754,6 +754,7 @@
       "loadFailed": "載入委派設定失敗：{detail}",
       "tabGeneral": "一般",
       "tabAgentDefaults": "子智慧體設定",
+      "tabPerformance": "表現",
       "agentDefaultsDescription": "多智慧體協同在為委派呼叫啟動子智慧體時使用這些覆寫項。下方選項透過即時探測取得，所選即所用。",
       "probing": "正在載入該智慧體的可用設定項…",
       "probeFailed": "載入設定項失敗：{detail}",
@@ -761,7 +762,29 @@
       "noConfigAvailable": "該智慧體沒有可設定項。",
       "modeLabel": "模式",
       "agentDefaultHint": "智慧體預設：{value}",
-      "defaultOptionLabel": "預設（{value}）"
+      "defaultOptionLabel": "預設（{value}）",
+      "performance": {
+        "loading": "正在載入委派歷史…",
+        "loadFailed": "載入表現資料失敗：{detail}",
+        "empty": "還沒有委派記錄。使用多智能體協作委派的子智能體任務會顯示在這裡。",
+        "notRecorded": "未記錄",
+        "totalTasks": "任務數",
+        "totalSuccess": "成功率",
+        "totalRework": "重工率",
+        "totalAvgDuration": "平均時長",
+        "totalTokens": "Token",
+        "totalRunning": "進行中",
+        "byAgent": "依智能體",
+        "byModel": "依模型",
+        "colAgent": "智能體",
+        "colModel": "模型",
+        "colTasks": "任務數",
+        "colSuccess": "成功率",
+        "colAvgDuration": "平均時長",
+        "colTokens": "Token",
+        "colRework": "重工率",
+        "footnote": "成功率與重工率僅統計已結束的任務；任務被後續委派在同一子智能體上繼續時計為重工。Token 與時長只在子智能體上報時才會顯示。"
+      }
     },
     "actions": {
       "dragSort": "拖拽排序",
