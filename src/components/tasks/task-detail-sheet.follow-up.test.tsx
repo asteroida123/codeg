@@ -160,7 +160,8 @@ describe("task drawer follow-up", () => {
       7,
       "look at [retry.ts](file:///repo/retry.ts) again",
       "revise",
-      []
+      [],
+      false
     )
   })
 
@@ -206,6 +207,7 @@ describe("task drawer follow-up", () => {
       7,
       "run pnpm install first",
       [],
+      false,
       false
     )
   })
@@ -279,7 +281,8 @@ describe("task drawer follow-up", () => {
       7,
       "this note must survive",
       [],
-      true
+      true,
+      false
     )
   })
 
@@ -309,7 +312,7 @@ describe("task drawer follow-up", () => {
 
     await user.click(screen.getByRole("button", { name: /^send$/i }))
     await waitFor(() => expect(workTaskRetry).toHaveBeenCalledTimes(2))
-    expect(workTaskRetry).toHaveBeenLastCalledWith(7, null, [], false)
+    expect(workTaskRetry).toHaveBeenLastCalledWith(7, null, [], false, false)
   })
 
   it("follows up on a pasted screenshot with no prose", async () => {
@@ -327,7 +330,13 @@ describe("task drawer follow-up", () => {
     })
     await user.click(screen.getByRole("button", { name: /^send$/i }))
     await waitFor(() => expect(workTaskReturn).toHaveBeenCalledTimes(1))
-    expect(workTaskReturn).toHaveBeenCalledWith(7, "", "revise", editorBlocks)
+    expect(workTaskReturn).toHaveBeenCalledWith(
+      7,
+      "",
+      "revise",
+      editorBlocks,
+      false
+    )
   })
 
   it("refuses to send while an image upload is still in flight", async () => {

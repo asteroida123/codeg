@@ -106,8 +106,28 @@ describe("TaskRestartDialog", () => {
       7,
       "look at [retry.ts](file:///repo/retry.ts) first",
       [],
+      false,
       false
     )
+  })
+
+  it("carries the new-session choice, and offers it only on retry", async () => {
+    const user = userEvent.setup()
+    mount(task())
+    const checkbox = screen.getByRole("checkbox", {
+      name: "Start a new session",
+    })
+    await user.click(checkbox)
+    await user.click(screen.getByRole("button", { name: "Retry" }))
+    await waitFor(() => expect(workTaskRetry).toHaveBeenCalledTimes(1))
+    expect(workTaskRetry).toHaveBeenLastCalledWith(7, null, [], false, true)
+  })
+
+  it("has no new-session choice on a requeue", () => {
+    mount(task({ status: "canceled" }), "requeue")
+    expect(
+      screen.queryByRole("checkbox", { name: "Start a new session" })
+    ).not.toBeInTheDocument()
   })
 
   it("requeues with a null note when the box is untouched", async () => {
@@ -127,7 +147,13 @@ describe("TaskRestartDialog", () => {
     await user.click(screen.getByRole("button", { name: "Retry" }))
     await waitFor(() => expect(workTaskRetry).toHaveBeenCalledTimes(1))
     // No prose, but the image still reaches the next run as its own block.
-    expect(workTaskRetry).toHaveBeenCalledWith(7, null, editorBlocks, false)
+    expect(workTaskRetry).toHaveBeenCalledWith(
+      7,
+      null,
+      editorBlocks,
+      false,
+      false
+    )
   })
 
   it("refuses to send while an image upload is still in flight", async () => {
@@ -170,7 +196,8 @@ describe("TaskRestartDialog", () => {
       7,
       "the note survives the refusal",
       [],
-      true
+      true,
+      false
     )
   })
 
