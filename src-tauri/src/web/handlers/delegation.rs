@@ -13,13 +13,30 @@ use serde::Deserialize;
 use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
 use crate::commands::delegation::{
-    load_delegation_settings, set_delegation_settings_core, DelegationSettings,
+    list_delegated_child_sessions_core, load_delegation_settings,
+    set_delegation_settings_core, DelegationSettings,
 };
+use crate::db::service::delegation_task_service::DelegatedChildSession;
 
 pub async fn get_delegation_settings(
     Extension(state): Extension<Arc<AppState>>,
 ) -> Result<Json<DelegationSettings>, AppCommandError> {
     Ok(Json(load_delegation_settings(&state.db.conn).await))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListDelegatedChildSessionsParams {
+    pub parent_conversation_id: i32,
+}
+
+pub async fn list_delegated_child_sessions(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<ListDelegatedChildSessionsParams>,
+) -> Result<Json<Vec<DelegatedChildSession>>, AppCommandError> {
+    Ok(Json(
+        list_delegated_child_sessions_core(&state.db.conn, params.parent_conversation_id).await?,
+    ))
 }
 
 #[derive(Deserialize)]
