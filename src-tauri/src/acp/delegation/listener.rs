@@ -34,7 +34,8 @@ use crate::acp::delegation::transport::{
     BrokerTaskCompleteRequest, BrokerTaskProgressRequest,
 };
 use crate::acp::delegation::types::{
-    DelegationRequest, DelegationTaskReport, ResumeDelegationRequest, TaskStatus,
+    DelegationRequest, DelegationTaskReport, ResumeDelegationRequest, SelectorPreferences,
+    TaskStatus,
 };
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{QuestionOutcome, SessionQuestionAccess};
@@ -1107,6 +1108,21 @@ impl DelegationListener {
                 );
             }
         };
+        // Per-call selector preferences (`model` / `mode` / `reasoning_level`),
+        // the singulars of `get_delegation_capabilities`'s output fields. Shape
+        // only here — the broker validates each value against the same catalog
+        // that tool reports from. A blank string reads as "omitted" (the LLM
+        // filling the slot with empty text meant no preference), a non-string
+        // is a malformed call.
+        let selectors = match parse_selector_preferences(&req.input) {
+            Ok(selectors) => selectors,
+            Err(field) => {
+                return report_failed(
+                    "invalid_selector",
+                    &format!("{field} must be a string or null"),
+                );
+            }
+        };
 
         let delegation_req = DelegationRequest {
             parent_connection_id: req.parent_connection_id,
@@ -1118,6 +1134,7 @@ impl DelegationListener {
             requested_working_dir,
             continue_from_task_id,
             external_handle: req.external_handle,
+            selectors,
         };
         self.broker.start_delegation(delegation_req).await
     }
@@ -1344,6 +1361,7 @@ fn report_canceled(message: &str) -> DelegationTaskReport {
         message: Some(message.into()),
         duration_ms: None,
         blocked_on: None,
+        selectors: None,
     }
 }
 
@@ -1359,6 +1377,7 @@ fn report_failed(error_code: &str, message: &str) -> DelegationTaskReport {
         message: Some(message.into()),
         duration_ms: None,
         blocked_on: None,
+        selectors: None,
     }
 }
 
@@ -1375,6 +1394,7 @@ fn unknown_report(task_id: &str) -> DelegationTaskReport {
         message: Some("unknown task id".into()),
         duration_ms: None,
         blocked_on: None,
+        selectors: None,
     }
 }
 
@@ -1392,6 +1412,33 @@ fn invalid_agent_type(raw: &str) -> DelegationTaskReport {
 
 fn parse_agent_type(raw: &str) -> Option<AgentType> {
     serde_json::from_value(serde_json::Value::String(raw.to_string())).ok()
+}
+
+/// Read the optional per-call selector trio (`model` / `mode` /
+/// `reasoning_level`) out of a `delegate_to_agent` arguments object. Blank
+/// strings read as omitted; a non-string, non-null value is reported by field
+/// name so the caller can self-correct.
+fn parse_selector_preferences(
+    input: &serde_json::Value,
+) -> Result<SelectorPreferences, &'static str> {
+    let mut selectors = SelectorPreferences::default();
+    for (field, slot) in [
+        ("model", &mut selectors.model),
+        ("mode", &mut selectors.mode),
+        ("reasoning_level", &mut selectors.reasoning_level),
+    ] {
+        match input.get(field) {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(value)) => {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    *slot = Some(trimmed.to_string());
+                }
+            }
+            Some(_) => return Err(field),
+        }
+    }
+    Ok(selectors)
 }
 
 /// Whether `path` fits in `sockaddr_un::sun_path`.
@@ -2000,6 +2047,103 @@ mod tests {
         assert!(report.message.unwrap().contains("invalid token"));
     }
 
+    /// The `delegate_to_agent` argument trio (`model` / `mode` /
+    /// `reasoning_level`) rides `input` verbatim from the companion; the
+    /// listener parses it into `DelegationRequest.selectors`, the broker
+    /// maps it onto the spawn preferences (all-unknown catalog here → the
+    /// conventional wire ids), and the Running ack carries the requested trio
+    /// back for drift reporting.
+    #[tokio::test]
+    async fn selector_arguments_flow_into_the_delegation_request() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-sel".into())).await;
+        mock.queue_send(Ok(42)).await;
+        let broker = make_broker(mock.clone()).await;
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry {
+                    parent_connection_id: "parent-conn".into(),
+                    working_dir: PathBuf::from("/tmp"),
+                },
+            )
+            .await;
+        let listener = make_listener(broker, tokens, Some(1));
+
+        let report = listener
+            .process(
+                make_request(json!({
+                    "agent_type": "codex",
+                    "task": "do x",
+                    "model": "gpt-6-sol",
+                    "mode": "  full-auto  ",
+                    "reasoning_level": null,
+                }))
+                .await,
+            )
+            .await;
+        assert_eq!(report.status, TaskStatus::Running, "{report:?}");
+        let selectors = report.selectors.as_ref().expect("ack carries selectors");
+        assert_eq!(selectors.requested.model.as_deref(), Some("gpt-6-sol"));
+        // Whitespace is trimmed; null reads as omitted.
+        assert_eq!(selectors.requested.mode.as_deref(), Some("full-auto"));
+        assert!(selectors.requested.reasoning_level.is_none());
+        // The mock spawner never reports an effective snapshot, and the
+        // unknown-catalog broker forwarded the preferences under the
+        // conventional ids.
+        assert!(selectors.effective.is_none());
+        let args = mock.spawn_args.lock().await;
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].preferred_mode_id.as_deref(), Some("full-auto"));
+        assert_eq!(
+            args[0].preferred_config_values,
+            std::collections::BTreeMap::from([("model".to_string(), "gpt-6-sol".to_string())])
+        );
+    }
+
+    /// A malformed selector argument (non-string, non-null) is a failed call
+    /// naming the field, not a silent omission.
+    #[tokio::test]
+    async fn malformed_selector_argument_fails_naming_the_field() {
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry {
+                    parent_connection_id: "parent-conn".into(),
+                    working_dir: PathBuf::from("/tmp"),
+                },
+            )
+            .await;
+        let listener = make_listener(
+            make_broker(Arc::new(MockSpawner::new())).await,
+            tokens,
+            Some(1),
+        );
+        let report = listener
+            .process(
+                make_request(json!({
+                    "agent_type": "codex",
+                    "task": "do x",
+                    "reasoning_level": 11,
+                }))
+                .await,
+            )
+            .await;
+        assert_eq!(report.status, TaskStatus::Failed);
+        assert_eq!(report.error_code.as_deref(), Some("invalid_selector"));
+        assert!(
+            report
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("reasoning_level must be a string or null"),
+            "message: {:?}",
+            report.message
+        );
+    }
+
     #[tokio::test]
     async fn token_parent_mismatch_rejected() {
         let tokens = Arc::new(TokenRegistry::default());
@@ -2177,6 +2321,7 @@ mod tests {
                 requested_working_dir: None,
                 continue_from_task_id: None,
                 external_handle: None,
+                selectors: SelectorPreferences::default(),
             })
             .await;
         let task_id = ack.task_id.clone().expect("running task carries an id");
@@ -2331,6 +2476,7 @@ mod tests {
                         requested_working_dir: None,
                         continue_from_task_id: None,
                         external_handle: None,
+                        selectors: SelectorPreferences::default(),
                     })
                     .await
                     .task_id
@@ -2434,6 +2580,7 @@ mod tests {
                 requested_working_dir: None,
                 continue_from_task_id: None,
                 external_handle: None,
+                selectors: SelectorPreferences::default(),
             })
             .await;
         let task_id = ack.task_id.clone().unwrap();
@@ -2485,6 +2632,7 @@ mod tests {
                     working_dir: None,
                     requested_working_dir: None,
                     continue_from_task_id: None,
+                    selectors: SelectorPreferences::default(),
                     external_handle: Some("h-1".into()),
                 };
                 broker.handle_request(req).await

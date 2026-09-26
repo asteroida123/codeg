@@ -279,7 +279,10 @@ impl ConnectionSpawner for FixtureContinuationSpawner {
         })
         .await
         .map_err(|_| SpawnerError::Send("fixture continuation prompt timed out".into()))?;
-        Ok(DelegationDispatch::Started(self.child_conversation_id))
+        Ok(DelegationDispatch::Started {
+            child_conversation_id: self.child_conversation_id,
+            effective: None,
+        })
     }
 
     async fn spawn_for_resume(
@@ -535,6 +538,7 @@ fn durable_continuation_reopens_the_source_session_and_admits_one_successor() {
             message: None,
             duration_ms: Some(1),
             blocked_on: None,
+            selectors: None,
         };
         assert!(
             ledger::finish(&db.conn, parent.id, source_task_id, &source_report)
@@ -588,6 +592,7 @@ fn durable_continuation_reopens_the_source_session_and_admits_one_successor() {
                 requested_working_dir: Some(working_dir),
                 continue_from_task_id: Some(source_task_id.into()),
                 external_handle: None,
+                selectors: Default::default(),
             })
             .await;
         assert_eq!(ack.status, TaskStatus::Running, "{ack:?}");

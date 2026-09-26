@@ -3102,6 +3102,7 @@ mod tests {
             requested_working_dir: None,
             continue_from_task_id: None,
             external_handle: None,
+            selectors: Default::default(),
         }
     }
 

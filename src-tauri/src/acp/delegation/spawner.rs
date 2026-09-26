@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 
-use super::types::DelegationTaskReport;
+use super::types::{AppliedSelectors, DelegationTaskReport};
 use crate::db::service::delegation_task_service::ResumeBinding;
 use crate::models::agent::AgentType;
 
@@ -47,7 +47,16 @@ pub struct DelegationAdmission {
 
 #[derive(Debug, Clone)]
 pub enum DelegationDispatch {
-    Started(i32),
+    /// The prompt was dispatched and a new ledger row (or legacy child row)
+    /// was bound. `effective` carries the child session's selector snapshot
+    /// at admission time — what launch-time preferences actually landed —
+    /// so the broker can report requested-vs-effective drift. `None` on
+    /// paths that never read a snapshot (mock spawners, the legacy
+    /// no-admission shim).
+    Started {
+        child_conversation_id: i32,
+        effective: Option<AppliedSelectors>,
+    },
     Existing(DelegationTaskReport),
     Conflict {
         next_task_id: String,
@@ -310,7 +319,27 @@ pub mod mock {
             self.send_results
                 .lock()
                 .await
-                .push_back(r.map(DelegationDispatch::Started));
+                .push_back(r.map(|cid| DelegationDispatch::Started {
+                    child_conversation_id: cid,
+                    effective: None,
+                }));
+        }
+
+        /// `queue_send`, but the started dispatch also carries the effective
+        /// selector snapshot — for tests that assert the requested-vs-
+        /// effective drift report.
+        pub async fn queue_send_with_effective(
+            &self,
+            cid: i32,
+            effective: Option<AppliedSelectors>,
+        ) {
+            self.send_results
+                .lock()
+                .await
+                .push_back(Ok(DelegationDispatch::Started {
+                    child_conversation_id: cid,
+                    effective,
+                }));
         }
 
         pub async fn queue_dispatch(&self, dispatch: DelegationDispatch) {

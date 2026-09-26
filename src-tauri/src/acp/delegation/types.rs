@@ -38,6 +38,60 @@ impl AgentDelegationDefaults {
     }
 }
 
+/// Per-call selector preferences a `delegate_to_agent` caller attached to ONE
+/// call (`model` / `mode` / `reasoning_level` tool arguments). The names are
+/// the singulars of `get_delegation_capabilities`'s output fields, so the LLM
+/// that just read the lists knows exactly what to pass back.
+///
+/// Semantics follow 5bd912ca ("treat resumed selectors as preferences"):
+/// these are PREFERENCES, not hard constraints. The broker validates them
+/// against the same capability catalog the tool reports from — a known list
+/// that does not contain the value is rejected as a typo, an unknown list
+/// passes the value through for the agent to apply or ignore — and the task
+/// report carries requested vs effective so any drift is visible. Per-call
+/// values override [`AgentDelegationDefaults`] for this one call without
+/// touching the configured defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectorPreferences {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_level: Option<String>,
+}
+
+impl SelectorPreferences {
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none() && self.mode.is_none() && self.reasoning_level.is_none()
+    }
+}
+
+/// The selector state a child session ACTUALLY launched with: the effective
+/// mode plus every advertised config option's current value, read from the
+/// child's admission snapshot after launch-time preferences were applied.
+/// Reported next to [`SelectorPreferences`] so "requested X, running with Y"
+/// is visible to the caller (and captured in the ledger's `resume_binding`,
+/// which is built from the same snapshot).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedSelectors {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config_values: BTreeMap<String, String>,
+}
+
+/// What one delegation asked for selector-wise and what it got. Carried on
+/// [`DelegationTaskReport`] only when the caller asked for selectors;
+/// `effective` is `None` on paths that never read a child snapshot (mock
+/// spawners, failures before admission).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationSelectorReport {
+    pub requested: SelectorPreferences,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective: Option<AppliedSelectors>,
+}
+
 /// Everything the broker needs to dispatch a single delegation call.
 ///
 /// `parent_connection_id` is the codeg-internal ACP connection UUID for the
@@ -73,6 +127,12 @@ pub struct DelegationRequest {
     pub continue_from_task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_handle: Option<String>,
+    /// Per-call selector preferences (`model` / `mode` / `reasoning_level`).
+    /// Empty for every caller that didn't ask — including all pre-existing
+    /// callers. Rejected on continuations: `continue_from_task_id` strictly
+    /// restores the source task's selectors.
+    #[serde(default, skip_serializing_if = "SelectorPreferences::is_empty")]
+    pub selectors: SelectorPreferences,
 }
 
 /// Everything the broker needs to resume one interrupted delegation task.
@@ -134,6 +194,18 @@ pub enum DelegationError {
     DepthLimitExceeded { current_depth: u32, limit: u32 },
     #[error("invalid agent type")]
     InvalidAgentType,
+    /// A per-call selector preference whose spelling the capability catalog
+    /// positively contradicts: the agent's list is KNOWN and does not contain
+    /// the value (a typo, or a value that belongs to another agent). The
+    /// accepted spellings ride along so the caller can self-correct in one
+    /// retry. Only raised against a KNOWN list — an unknown capability source
+    /// passes the value through as a preference instead.
+    #[error("invalid {field} {value:?}: not one of this agent's known options (accepted: {accepted:?})")]
+    InvalidSelector {
+        field: String,
+        value: String,
+        accepted: Vec<String>,
+    },
     #[error("invalid working dir: {0}")]
     InvalidWorkingDir(String),
     #[error("spawn failed: {0}")]
@@ -299,6 +371,12 @@ pub struct DelegationTaskReport {
     /// presence, and neither breaks a consumer that doesn't know the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_on: Option<BlockedOn>,
+    /// Per-call selector preferences this call requested and what the child
+    /// actually launched with. Present only when the caller asked for
+    /// `model` / `mode` / `reasoning_level`; absent fields are ignored by
+    /// every consumer that predates them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selectors: Option<DelegationSelectorReport>,
 }
 
 impl DelegationOutcome {
@@ -309,6 +387,7 @@ impl DelegationOutcome {
         let code = match &err {
             DelegationError::DepthLimitExceeded { .. } => "depth_limit",
             DelegationError::InvalidAgentType => "invalid_agent_type",
+            DelegationError::InvalidSelector { .. } => "invalid_selector",
             DelegationError::InvalidWorkingDir(_) => "invalid_working_dir",
             DelegationError::SpawnFailed(_) => "spawn_failed",
             DelegationError::ContinuationBusy(_) => "continuation_busy",
@@ -360,6 +439,14 @@ mod tests {
                 DelegationError::ChildUnknown("whatever".into()),
                 "child_unknown",
             ),
+            (
+                DelegationError::InvalidSelector {
+                    field: "model".into(),
+                    value: "gpt-6-typo".into(),
+                    accepted: vec!["gpt-6-astra".into(), "gpt-6-sol".into()],
+                },
+                "invalid_selector",
+            ),
         ];
         for (err, expected) in cases {
             let display = err.to_string();
@@ -380,5 +467,62 @@ mod tests {
             unreachable!()
         };
         assert!(message.contains("sign in"), "message was {message:?}");
+    }
+
+    /// Per-call selector preferences cross two serde boundaries (listener →
+    /// broker structs, and the report the companion renders): pin that an
+    /// absent trio serializes to NOTHING (pre-existing payloads stay
+    /// byte-identical) and a present trio round-trips losslessly.
+    #[test]
+    fn selector_preferences_serialize_additively() {
+        // Absent selectors leave the request shape unchanged.
+        let base = serde_json::to_value(SelectorPreferences::default()).unwrap();
+        assert_eq!(base, serde_json::json!({}));
+
+        let prefs = SelectorPreferences {
+            model: Some("gpt-6-sol".into()),
+            mode: Some("full-auto".into()),
+            reasoning_level: None,
+        };
+        let v = serde_json::to_value(&prefs).unwrap();
+        assert_eq!(v["model"], "gpt-6-sol");
+        assert_eq!(v["mode"], "full-auto");
+        assert!(v.get("reasoning_level").is_none());
+        let back: SelectorPreferences = serde_json::from_value(v).unwrap();
+        assert_eq!(back, prefs);
+        assert!(!prefs.is_empty());
+    }
+
+    /// The drift report: requested preferences plus the effective selector
+    /// snapshot, both skipping their empty halves so a report for a call that
+    /// asked only for a model stays compact.
+    #[test]
+    fn selector_report_round_trips_requested_and_effective() {
+        let report = DelegationSelectorReport {
+            requested: SelectorPreferences {
+                model: Some("gpt-6-sol".into()),
+                ..SelectorPreferences::default()
+            },
+            effective: Some(AppliedSelectors {
+                mode: Some("default".into()),
+                config_values: BTreeMap::from([
+                    (String::from("model"), String::from("gpt-6-astra")),
+                ]),
+            }),
+        };
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["requested"]["model"], "gpt-6-sol");
+        assert_eq!(v["effective"]["mode"], "default");
+        assert_eq!(v["effective"]["config_values"]["model"], "gpt-6-astra");
+        let back: DelegationSelectorReport = serde_json::from_value(v).unwrap();
+        assert_eq!(back, report);
+
+        // An empty effective half serializes to nothing, not null.
+        let bare = serde_json::to_value(DelegationSelectorReport {
+            requested: SelectorPreferences::default(),
+            effective: None,
+        })
+        .unwrap();
+        assert!(bare.get("effective").is_none());
     }
 }
