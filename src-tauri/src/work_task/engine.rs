@@ -654,6 +654,21 @@ impl TaskEngine {
             .await
             .map_err(|e| e.to_string())?;
         self.preflight_folder(task.folder_id).await?;
+        // The orchestration gate is enforced inside the claim, which loses the
+        // CAS on a blocked task and would report a bare "not in todo". Ask the
+        // same derivation first so a blocked start explains itself: the board
+        // already shows `blocked`, and this is the voice of the Start button.
+        if task.status == WorkTaskStatus::Todo {
+            if let Some(blocked) = work_task_service::blocked_for(&self.db.conn, &task)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                return Err(format!(
+                    "this task cannot start yet: {}",
+                    work_task_service::blocked_message(&blocked)
+                ));
+            }
+        }
         match work_task_service::claim_for_run(&self.db.conn, task_id, WorkTaskStatus::Todo, "user")
             .await
             .map_err(|e| e.to_string())?
