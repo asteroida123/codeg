@@ -1312,6 +1312,86 @@ fn render_batch_report(tasks: &[Value]) -> Value {
 /// canceled task), and `unknown` are all valid tool results the LLM should read
 /// rather than treat as errors. The full report rides along in
 /// `structuredContent` so the frontend can read `status` + the child ids.
+/// When the call carried per-call selector preferences, a trailing
+/// "Selectors:" line renders requested vs effective VERBATIM (no
+/// interpretation — the renderer does not know which config option is the
+/// model) so hosts that surface only the content text still see the drift.
+pub fn render_task_report(report: &Value) -> Value {
+    let status = report.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    let is_error = status == "failed";
+    let report_str = |key: &str| {
+        report
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+    };
+    let mut text = if status == "completed" {
+        // Prefer the result text; fall back to `message` so the DB-fallback note
+        // ("Result no longer cached; open child session N…") for an evicted
+        // result isn't rendered as empty content.
+        report_str("text")
+            .or_else(|| report_str("message"))
+            .unwrap_or("")
+            .to_string()
+    } else {
+        report_str("message")
+            .or_else(|| report_str("text"))
+            .unwrap_or("")
+            .to_string()
+    };
+    if let Some(line) = render_selector_drift_line(report.get("selectors")) {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&line);
+    }
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": is_error,
+        "structuredContent": report.clone(),
+    })
+}
+
+/// One verbatim line describing a report's `selectors` (requested vs
+/// effective), or `None` when the call asked for none. Rendering is purely
+/// mechanical — requested trio on the left, effective mode + config values on
+/// the right — because only the broker knows which config-option id is the
+/// model; the reader compares the ids themselves.
+fn render_selector_drift_line(selectors: Option<&Value>) -> Option<String> {
+    let selectors = selectors?;
+    let requested = selectors.get("requested")?;
+    let mut parts: Vec<String> = Vec::new();
+    for field in ["model", "mode", "reasoning_level"] {
+        if let Some(value) = requested.get(field).and_then(|v| v.as_str()) {
+            parts.push(format!("{field}={value}"));
+        }
+    }
+    // A report with no requested fields carries nothing worth a line.
+    if parts.is_empty() {
+        return None;
+    }
+    let mut line = format!("Selectors requested: {}", parts.join(", "));
+    if let Some(effective) = selectors.get("effective") {
+        let mut got: Vec<String> = Vec::new();
+        if let Some(mode) = effective.get("mode").and_then(|v| v.as_str()) {
+            got.push(format!("mode={mode}"));
+        }
+        if let Some(config) = effective.get("config_values").and_then(|v| v.as_object()) {
+            for (id, value) in config {
+                if let Some(value) = value.as_str() {
+                    got.push(format!("{id}={value}"));
+                }
+            }
+        }
+        if !got.is_empty() {
+            line.push_str(&format!("; effective: {}", got.join(", ")));
+        } else {
+            line.push_str("; effective: not yet reported");
+        }
+    }
+    Some(line)
+}
+
 /// Map the `check_user_feedback` round-trip outcome (a `{ count, feedback:[..] }`
 /// envelope from the listener) into an MCP `tools/call` result.
 ///
@@ -2632,36 +2712,6 @@ fn render_session_summary_text(o: &Value) -> String {
     out
 }
 
-pub fn render_task_report(report: &Value) -> Value {
-    let status = report.get("status").and_then(|v| v.as_str()).unwrap_or("");
-    let is_error = status == "failed";
-    let report_str = |key: &str| {
-        report
-            .get(key)
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-    };
-    let text = if status == "completed" {
-        // Prefer the result text; fall back to `message` so the DB-fallback note
-        // ("Result no longer cached; open child session N…") for an evicted
-        // result isn't rendered as empty content.
-        report_str("text")
-            .or_else(|| report_str("message"))
-            .unwrap_or("")
-            .to_string()
-    } else {
-        report_str("message")
-            .or_else(|| report_str("text"))
-            .unwrap_or("")
-            .to_string()
-    };
-    json!({
-        "content": [{ "type": "text", "text": text }],
-        "isError": is_error,
-        "structuredContent": report.clone(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2773,6 +2823,30 @@ mod tests {
         assert!(status["inputSchema"]["properties"]["wait_ms"].is_object());
         let required = status["inputSchema"]["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v == "task_ids"));
+        // delegate_to_agent now takes the three OPTIONAL per-call selector
+        // preferences, named as the singulars of get_delegation_capabilities's
+        // output fields; none of them is required, and the schema's required
+        // list stays [agent_type, task].
+        let delegate_props = delegate["inputSchema"]["properties"].as_object().unwrap();
+        for param in ["model", "mode", "reasoning_level"] {
+            assert!(
+                delegate_props.get(param).is_some_and(|p| p.is_object()),
+                "delegate_to_agent must declare {param}"
+            );
+        }
+        let delegate_required = delegate["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .to_vec();
+        assert_eq!(delegate_required.len(), 2);
+        assert!(delegate_required.iter().any(|v| v == "agent_type"));
+        assert!(delegate_required.iter().any(|v| v == "task"));
+        for param in ["model", "mode", "reasoning_level"] {
+            assert!(
+                !delegate_required.iter().any(|v| v == param),
+                "{param} must stay optional"
+            );
+        }
         // get_delegation_capabilities takes only the OPTIONAL agent_type
         // filter — nothing is required, so an unfiltered listing works.
         let capabilities = tools
@@ -3084,6 +3158,76 @@ mod tests {
         assert_eq!(
             rendered["content"][0]["text"],
             "Result no longer cached; open child session 7 for the full output."
+        );
+    }
+
+    /// A report carrying per-call selectors appends ONE verbatim drift line to
+    /// the content text — requested trio on the left, effective mode + config
+    /// values on the right — so hosts that surface only `content` still see
+    /// that the child launched with a different model than requested.
+    #[test]
+    fn render_task_report_appends_the_selector_drift_line() {
+        let report = json!({
+            "task_id": "t1",
+            "status": "running",
+            "message": "running in background",
+            "selectors": {
+                "requested": {
+                    "model": "gpt-6-sol",
+                    "mode": "full-auto",
+                    "reasoning_level": "high"
+                },
+                "effective": {
+                    "mode": "default",
+                    "config_values": {
+                        "model": "gpt-6-astra",
+                        "reasoning_effort": "high"
+                    }
+                }
+            }
+        });
+        let rendered = render_task_report(&report);
+        let text = rendered["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("running in background\nSelectors requested: "),
+            "text: {text:?}"
+        );
+        assert!(text.contains("model=gpt-6-sol"), "text: {text:?}");
+        assert!(text.contains("mode=full-auto"), "text: {text:?}");
+        assert!(text.contains("reasoning_level=high"), "text: {text:?}");
+        assert!(text.contains("effective: mode=default"), "text: {text:?}");
+        assert!(text.contains("model=gpt-6-astra"), "text: {text:?}");
+        // The structured payload rides along untouched.
+        assert_eq!(
+            rendered["structuredContent"]["selectors"]["requested"]["model"],
+            "gpt-6-sol"
+        );
+    }
+
+    /// Reports WITHOUT selectors render exactly as before — no trailing line,
+    /// byte-identical content text.
+    #[test]
+    fn render_task_report_without_selectors_adds_no_line() {
+        let report = json!({
+            "task_id": "t1",
+            "status": "running",
+            "message": "running in background"
+        });
+        let rendered = render_task_report(&report);
+        assert_eq!(
+            rendered["content"][0]["text"].as_str().unwrap(),
+            "running in background"
+        );
+        // An empty requested trio (nothing asked) is not worth a line either.
+        let empty = json!({
+            "status": "running",
+            "message": "running in background",
+            "selectors": {"requested": {}, "effective": null}
+        });
+        let rendered = render_task_report(&empty);
+        assert_eq!(
+            rendered["content"][0]["text"].as_str().unwrap(),
+            "running in background"
         );
     }
 

@@ -429,6 +429,7 @@ pub async fn boot_reconcile_interrupted(conn: &DatabaseConnection) -> Result<u64
                 ),
                 duration_ms: None,
                 blocked_on: None,
+                selectors: None,
             };
             active.status = Set(status_string(TaskStatus::Unknown));
             active.terminal_report = Set(Some(serde_json::to_string(&report).map_err(|e| {
@@ -613,6 +614,7 @@ fn running_report(
         message: None,
         duration_ms: None,
         blocked_on: None,
+        selectors: None,
     }
 }
 
@@ -765,6 +767,7 @@ mod tests {
             message: None,
             duration_ms: Some(12),
             blocked_on: None,
+            selectors: None,
         }
     }
 

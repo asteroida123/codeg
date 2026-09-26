@@ -315,6 +315,198 @@ async fn end_to_end_uds_happy_path() {
     assert_eq!(resp.outcome["tasks"][0]["child_conversation_id"], 77);
 }
 
+/// Per-call selector preferences end to end: the trio rides the raw
+/// `input` JSON through the UDS frame, the listener parses it into
+/// `DelegationRequest.selectors`, the broker validates it against a wired
+/// capability catalog and maps it onto the spawn preferences, and BOTH the
+/// Running ack and the post-completion status poll carry the requested-vs-
+/// effective report over the wire.
+#[tokio::test]
+async fn end_to_end_uds_per_call_selectors_report_drift() {
+    /// One canned KNOWN entry for codex — the same shape
+    /// `ConnectionManagerCapabilityCatalog` serves from advertisements.
+    struct CodexCapabilities;
+    #[async_trait]
+    impl codeg_lib::acp::capability_catalog::CapabilityCatalogAccess for CodexCapabilities {
+        async fn resolve(
+            &self,
+            agent_type: Option<&str>,
+        ) -> codeg_lib::acp::capability_catalog::CapabilitiesReport {
+            use codeg_lib::acp::capability_catalog as cc;
+            if agent_type.is_some_and(|slug| slug != "codex") {
+                return cc::CapabilitiesReport::default();
+            }
+            cc::CapabilitiesReport {
+                agents: vec![cc::AgentCapabilities {
+                    agent_type: "codex".into(),
+                    display_name: "Codex".into(),
+                    models: vec!["gpt-6-astra".into(), "gpt-6-sol".into()],
+                    modes: vec!["default".into(), "full-auto".into()],
+                    reasoning_levels: vec!["low".into(), "high".into()],
+                    model_option_id: Some("model".into()),
+                    reasoning_option_id: Some("reasoning_effort".into()),
+                    source: cc::CapabilitySource::Advertised,
+                    notes: Vec::new(),
+                }],
+                note: None,
+            }
+        }
+    }
+
+    let mock = Arc::new(MockSpawner::new());
+    mock.queue_spawn(Ok("child-sel".into())).await;
+    // The admission snapshot lands a DIFFERENT model than requested — the
+    // exact drift the report exists to surface.
+    mock.queue_send_with_effective(
+        79,
+        Some(codeg_lib::acp::delegation::types::AppliedSelectors {
+            mode: Some("default".into()),
+            config_values: [
+                ("model".to_string(), "gpt-6-astra".to_string()),
+                ("reasoning_effort".to_string(), "high".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        }),
+    )
+    .await;
+
+    let broker = Arc::new(
+        DelegationBroker::new(
+            mock.clone() as Arc<dyn ConnectionSpawner>,
+            Arc::new(AlwaysRoot) as Arc<dyn ConversationDepthLookup>,
+        )
+        .with_capability_catalog(Arc::new(CodexCapabilities)),
+    );
+    broker
+        .set_config(DelegationConfig {
+            enabled: true,
+            depth_limit: 8,
+            ..DelegationConfig::default()
+        })
+        .await;
+
+    let tokens = Arc::new(TokenRegistry::default());
+    tokens
+        .register(
+            "tok".into(),
+            TokenEntry {
+                parent_connection_id: "p1".into(),
+                working_dir: PathBuf::from("/tmp"),
+            },
+        )
+        .await;
+
+    let listener = DelegationListener::new(
+        broker.clone(),
+        tokens,
+        Arc::new(FixedParent(1)) as Arc<dyn ParentSessionLookup>,
+        Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
+        Arc::new(StubQuestions::default()) as Arc<dyn SessionQuestionAccess>,
+        Arc::new(NoSessionInfo) as Arc<dyn codeg_lib::acp::session_info::SessionInfoAccess>,
+        Arc::new(NoTaskTools) as Arc<dyn codeg_lib::acp::work_task_tools::WorkTaskToolAccess>,
+        Arc::new(NoAuthoring) as Arc<dyn codeg_lib::acp::chat_authoring::ChatAuthoringAccess>,
+        Arc::new(codeg_lib::acp::browser_tools::NoBrowserTabs)
+            as Arc<dyn codeg_lib::acp::browser_tools::BrowserToolAccess>,
+        Arc::new(NoCapabilities)
+            as Arc<dyn codeg_lib::acp::capability_catalog::CapabilityCatalogAccess>,
+    );
+
+    let dir = socket_dir();
+    let socket = dir.path().join("codeg-e2e-selectors.sock");
+    let socket_for_listener = socket.clone();
+    let listener_task = tokio::spawn(async move {
+        let _ = listener.run(socket_for_listener).await;
+    });
+    for _ in 0..50 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(socket.exists(), "listener never bound the socket");
+
+    // 1. delegate_to_agent with the selector trio → the preferences reached
+    //    the spawner under the catalog's wire ids.
+    let req = BrokerRequest {
+        token: "tok".into(),
+        parent_connection_id: "p1".into(),
+        parent_tool_use_id: "pt-sel".into(),
+        external_handle: None,
+        input: json!({
+            "agent_type": "codex",
+            "task": "do x",
+            "model": "gpt-6-sol",
+            "mode": "full-auto",
+            "reasoning_level": "high",
+        }),
+    };
+    let ack = client_round_trip(&socket.to_string_lossy(), &req)
+        .await
+        .expect("client round-trip");
+    assert_eq!(ack.outcome["status"], "running", "ack: {}", ack.outcome);
+    assert_eq!(
+        ack.outcome["selectors"]["requested"]["model"], "gpt-6-sol",
+        "ack: {}",
+        ack.outcome
+    );
+    assert_eq!(ack.outcome["selectors"]["requested"]["mode"], "full-auto");
+    // THE DRIFT, over the wire: requested sol, launched astra.
+    assert_eq!(
+        ack.outcome["selectors"]["effective"]["config_values"]["model"], "gpt-6-astra",
+        "ack: {}",
+        ack.outcome
+    );
+    let task_id = ack.outcome["task_id"].as_str().unwrap().to_string();
+
+    let spawn_args = mock.spawn_args.lock().await;
+    assert_eq!(spawn_args.len(), 1);
+    assert_eq!(spawn_args[0].preferred_mode_id.as_deref(), Some("full-auto"));
+    assert_eq!(
+        spawn_args[0].preferred_config_values.get("model").map(String::as_str),
+        Some("gpt-6-sol")
+    );
+    assert_eq!(
+        spawn_args[0]
+            .preferred_config_values
+            .get("reasoning_effort")
+            .map(String::as_str),
+        Some("high")
+    );
+    drop(spawn_args);
+
+    // 2. Terminal resolution, then the status poll still reports the drift.
+    broker
+        .complete_call(
+            &task_id,
+            DelegationOutcome::Ok(DelegationSuccess {
+                text: "selected-result".into(),
+                child_conversation_id: 79,
+                child_agent_type: AgentType::Codex,
+                turn_count: 1,
+                duration_ms: 9,
+                token_usage: None,
+            }),
+        )
+        .await;
+    let status_req = BrokerStatusRequest {
+        token: "tok".into(),
+        task_ids: vec![task_id],
+        wait_ms: Some(1_000),
+    };
+    let resp = client_status_round_trip(&socket.to_string_lossy(), &status_req)
+        .await
+        .expect("status round-trip");
+    listener_task.abort();
+
+    assert_eq!(resp.outcome["tasks"][0]["status"], "completed");
+    assert_eq!(resp.outcome["tasks"][0]["selectors"]["requested"]["model"], "gpt-6-sol");
+    assert_eq!(
+        resp.outcome["tasks"][0]["selectors"]["effective"]["config_values"]["model"],
+        "gpt-6-astra"
+    );
+}
+
 /// Batch `get_delegation_status` over the wire: two delegations are started,
 /// one completes, and a single status round-trip with `task_ids: [t1, t2]`
 /// returns both reports in request order — `t1` completed, `t2` still running.

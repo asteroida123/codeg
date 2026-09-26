@@ -38,6 +38,20 @@ use serde_json::Value;
 
 use crate::acp::types::{SessionConfigKindInfo, SessionConfigOptionInfo, SessionModeStateInfo};
 
+/// The conventional config-option id of a model selector when no source named
+/// the real one. This is the id `session/set_config_option` uses across the
+/// agents codeg knows (and the id codeg itself synthesizes for Grok), so it is
+/// the honest default for forwarding a model preference whose wire id is
+/// unknown — the agent may still ignore it, and the drift is visible in the
+/// delegation result.
+pub const MODEL_CONFIG_OPTION_ID: &str = "model";
+
+/// The conventional config-option id of a reasoning / thought-level selector
+/// when no source named the real one — the id codeg itself synthesizes for
+/// Grok's effort selector. Same preference semantics as
+/// [`MODEL_CONFIG_OPTION_ID`].
+pub const REASONING_EFFORT_CONFIG_OPTION_ID: &str = "reasoning_effort";
+
 /// Upper bound on a config file this module is willing to parse. The catalogs
 /// are small (tens of models); a file bigger than this is not a catalog but a
 /// mistake, and refusing it keeps the tool bounded no matter what landed on
@@ -82,6 +96,18 @@ pub struct AgentCapabilities {
     /// Reasoning-effort / thought-level ids the agent accepts (per-model
     /// where the source is per-model — see `notes`).
     pub reasoning_levels: Vec<String>,
+    /// The config-option id (`session/set_config_option` target) the model
+    /// selector is published under, when a source identified one. Advertised
+    /// entries know it — the option was on the wire; static catalog
+    /// projections know the VALUES, not the agent's wire id, and leave this
+    /// `None` so a caller forwarding a preference falls back to the
+    /// conventional [`MODEL_CONFIG_OPTION_ID`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_option_id: Option<String>,
+    /// Same as [`AgentCapabilities::model_option_id`] for the reasoning /
+    /// thought-level selector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_option_id: Option<String>,
     pub source: CapabilitySource,
     /// Honest caveats: what is missing, why, and how it would surface. Also
     /// carries per-model qualifications a flat list cannot (e.g. codex's
@@ -99,6 +125,8 @@ impl AgentCapabilities {
             models: Vec::new(),
             modes: Vec::new(),
             reasoning_levels: Vec::new(),
+            model_option_id: None,
+            reasoning_option_id: None,
             source: CapabilitySource::Unknown,
             notes: vec![
                 "No static catalog and no cached advertisement for this agent; its \
@@ -161,7 +189,7 @@ fn push_unique(out: &mut Vec<String>, values: impl IntoIterator<Item = String>) 
 /// Whether a config option is the MODEL selector: ACP's `category: "model"`,
 /// or the conventional `model` id (Grok's synthesized selector uses both).
 fn is_model_option(option: &SessionConfigOptionInfo) -> bool {
-    option.category.as_deref() == Some("model") || option.id == "model"
+    option.category.as_deref() == Some("model") || option.id == MODEL_CONFIG_OPTION_ID
 }
 
 /// Whether a config option is the REASONING selector: ACP's
@@ -169,7 +197,8 @@ fn is_model_option(option: &SessionConfigOptionInfo) -> bool {
 /// carries. Deliberately narrow — an id weaselled out of a substring match
 /// (`"reasoning_mode"`…) is a guess, and this module does not guess.
 fn is_reasoning_option(option: &SessionConfigOptionInfo) -> bool {
-    option.category.as_deref() == Some("thought_level") || option.id == "reasoning_effort"
+    option.category.as_deref() == Some("thought_level")
+        || option.id == REASONING_EFFORT_CONFIG_OPTION_ID
 }
 
 /// Project a live session's advertised selectors (the same
@@ -187,12 +216,20 @@ pub fn from_advertised(
 ) -> AgentCapabilities {
     let mut models = Vec::new();
     let mut reasoning = Vec::new();
+    let mut model_option_id = None;
+    let mut reasoning_option_id = None;
     let mut notes = Vec::new();
     for option in config_options {
         if is_model_option(option) {
             push_unique(&mut models, select_values(option));
+            if model_option_id.is_none() {
+                model_option_id = Some(option.id.clone());
+            }
         } else if is_reasoning_option(option) {
             push_unique(&mut reasoning, select_values(option));
+            if reasoning_option_id.is_none() {
+                reasoning_option_id = Some(option.id.clone());
+            }
         }
     }
     let mode_list: Vec<String> = modes
@@ -228,6 +265,8 @@ pub fn from_advertised(
         models,
         modes: mode_list,
         reasoning_levels: reasoning,
+        model_option_id,
+        reasoning_option_id,
         source: CapabilitySource::Advertised,
         notes,
     }
@@ -295,6 +334,10 @@ pub fn from_codex_catalog(
         models,
         modes: Vec::new(),
         reasoning_levels: reasoning,
+        // The catalog file names models, not the agent's config-option wire
+        // ids — callers fall back to the conventional spellings.
+        model_option_id: None,
+        reasoning_option_id: None,
         source: CapabilitySource::Static,
         notes,
     }
@@ -379,6 +422,10 @@ pub fn from_zcode_provider_catalog(
         models: catalog.models.clone(),
         modes: Vec::new(),
         reasoning_levels: catalog.reasoning_variants.clone(),
+        // The provider config names models, not the agent's config-option
+        // wire ids — callers fall back to the conventional spellings.
+        model_option_id: None,
+        reasoning_option_id: None,
         source: CapabilitySource::Static,
         notes: vec![
             "Model names come from ZCode's own provider config (bare names, one \
@@ -511,6 +558,47 @@ pub fn dedupe_agents(report: &mut CapabilitiesReport) {
     report.agents.retain(|a| seen.insert(a.agent_type.clone()));
 }
 
+/// Outcome of checking one requested per-call selector against a capability
+/// list from this catalog. This is the whole validation contract for
+/// `delegate_to_agent`'s `model` / `mode` / `reasoning_level` arguments,
+/// kept next to the data it rules on so the tool that reports the lists and
+/// the broker that enforces them can never drift apart:
+///
+///   * [`SelectorCheck::Known`] — a source filled the list and the value is
+///     in it: the spelling is validated, forward it.
+///   * [`SelectorCheck::HardUnknown`] — a source filled the list and the
+///     value is NOT in it: reject the call as a typo, handing back the
+///     accepted spellings so the caller can self-correct.
+///   * [`SelectorCheck::Unknown`] — no source could fill the list: pass the
+///     value through as a preference the agent may apply or ignore
+///     (per 5bd912ca — selectors are preferences, and drift is reported
+///     rather than blocked).
+///
+/// An EMPTY list is always [`SelectorCheck::Unknown`], whatever its source
+/// tag: it means "nothing known", never "nothing exists" — including a
+/// known-source entry that simply advertised no such selector, where an
+/// unadvertised `set_config_option` id may still be accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectorCheck {
+    Known,
+    HardUnknown { accepted: Vec<String> },
+    Unknown,
+}
+
+/// Check one requested selector `value` against a capability `list` under the
+/// three-state rule above.
+pub fn check_selector(list: &[String], value: &str) -> SelectorCheck {
+    if list.is_empty() {
+        return SelectorCheck::Unknown;
+    }
+    if list.iter().any(|known| known == value) {
+        return SelectorCheck::Known;
+    }
+    SelectorCheck::HardUnknown {
+        accepted: list.to_vec(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,6 +657,10 @@ mod tests {
         assert_eq!(caps.models, vec!["m1", "m2"]);
         assert_eq!(caps.reasoning_levels, vec!["low", "high"]);
         assert_eq!(caps.modes, vec!["default", "plan"]);
+        // The advertised projection also names the WIRE IDS the selector
+        // preferences must be forwarded under.
+        assert_eq!(caps.model_option_id.as_deref(), Some("model"));
+        assert_eq!(caps.reasoning_option_id.as_deref(), Some("reasoning_effort"));
         assert_eq!(caps.source, CapabilitySource::Advertised);
         // Every advertised field was filled, so no gap notes.
         assert!(caps.notes.is_empty(), "notes: {:?}", caps.notes);
@@ -764,5 +856,50 @@ mod tests {
         let v = serde_json::to_value(&report).unwrap();
         assert!(v.get("note").is_none());
         assert_eq!(v["agents"].as_array().unwrap().len(), 1);
+    }
+
+    /// Static projections know model VALUES, not the agent's config-option
+    /// wire ids — the option-id fields stay `None` so callers fall back to
+    /// the conventional spellings instead of trusting a guessed id.
+    #[test]
+    fn static_projections_leave_option_ids_unset() {
+        let codex = from_codex_catalog(
+            "codex",
+            "Codex",
+            &[json!({"slug": "m1", "visibility": "list"})],
+        );
+        assert!(codex.model_option_id.is_none());
+        assert!(codex.reasoning_option_id.is_none());
+        let zcode = from_zcode_provider_catalog(
+            "zcode",
+            "ZCode",
+            &ZcodeProviderCatalog {
+                models: vec!["GLM-5.3".into()],
+                reasoning_variants: vec!["high".into()],
+            },
+        );
+        assert!(zcode.model_option_id.is_none());
+        assert!(zcode.reasoning_option_id.is_none());
+        // ... and they deserialize back without the fields (serde default).
+        let raw = serde_json::to_string(&codex).unwrap();
+        let back: AgentCapabilities = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back.model_option_id, None);
+    }
+
+    #[test]
+    fn check_selector_is_the_three_state_rule() {
+        let list = vec!["m1".to_string(), "m2".to_string()];
+        assert_eq!(check_selector(&list, "m1"), SelectorCheck::Known);
+        // A known list that does not contain the value is a HARD reject
+        // carrying the accepted spellings.
+        assert_eq!(
+            check_selector(&list, "mX"),
+            SelectorCheck::HardUnknown {
+                accepted: list.clone()
+            }
+        );
+        // Empty lists — unknown source, or a source that advertised no such
+        // selector — always pass through as preferences.
+        assert_eq!(check_selector(&[], "anything"), SelectorCheck::Unknown);
     }
 }

@@ -177,13 +177,23 @@ pub fn build_delegation_stack(
     let live_reply_lookup = Arc::new(ConnectionManagerLiveReplyLookup {
         manager: cm_arc.clone(),
     }) as Arc<dyn ChildLiveReplyLookup>;
-    let event_emitter = Arc::new(ConnectionManagerEventEmitter { manager: cm_arc })
-        as Arc<dyn DelegationEventEmitter>;
+    let event_emitter = Arc::new(ConnectionManagerEventEmitter {
+        manager: cm_arc.clone(),
+    }) as Arc<dyn DelegationEventEmitter>;
     let broker = Arc::new(
         DelegationBroker::with_writers(spawner, depth_lookup, meta_writer, event_emitter)
             .with_status_lookup(status_lookup)
             .with_ledger(db_arc)
-            .with_live_reply_lookup(live_reply_lookup),
+            .with_live_reply_lookup(live_reply_lookup)
+            // Same catalog the listener answers `get_delegation_capabilities`
+            // from: one source of truth for the tool that lists an agent's
+            // selectors and the broker that validates per-call selector
+            // preferences against them.
+            .with_capability_catalog(Arc::new(
+                crate::acp::manager::ConnectionManagerCapabilityCatalog {
+                    manager: cm_arc.clone(),
+                },
+            )),
     );
     let tokens = Arc::new(TokenRegistry::default());
     let socket_path = default_socket_path(&std::env::temp_dir());

@@ -59,6 +59,10 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify};
 
+use crate::acp::capability_catalog::{
+    check_selector, CapabilityCatalogAccess, CapabilitiesReport, SelectorCheck,
+    MODEL_CONFIG_OPTION_ID, REASONING_EFFORT_CONFIG_OPTION_ID,
+};
 use crate::acp::delegation::event_emitter::{DelegationEventEmitter, NoopEventEmitter};
 use crate::acp::delegation::live_reply::{ChildLiveReplyLookup, NoopChildLiveReplyLookup};
 use crate::acp::delegation::meta_writer::{
@@ -69,7 +73,8 @@ use crate::acp::delegation::spawner::{
 };
 use crate::acp::delegation::types::{
     AgentDelegationDefaults, BlockedKind, BlockedOn, DelegationError, DelegationOutcome,
-    DelegationRequest, DelegationTaskReport, ResumeDelegationRequest, TaskStatus,
+    DelegationRequest, DelegationSelectorReport, DelegationTaskReport, ResumeDelegationRequest,
+    SelectorPreferences, TaskStatus,
 };
 use crate::acp::types::DelegationResultSummary;
 use crate::models::AgentType;
@@ -102,6 +107,20 @@ const STATUS_PREVIEW_CAP: usize = 2 * 1024;
 #[async_trait]
 pub trait ConversationDepthLookup: Send + Sync {
     async fn parent_of(&self, conversation_id: i32) -> Result<Option<i32>, DelegationError>;
+}
+
+/// Default capability-catalog access: every agent is `unknown`, so every
+/// per-call selector preference passes through unvalidated — exactly the
+/// pre-feature behavior. Production wires
+/// `ConnectionManagerCapabilityCatalog` (the SAME source
+/// `get_delegation_capabilities` answers from) via `with_capability_catalog`.
+struct UnknownCapabilities;
+
+#[async_trait]
+impl CapabilityCatalogAccess for UnknownCapabilities {
+    async fn resolve(&self, _agent_type: Option<&str>) -> CapabilitiesReport {
+        CapabilitiesReport::default()
+    }
 }
 
 /// Status-level facts the broker recovers from a child conversation row when a
@@ -260,6 +279,12 @@ struct RunningTask {
     /// stall this fixes. So the same unanswered prompt becomes reportable again
     /// after [`BLOCK_RESURFACE_INTERVAL`].
     last_surfaced_block: Option<SurfacedBlock>,
+    /// The requested-vs-effective selector report for THIS call. `None` for
+    /// every call that passed no `model` / `mode` / `reasoning_level`
+    /// (including all pre-feature calls); carried from the `Started`
+    /// dispatch through to the completed cache so status polls keep showing
+    /// the drift.
+    selectors: Option<DelegationSelectorReport>,
 }
 
 /// See [`RunningTask::last_surfaced_block`].
@@ -285,6 +310,10 @@ struct CompletedTask {
     error_code: Option<String>,
     message: Option<String>,
     duration_ms: u64,
+    /// The call's requested-vs-effective selector report, retained so status
+    /// polls after the terminal still show the drift. `None` for calls that
+    /// asked for no selectors.
+    selectors: Option<DelegationSelectorReport>,
 }
 
 #[derive(Default)]
@@ -710,12 +739,15 @@ fn terminal_fields(
 }
 
 /// Build a [`CompletedTask`] from a resolved outcome for the completed-cache.
+/// `selectors` is the call's requested-vs-effective selector report, carried
+/// through so terminal status queries still show the drift.
 fn build_completed(
     parent_connection_id: &str,
     child_conversation_id: i32,
     agent_type: AgentType,
     duration_ms: u64,
     outcome: &DelegationOutcome,
+    selectors: Option<DelegationSelectorReport>,
 ) -> CompletedTask {
     let (status, text, error_code, message) = terminal_fields(outcome);
     CompletedTask {
@@ -727,6 +759,7 @@ fn build_completed(
         error_code,
         message,
         duration_ms,
+        selectors,
     }
 }
 
@@ -761,6 +794,7 @@ fn drain_and_record_canceled(
         let task = inner.running.remove(&k).expect("key just observed");
         let outcome = canceled_outcome(task.child_conversation_id, reason);
         let duration_ms = task.started_at.elapsed().as_millis() as u64;
+        let selectors = task.selectors.clone();
         inner.insert_completed(
             &k,
             build_completed(
@@ -769,6 +803,7 @@ fn drain_and_record_canceled(
                 task.agent_type,
                 duration_ms,
                 &outcome,
+                selectors,
             ),
         );
         out.push((task, duration_ms));
@@ -792,12 +827,15 @@ fn outcome_to_summary(outcome: &DelegationOutcome, duration_ms: u64) -> Delegati
 }
 
 /// Project a resolved outcome onto a terminal [`DelegationTaskReport`] (used by
-/// the setup-window terminal dispositions and the test shim).
+/// the setup-window terminal dispositions and the test shim). `selectors`
+/// threads the requested-vs-effective report onto the ledger's terminal
+/// record; callers that never knew one pass `None`.
 fn report_from_outcome(
     task_id: Option<String>,
     agent_type: Option<AgentType>,
     outcome: &DelegationOutcome,
     duration_ms: Option<u64>,
+    selectors: Option<DelegationSelectorReport>,
 ) -> DelegationTaskReport {
     let (status, text, error_code, message) = terminal_fields(outcome);
     let child_conversation_id = match outcome {
@@ -818,6 +856,7 @@ fn report_from_outcome(
         duration_ms,
         // Terminal by construction — nothing is waiting on the user anymore.
         blocked_on: None,
+        selectors,
     }
 }
 
@@ -829,14 +868,18 @@ fn report_err(
     child_conversation_id: Option<i32>,
 ) -> DelegationTaskReport {
     let outcome = DelegationOutcome::from_err(err, child_conversation_id);
-    report_from_outcome(None, Some(agent_type), &outcome, None)
+    report_from_outcome(None, Some(agent_type), &outcome, None, None)
 }
 
 /// The `Running` ack returned by `start_delegation` for a backgrounded task.
+/// `selectors` is the call's requested-vs-effective report — the ack is where
+/// drift first becomes visible to the caller ("you asked for model X, the child
+/// launched with Y"), so it rides the immediate response, not only later polls.
 fn running_ack(
     call_id: String,
     child_conversation_id: i32,
     agent_type: AgentType,
+    selectors: Option<DelegationSelectorReport>,
 ) -> DelegationTaskReport {
     // Embed the literal task_id in the message so it survives clients that only
     // surface the MCP `content` text (not `structuredContent`) — without it the
@@ -856,6 +899,7 @@ fn running_ack(
         message: Some(message),
         duration_ms: None,
         blocked_on: None,
+        selectors,
     }
 }
 
@@ -924,6 +968,7 @@ fn resume_ack(
         message: Some(message),
         duration_ms: None,
         blocked_on: None,
+        selectors: None,
     }
 }
 
@@ -953,6 +998,7 @@ fn not_resumable_report(
         message: Some(format!("Not resumed: {why}")),
         duration_ms: None,
         blocked_on: None,
+        selectors: None,
     }
 }
 
@@ -1034,6 +1080,7 @@ fn running_report(task_id: &str, task: &RunningTask) -> DelegationTaskReport {
         message: Some("Running.".to_string()),
         duration_ms: None,
         blocked_on: None,
+        selectors: task.selectors.clone(),
     }
 }
 
@@ -1049,6 +1096,7 @@ fn completed_report(task_id: &str, c: &CompletedTask) -> DelegationTaskReport {
         message: c.message.clone(),
         duration_ms: Some(c.duration_ms),
         blocked_on: None,
+        selectors: c.selectors.clone(),
     }
 }
 
@@ -1069,6 +1117,7 @@ fn unknown_report(task_id: &str) -> DelegationTaskReport {
         ),
         duration_ms: None,
         blocked_on: None,
+        selectors: None,
     }
 }
 
@@ -1088,6 +1137,7 @@ fn interrupted_ledger_report(
         ),
         duration_ms: None,
         blocked_on: None,
+        selectors: None,
     }
 }
 
@@ -1107,6 +1157,7 @@ fn db_report(task_id: &str, rec: &ChildStatusRecord) -> DelegationTaskReport {
         )),
         duration_ms: None,
         blocked_on: None,
+        selectors: None,
     }
 }
 
@@ -1479,6 +1530,12 @@ pub struct DelegationBroker {
     tool_calls: Arc<ToolCallTracker>,
     pre_canceled_handles: Arc<PreCanceledHandles>,
     config: Arc<Mutex<DelegationConfig>>,
+    /// Capability catalog the broker validates per-call selector preferences
+    /// (`model` / `mode` / `reasoning_level`) against — the same source the
+    /// `get_delegation_capabilities` tool reports from, wired in production
+    /// via `with_capability_catalog`. Defaults to all-unknown (pure
+    /// preference passthrough).
+    capabilities: Arc<dyn CapabilityCatalogAccess>,
     /// Woken after every terminal `record_completed` so a `get_delegation_status`
     /// long-poll wakes the instant its task finishes instead of busy-polling.
     result_notify: Arc<Notify>,
@@ -1644,6 +1701,7 @@ impl DelegationBroker {
             tool_calls: Arc::new(ToolCallTracker::default()),
             pre_canceled_handles: Arc::new(PreCanceledHandles::default()),
             config: Arc::new(Mutex::new(DelegationConfig::default())),
+            capabilities: Arc::new(UnknownCapabilities) as Arc<dyn CapabilityCatalogAccess>,
             result_notify: Arc::new(Notify::new()),
             block_resurface: BLOCK_RESURFACE_INTERVAL,
         }
@@ -1673,6 +1731,118 @@ impl DelegationBroker {
     pub fn with_ledger(mut self, db: Arc<crate::db::AppDatabase>) -> Self {
         self.ledger_db = Some(db);
         self
+    }
+
+    /// Replace the capability catalog used to validate per-call selector
+    /// preferences. Builder-style, layered onto `with_writers` by the
+    /// production wiring (which passes the same
+    /// `ConnectionManagerCapabilityCatalog` the delegation listener serves
+    /// `get_delegation_capabilities` from — one source of truth for both the
+    /// tool that lists an agent's models / modes / reasoning levels and the
+    /// broker that accepts or rejects them); tests opt in with a stub.
+    pub fn with_capability_catalog(
+        mut self,
+        capabilities: Arc<dyn CapabilityCatalogAccess>,
+    ) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Validate one call's [`SelectorPreferences`] against the capability
+    /// catalog and map the accepted values onto the launch-preference
+    /// pipeline. Empty preferences short-circuit to `Ok(None)` without
+    /// touching the catalog — the pre-feature path costs nothing.
+    ///
+    /// Three-state rule (mirrors [`check_selector`], which this applies per
+    /// field): a KNOWN list accepts the value or hard-rejects it as a typo
+    /// (handing back the accepted spellings so the caller self-corrects in
+    /// one retry); an empty / unknown list passes the value through as a
+    /// preference the agent may apply or ignore — drift surfaces in the
+    /// report instead.
+    ///
+    /// Mapping onto the pipeline: `mode` replaces `preferred_mode_id`;
+    /// `model` and `reasoning_level` are inserted into
+    /// `preferred_config_values` under the wire id the catalog says the
+    /// agent publishes that selector under (`model_option_id` /
+    /// `reasoning_option_id`, falling back to the conventional
+    /// `MODEL_CONFIG_OPTION_ID` / `REASONING_EFFORT_CONFIG_OPTION_ID` spellings
+    /// when no source named one). Per-call values thereby override any
+    /// `DelegationConfig::agent_defaults` entry for this one call without
+    /// touching the configured defaults.
+    async fn apply_selector_preferences(
+        &self,
+        agent_type: AgentType,
+        selectors: &SelectorPreferences,
+        preferred_mode_id: &mut Option<String>,
+        preferred_config_values: &mut BTreeMap<String, String>,
+    ) -> Result<Option<DelegationSelectorReport>, DelegationError> {
+        if selectors.is_empty() {
+            return Ok(None);
+        }
+        let slug = agent_type.as_wire().to_string();
+        let report = self.capabilities.resolve(Some(&slug)).await;
+        let entry = report.agents.iter().find(|a| a.agent_type == slug);
+        let check = |field: &'static str,
+                     requested: &Option<String>,
+                     list: &[String]|
+         -> Result<(), DelegationError> {
+            let Some(value) = requested.as_deref() else {
+                return Ok(());
+            };
+            match check_selector(list, value) {
+                SelectorCheck::Known | SelectorCheck::Unknown => Ok(()),
+                SelectorCheck::HardUnknown { accepted } => {
+                    Err(DelegationError::InvalidSelector {
+                        field: field.to_string(),
+                        value: value.to_string(),
+                        accepted,
+                    })
+                }
+            }
+        };
+        // A filter miss reads as "nothing known about this agent" — every
+        // preference passes through, same as an unknown catalog.
+        if let Some(entry) = entry {
+            check("model", &selectors.model, &entry.models)?;
+            check("mode", &selectors.mode, &entry.modes)?;
+            check("reasoning_level", &selectors.reasoning_level, &entry.reasoning_levels)?;
+            if let Some(mode) = selectors.mode.clone() {
+                *preferred_mode_id = Some(mode);
+            }
+            if let Some(model) = selectors.model.clone() {
+                let id = entry
+                    .model_option_id
+                    .clone()
+                    .unwrap_or_else(|| MODEL_CONFIG_OPTION_ID.to_string());
+                preferred_config_values.insert(id, model);
+            }
+            if let Some(level) = selectors.reasoning_level.clone() {
+                let id = entry
+                    .reasoning_option_id
+                    .clone()
+                    .unwrap_or_else(|| REASONING_EFFORT_CONFIG_OPTION_ID.to_string());
+                preferred_config_values.insert(id, level);
+            }
+        } else {
+            // Unknown agent entry: the conventional wire ids are the honest
+            // default for forwarding a preference whose real id is unknown.
+            if let Some(mode) = selectors.mode.clone() {
+                *preferred_mode_id = Some(mode);
+            }
+            if let Some(model) = selectors.model.clone() {
+                preferred_config_values.insert(MODEL_CONFIG_OPTION_ID.to_string(), model);
+            }
+            if let Some(level) = selectors.reasoning_level.clone() {
+                preferred_config_values
+                    .insert(REASONING_EFFORT_CONFIG_OPTION_ID.to_string(), level);
+            }
+        }
+        Ok(Some(DelegationSelectorReport {
+            requested: selectors.clone(),
+            // Filled in from the spawner's admission snapshot when the child
+            // starts; stays `None` on paths that never read one.
+            effective: None,
+        }))
     }
 
     /// Shrink [`BLOCK_RESURFACE_INTERVAL`] so a test can observe the
@@ -2633,6 +2803,27 @@ impl DelegationBroker {
             );
         }
 
+        // --- Per-call selector preferences --------------------------------------
+        // `continue_from_task_id` strictly restores the source task's
+        // selections (they ride the resume binding below), so a call that
+        // passes BOTH a continuation source and fresh selectors is a
+        // conflicting request — rejected up front, before any continuation
+        // storage is touched, rather than silently resolved one way or the
+        // other.
+        if req.continue_from_task_id.is_some() && !req.selectors.is_empty() {
+            self.drop_inflight(inflight_id).await;
+            return report_err(
+                req.agent_type,
+                DelegationError::ContinuationInvalid(
+                    "per-call model / mode / reasoning_level cannot accompany \
+                     continue_from_task_id — the continuation restores the source \
+                     task's selections"
+                        .into(),
+                ),
+                None,
+            );
+        }
+
         // --- Spawn child connection --------------------------------------------
         // Pull per-agent overrides from the broker config (defaults to empty).
         // Cloning is cheap — `AgentDelegationDefaults` is at most one Option<String>
@@ -2737,6 +2928,29 @@ impl DelegationBroker {
             Some(binding)
         } else {
             None
+        };
+        // Validate the requested trio against the same capability catalog
+        // `get_delegation_capabilities` reports from (three-state rule, see
+        // `check_selector`), then map the accepted values onto the existing
+        // launch-preference pipeline: `mode` overrides `preferred_mode_id`,
+        // `model` / `reasoning_level` land in `preferred_config_values` under
+        // the agent's advertised config-option wire ids (conventional ids when
+        // no source named them). Returns the requested-vs-effective report
+        // skeleton the Started dispatch will fill in.
+        let selector_report = match self
+            .apply_selector_preferences(
+                req.agent_type,
+                &req.selectors,
+                &mut preferred_mode_id,
+                &mut preferred_config_values,
+            )
+            .await
+        {
+            Ok(report) => report,
+            Err(err) => {
+                self.drop_inflight(inflight_id).await;
+                return report_err(req.agent_type, err, None);
+            }
         };
         // Checkpoint #1 (opportunistic): if a parent cancel already landed
         // during the claim/depth phase, bail before spawning a child the parent
@@ -2847,12 +3061,24 @@ impl DelegationBroker {
             .await
             .reserve(&call_id, &child_connection_id);
 
+        let mut selector_report = selector_report;
         let child_conversation_id = match self
             .spawner
             .send_prompt_linked_for_delegation(&child_connection_id, req.task.clone(), link)
             .await
         {
-            Ok(DelegationDispatch::Started(cid)) => cid,
+            // The spawner's admission snapshot reports what the launch-time
+            // preferences actually landed as — attach it to the requested-
+            // vs-effective report so drift is visible from the ack on.
+            Ok(DelegationDispatch::Started {
+                child_conversation_id: cid,
+                effective,
+            }) => {
+                if let Some(report) = selector_report.as_mut() {
+                    report.effective = effective;
+                }
+                cid
+            }
             Ok(DelegationDispatch::Existing(report)) => {
                 let mut inner = self.pending.inner.lock().await;
                 inner.unreserve(&call_id, &child_connection_id);
@@ -3021,6 +3247,7 @@ impl DelegationBroker {
                         req.agent_type,
                         setup_duration_ms,
                         outcome,
+                        selector_report.clone(),
                     ),
                 );
             };
@@ -3073,6 +3300,7 @@ impl DelegationBroker {
                             external_handle: req.external_handle.clone(),
                             started_at,
                             last_surfaced_block: None,
+                            selectors: selector_report.clone(),
                         },
                     );
                     inner.deregister_inflight(inflight_id);
@@ -3098,6 +3326,7 @@ impl DelegationBroker {
                     &outcome,
                     &task_preview,
                     &call_id,
+                    selector_report.clone(),
                 )
                 .await;
                 self.result_notify.notify_waiters();
@@ -3106,6 +3335,7 @@ impl DelegationBroker {
                     Some(req.agent_type),
                     &outcome,
                     Some(setup_duration_ms),
+                    selector_report,
                 );
             }
             // A parent cancel reached this delegation mid-setup — after the
@@ -3120,6 +3350,7 @@ impl DelegationBroker {
                     child_conversation_id,
                     setup_duration_ms,
                     &canceled_outcome(child_conversation_id, "parent canceled"),
+                    selector_report.clone(),
                 )
                 .await;
                 self.write_meta_if_real(
@@ -3156,6 +3387,7 @@ impl DelegationBroker {
                     Some(req.agent_type),
                     &canceled_outcome(child_conversation_id, "parent canceled"),
                     Some(setup_duration_ms),
+                    selector_report,
                 );
             }
             // Registered in `running` — fall through to the second pre-cancel
@@ -3188,6 +3420,7 @@ impl DelegationBroker {
                                 req.agent_type,
                                 duration_ms,
                                 &outcome,
+                                selector_report.clone(),
                             ),
                         );
                         Some(duration_ms)
@@ -3203,6 +3436,7 @@ impl DelegationBroker {
                         child_conversation_id,
                         duration_ms,
                         &canceled_outcome(child_conversation_id, "canceled before await"),
+                        selector_report.clone(),
                     )
                     .await;
                     self.write_meta_if_real(
@@ -3239,6 +3473,7 @@ impl DelegationBroker {
                         Some(req.agent_type),
                         &canceled_outcome(child_conversation_id, "canceled before await"),
                         Some(duration_ms),
+                        selector_report,
                     );
                 }
             }
@@ -3246,7 +3481,7 @@ impl DelegationBroker {
 
         // Registered and running in the background — return the ack. The child
         // resolves later via the lifecycle → `complete_call` (or a cancel path).
-        running_ack(call_id, child_conversation_id, req.agent_type)
+        running_ack(call_id, child_conversation_id, req.agent_type, selector_report)
     }
 
     /// Called by the child-session lifecycle subscriber on `TurnComplete`
@@ -3273,6 +3508,7 @@ impl DelegationBroker {
                     // Atomic running → completed so a concurrent status query
                     // never sees the task as neither running nor completed.
                     let duration_ms = task.started_at.elapsed().as_millis() as u64;
+                    let selectors = task.selectors.clone();
                     inner.insert_completed(
                         call_id,
                         build_completed(
@@ -3281,6 +3517,7 @@ impl DelegationBroker {
                             task.agent_type,
                             duration_ms,
                             &outcome,
+                            selectors,
                         ),
                     );
                     Some((task, duration_ms))
@@ -3295,6 +3532,7 @@ impl DelegationBroker {
             }
         };
         if let Some((task, duration_ms)) = task {
+            let selectors = task.selectors.clone();
             self.finalize_delegation(
                 &task.parent_connection_id,
                 task.parent_conversation_id,
@@ -3306,6 +3544,7 @@ impl DelegationBroker {
                 &outcome,
                 &task.task_preview,
                 &task.task_id,
+                selectors,
             )
             .await;
             self.result_notify.notify_waiters();
@@ -3323,6 +3562,8 @@ impl DelegationBroker {
     ///
     /// `duration_ms` is the broker-measured elapsed time (from `started_at`),
     /// carried onto the event summary so the parent UI shows a real duration.
+    /// `selectors` threads the requested-vs-effective report into the ledger's
+    /// terminal record; callers that never knew one pass `None`.
     #[allow(clippy::too_many_arguments)]
     async fn finalize_delegation(
         &self,
@@ -3336,6 +3577,7 @@ impl DelegationBroker {
         outcome: &DelegationOutcome,
         task_preview: &str,
         task_id: &str,
+        selectors: Option<DelegationSelectorReport>,
     ) {
         self.freeze_ledger_outcome(
             parent_conversation_id,
@@ -3344,6 +3586,7 @@ impl DelegationBroker {
             child_conversation_id,
             duration_ms,
             outcome,
+            selectors,
         )
         .await;
         let meta = match outcome {
@@ -3383,6 +3626,7 @@ impl DelegationBroker {
         let _ = self.spawner.disconnect(child_connection_id).await;
     }
 
+    #[allow(clippy::too_many_arguments)] // selector-report threading, like finalize_delegation
     async fn freeze_ledger_outcome(
         &self,
         parent_conversation_id: i32,
@@ -3391,6 +3635,7 @@ impl DelegationBroker {
         _child_conversation_id: i32,
         duration_ms: u64,
         outcome: &DelegationOutcome,
+        selectors: Option<DelegationSelectorReport>,
     ) {
         let Some(db) = self.ledger_db.as_ref() else {
             return;
@@ -3400,6 +3645,7 @@ impl DelegationBroker {
             Some(agent_type),
             outcome,
             Some(duration_ms),
+            selectors,
         );
         if let Err(error) = crate::db::service::delegation_task_service::finish(
             &db.conn,
@@ -3721,6 +3967,7 @@ impl DelegationBroker {
             task.child_conversation_id,
             duration_ms,
             &canceled_outcome(task.child_conversation_id, "delegation canceled"),
+            task.selectors.clone(),
         )
         .await;
         self.write_meta_if_real(
@@ -4170,6 +4417,7 @@ impl DelegationBroker {
                     Some(task.agent_type),
                     &canceled_outcome(task.child_conversation_id, "canceled by request"),
                     Some(duration_ms),
+                    task.selectors.clone(),
                 )
             }
             None => self.status_from_db(parent_conversation_id, task_id).await,
@@ -4276,6 +4524,7 @@ impl DelegationBroker {
                         None,
                     ),
                     None,
+                    None,
                 );
             }
         }
@@ -4291,6 +4540,7 @@ impl DelegationBroker {
                     },
                     None,
                 ),
+                None,
                 None,
             );
         }
@@ -4553,6 +4803,7 @@ impl DelegationBroker {
                 Some(ctx.agent_type),
                 &canceled_outcome(ctx.child_conversation_id, "parent canceled"),
                 None,
+                None,
             );
         }
         let spawned = match self
@@ -4579,6 +4830,7 @@ impl DelegationBroker {
                         Some(ctx.child_conversation_id),
                     ),
                     None,
+                    None,
                 );
             }
         };
@@ -4596,6 +4848,7 @@ impl DelegationBroker {
                 Some(req.task_id.clone()),
                 Some(ctx.agent_type),
                 &canceled_outcome(ctx.child_conversation_id, "parent canceled"),
+                None,
                 None,
             );
         }
@@ -4675,6 +4928,7 @@ impl DelegationBroker {
                     Some(ctx.child_conversation_id),
                 ),
                 None,
+                None,
             );
         }
 
@@ -4751,6 +5005,7 @@ impl DelegationBroker {
                         ctx.agent_type,
                         setup_duration_ms,
                         outcome,
+                        None,
                     ),
                 );
             };
@@ -4796,6 +5051,7 @@ impl DelegationBroker {
                             external_handle: req.external_handle.clone(),
                             started_at,
                             last_surfaced_block: None,
+                            selectors: None,
                         },
                     );
                     inner.deregister_inflight(inflight_id);
@@ -4817,6 +5073,7 @@ impl DelegationBroker {
                     &outcome,
                     &task_preview,
                     &call_id,
+                    None,
                 )
                 .await;
                 self.result_notify.notify_waiters();
@@ -4825,6 +5082,7 @@ impl DelegationBroker {
                     Some(ctx.agent_type),
                     &outcome,
                     Some(setup_duration_ms),
+                    None,
                 );
             }
             Disposition::ParentCanceled => {
@@ -4835,6 +5093,7 @@ impl DelegationBroker {
                     ctx.child_conversation_id,
                     setup_duration_ms,
                     &canceled_outcome(ctx.child_conversation_id, "parent canceled"),
+                    None,
                 )
                 .await;
                 self.write_meta_if_real(
@@ -4871,6 +5130,7 @@ impl DelegationBroker {
                     Some(ctx.agent_type),
                     &canceled_outcome(ctx.child_conversation_id, "parent canceled"),
                     Some(setup_duration_ms),
+                    None,
                 );
             }
             Disposition::Running => {}
@@ -4895,6 +5155,7 @@ impl DelegationBroker {
                                 ctx.agent_type,
                                 duration_ms,
                                 &outcome,
+                                None,
                             ),
                         );
                         Some(duration_ms)
@@ -4910,6 +5171,7 @@ impl DelegationBroker {
                         ctx.child_conversation_id,
                         duration_ms,
                         &canceled_outcome(ctx.child_conversation_id, "canceled before await"),
+                        None,
                     )
                     .await;
                     self.write_meta_if_real(
@@ -4946,6 +5208,7 @@ impl DelegationBroker {
                         Some(ctx.agent_type),
                         &canceled_outcome(ctx.child_conversation_id, "canceled before await"),
                         Some(duration_ms),
+                        None,
                     );
                 }
             }
@@ -5189,6 +5452,7 @@ mod tests {
             requested_working_dir: None,
             continue_from_task_id: None,
             external_handle: None,
+            selectors: SelectorPreferences::default(),
         }
     }
 
@@ -5744,6 +6008,7 @@ mod tests {
             child_conversation_id: Some(child.id),
             agent_type: Some(AgentType::Codex),
             text: Some("durable result".into()),
+            selectors: None,
             error_code: None,
             message: None,
             duration_ms: Some(1),
@@ -6139,6 +6404,472 @@ mod tests {
         assert_eq!(call.agent_type, AgentType::ClaudeCode);
         assert_eq!(call.preferred_mode_id.as_deref(), Some("auto"));
         assert_eq!(call.preferred_config_values, claude_cfg);
+    }
+
+    // -- Per-call selector preferences --------------------------------------
+
+    use crate::acp::capability_catalog::{AgentCapabilities, CapabilitySource};
+
+    /// In-memory capability catalog: hands back exactly the canned entries it
+    /// was built with, filtered by slug like the production resolver.
+    struct StubCapabilities(Vec<AgentCapabilities>);
+
+    #[async_trait]
+    impl crate::acp::capability_catalog::CapabilityCatalogAccess for StubCapabilities {
+        async fn resolve(
+            &self,
+            agent_type: Option<&str>,
+        ) -> crate::acp::capability_catalog::CapabilitiesReport {
+            crate::acp::capability_catalog::CapabilitiesReport {
+                agents: self
+                    .0
+                    .iter()
+                    .filter(|a| agent_type.is_none_or(|slug| a.agent_type == slug))
+                    .cloned()
+                    .collect(),
+                note: None,
+            }
+        }
+    }
+
+    /// A claude_code entry with EVERY selector list filled and the advertised
+    /// wire ids named — the KNOWN-list case of the three-state rule.
+    fn claude_caps() -> AgentCapabilities {
+        AgentCapabilities {
+            agent_type: "claude_code".into(),
+            display_name: "Claude Code".into(),
+            models: vec!["claude-sonnet-4-5".into(), "claude-opus-4-6".into()],
+            modes: vec!["default".into(), "full-auto".into()],
+            reasoning_levels: vec!["low".into(), "high".into()],
+            model_option_id: Some("model".into()),
+            reasoning_option_id: Some("reasoning_effort".into()),
+            source: CapabilitySource::Advertised,
+            notes: Vec::new(),
+        }
+    }
+
+    fn selector_request(prefs: SelectorPreferences) -> DelegationRequest {
+        DelegationRequest {
+            selectors: prefs,
+            ..request(1, "pt-sel")
+        }
+    }
+
+    /// The full happy path of the mapping: a validated trio rides the existing
+    /// launch-preference pipeline — `mode` replaces `preferred_mode_id`,
+    /// `model` / `reasoning_level` land in `preferred_config_values` under the
+    /// wire ids the catalog advertised — and per-call values override any
+    /// configured agent defaults for this one call.
+    #[tokio::test]
+    async fn per_call_selectors_map_onto_the_spawn_preference_pipeline() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-sel".into())).await;
+        mock.queue_send(Err(SpawnerError::Send("stop after spawn".into())))
+            .await;
+        let broker = DelegationBroker::new(
+            mock.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        )
+        .with_capability_catalog(Arc::new(StubCapabilities(vec![claude_caps()])));
+        // Configured defaults exist for this agent; per-call values must win.
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                agent_defaults: BTreeMap::from([(
+                    AgentType::ClaudeCode,
+                    AgentDelegationDefaults {
+                        mode_id: Some("default".into()),
+                        config_values: BTreeMap::from([(
+                            "model".to_string(),
+                            "claude-opus-4-6".to_string(),
+                        )]),
+                    },
+                )]),
+                ..DelegationConfig::default()
+            })
+            .await;
+
+        let _ = broker
+            .handle_request(selector_request(SelectorPreferences {
+                model: Some("claude-sonnet-4-5".into()),
+                mode: Some("full-auto".into()),
+                reasoning_level: Some("high".into()),
+            }))
+            .await;
+
+        let args = mock.spawn_args.lock().await;
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].preferred_mode_id.as_deref(), Some("full-auto"));
+        assert_eq!(
+            args[0].preferred_config_values,
+            BTreeMap::from([
+                ("model".to_string(), "claude-sonnet-4-5".to_string()),
+                ("reasoning_effort".to_string(), "high".to_string()),
+            ])
+        );
+    }
+
+    /// The KNOWN-list rejection: a model the catalog positively contradicts is
+    /// a typo, the call fails with `invalid_selector`, the accepted spellings
+    /// ride the message, and no child is ever spawned.
+    #[tokio::test]
+    async fn per_call_selector_typo_is_hard_rejected_with_accepted_spellings() {
+        let mock = Arc::new(MockSpawner::new());
+        let broker = DelegationBroker::new(
+            mock.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        )
+        .with_capability_catalog(Arc::new(StubCapabilities(vec![claude_caps()])));
+        enable_delegation(&broker).await;
+
+        let outcome = broker
+            .handle_request(selector_request(SelectorPreferences {
+                model: Some("claude-sonnet-4".into()),
+                ..SelectorPreferences::default()
+            }))
+            .await;
+
+        match outcome {
+            DelegationOutcome::Err { code, message, .. } => {
+                assert_eq!(code, "invalid_selector");
+                let message = message.as_str();
+                assert!(message.contains("claude-sonnet-4"), "message: {message:?}");
+                assert!(message.contains("claude-sonnet-4-5"), "message: {message:?}");
+                assert!(message.contains("claude-opus-4-6"), "message: {message:?}");
+            }
+            _ => panic!("expected Err for a known-list typo, got {outcome:?}"),
+        }
+        assert!(
+            mock.spawn_args.lock().await.is_empty(),
+            "a typo must not spawn a child"
+        );
+    }
+
+    /// The UNKNOWN-list pass-through: with no catalog wired (every agent
+    /// unknown), the same trio forwards verbatim under the CONVENTIONAL wire
+    /// ids — preference semantics, exactly the pre-feature behavior plus the
+    /// forwarding.
+    #[tokio::test]
+    async fn per_call_selectors_pass_through_an_unknown_catalog() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-sel".into())).await;
+        mock.queue_send(Err(SpawnerError::Send("stop after spawn".into())))
+            .await;
+        // No with_capability_catalog: the broker's all-unknown default.
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        enable_delegation(&broker).await;
+
+        let _ = broker
+            .handle_request(selector_request(SelectorPreferences {
+                model: Some("mystery-model".into()),
+                mode: Some("turbo".into()),
+                reasoning_level: Some("max".into()),
+            }))
+            .await;
+
+        let args = mock.spawn_args.lock().await;
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].preferred_mode_id.as_deref(), Some("turbo"));
+        assert_eq!(
+            args[0].preferred_config_values,
+            BTreeMap::from([
+                ("model".to_string(), "mystery-model".to_string()),
+                ("reasoning_effort".to_string(), "max".to_string()),
+            ])
+        );
+    }
+
+    /// An empty list is Unknown even on an otherwise KNOWN entry: the agent
+    /// advertised no reasoning selector, so a reasoning preference forwards
+    /// under the conventional id while the model (whose list IS known) still
+    /// validates. This is the empty-list clause of `check_selector` applied
+    /// per field.
+    #[tokio::test]
+    async fn per_call_selector_empty_list_forwards_that_field_only() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-sel".into())).await;
+        mock.queue_send(Err(SpawnerError::Send("stop after spawn".into())))
+            .await;
+        let mut caps = claude_caps();
+        caps.reasoning_levels = Vec::new();
+        caps.reasoning_option_id = None;
+        let broker = DelegationBroker::new(
+            mock.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        )
+        .with_capability_catalog(Arc::new(StubCapabilities(vec![caps])));
+        enable_delegation(&broker).await;
+
+        let _ = broker
+            .handle_request(selector_request(SelectorPreferences {
+                model: Some("claude-sonnet-4-5".into()),
+                reasoning_level: Some("ultra".into()),
+                ..SelectorPreferences::default()
+            }))
+            .await;
+
+        let args = mock.spawn_args.lock().await;
+        assert_eq!(args.len(), 1);
+        assert_eq!(
+            args[0].preferred_config_values,
+            BTreeMap::from([
+                ("model".to_string(), "claude-sonnet-4-5".to_string()),
+                ("reasoning_effort".to_string(), "ultra".to_string()),
+            ])
+        );
+    }
+
+    /// A continuation strictly restores the source task's selections, so
+    /// per-call selectors accompanying `continue_from_task_id` are refused —
+    /// before any continuation storage is consulted, so the refusal needs no
+    /// ledger at all.
+    #[tokio::test]
+    async fn per_call_selectors_are_refused_on_a_continuation() {
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        enable_delegation(&broker).await;
+
+        let outcome = broker
+            .handle_request(DelegationRequest {
+                selectors: SelectorPreferences {
+                    model: Some("claude-sonnet-4-5".into()),
+                    ..SelectorPreferences::default()
+                },
+                continue_from_task_id: Some("source-task".into()),
+                ..request(1, "pt-cont")
+            })
+            .await;
+
+        match outcome {
+            DelegationOutcome::Err { code, message, .. } => {
+                assert_eq!(code, "continuation_invalid");
+                let message = message.as_str();
+                assert!(message.contains("cannot accompany"), "message: {message:?}");
+            }
+            _ => panic!("expected Err for selectors on a continuation, got {outcome:?}"),
+        }
+        assert!(mock.spawn_args.lock().await.is_empty());
+    }
+
+    /// The drift report: the ack carries requested vs effective, the effective
+    /// half coming from the spawner's admission snapshot — here a mock that
+    /// landed a DIFFERENT model than requested, the exact drift the report
+    /// exists to surface. The report survives into the status poll after the
+    /// task completes.
+    #[tokio::test]
+    async fn selector_drift_is_visible_in_the_ack_and_survives_into_status() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-sel".into())).await;
+        mock.queue_send_with_effective(
+            42,
+            Some(crate::acp::delegation::types::AppliedSelectors {
+                mode: Some("default".into()),
+                config_values: BTreeMap::from([(
+                    "model".to_string(),
+                    "claude-opus-4-6".to_string(),
+                )]),
+            }),
+        )
+        .await;
+        let broker = DelegationBroker::new(
+            mock.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        )
+        .with_capability_catalog(Arc::new(StubCapabilities(vec![claude_caps()])));
+        enable_delegation(&broker).await;
+
+        let ack = broker
+            .start_delegation(selector_request(SelectorPreferences {
+                model: Some("claude-sonnet-4-5".into()),
+                mode: Some("full-auto".into()),
+                ..SelectorPreferences::default()
+            }))
+            .await;
+        assert_eq!(ack.status, TaskStatus::Running);
+        let selectors = ack.selectors.as_ref().expect("ack carries the drift report");
+        assert_eq!(selectors.requested.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(selectors.requested.mode.as_deref(), Some("full-auto"));
+        let effective = selectors.effective.as_ref().expect("effective snapshot attached");
+        // THE DRIFT: requested sonnet, launched opus.
+        assert_eq!(
+            effective.config_values.get("model").map(String::as_str),
+            Some("claude-opus-4-6")
+        );
+        let task_id = ack.task_id.clone().unwrap();
+
+        broker
+            .complete_call(
+                &task_id,
+                DelegationOutcome::Ok(DelegationSuccess {
+                    text: "done".into(),
+                    child_conversation_id: 42,
+                    child_agent_type: AgentType::ClaudeCode,
+                    turn_count: 1,
+                    duration_ms: 5,
+                    token_usage: None,
+                }),
+            )
+            .await;
+        let report = broker
+            .get_task_status("parent-conn", Some(1), &task_id, StatusWait::Immediate)
+            .await;
+        assert_eq!(report.status, TaskStatus::Completed);
+        let selectors = report.selectors.as_ref().expect("status keeps the report");
+        assert_eq!(selectors.requested.model.as_deref(), Some("claude-sonnet-4-5"));
+    }
+
+    /// Calls without selectors keep byte-identical reports: no `selectors`
+    /// field on the ack, the running entry, or the completed entry.
+    #[tokio::test]
+    async fn selectorless_calls_report_no_selectors_field() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-plain".into())).await;
+        mock.queue_send(Ok(7)).await;
+        let broker = DelegationBroker::new(
+            mock.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        )
+        .with_capability_catalog(Arc::new(StubCapabilities(vec![claude_caps()])));
+        enable_delegation(&broker).await;
+
+        let ack = broker.start_delegation(request(1, "pt-plain")).await;
+        assert!(ack.selectors.is_none());
+        let task_id = ack.task_id.clone().unwrap();
+        broker
+            .complete_call(
+                &task_id,
+                DelegationOutcome::Ok(DelegationSuccess {
+                    text: "done".into(),
+                    child_conversation_id: 7,
+                    child_agent_type: AgentType::ClaudeCode,
+                    turn_count: 1,
+                    duration_ms: 5,
+                    token_usage: None,
+                }),
+            )
+            .await;
+        let report = broker
+            .get_task_status("parent-conn", Some(1), &task_id, StatusWait::Immediate)
+            .await;
+        assert!(report.selectors.is_none());
+        let rendered = serde_json::to_value(&report).unwrap();
+        assert!(rendered.get("selectors").is_none());
+    }
+
+    /// The ledger half of the feature: a continuation spawns with EXACTLY the
+    /// source task's `resume_binding` selections — the effective selectors the
+    /// admission snapshot captured at launch — so per-call selections survive
+    /// into every later round on the same child. The binding is the drift
+    /// report's `effective`, persisted (see `send_prompt_linked_for_delegation`,
+    /// which fills both from the same child-state snapshot).
+    #[tokio::test]
+    async fn continuation_strictly_restores_the_binding_selections() {
+        use crate::db::service::{
+            conversation_service, delegation_task_service as ledger, folder_service,
+        };
+
+        let db = Arc::new(crate::db::test_helpers::fresh_in_memory_db().await);
+        let folder = folder_service::add_folder(&db.conn, "/tmp/broker-cont-sel")
+            .await
+            .unwrap();
+        let parent =
+            conversation_service::create(&db.conn, folder.id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        let child = conversation_service::create(&db.conn, folder.id, AgentType::Codex, None, None)
+            .await
+            .unwrap();
+        // The selections the source task ACTUALLY launched with.
+        let binding = ledger::ResumeBinding {
+            agent_type: AgentType::Codex,
+            external_session_id: "session-sel".into(),
+            child_conversation_id: child.id,
+            working_dir: "/tmp/broker-cont-sel".into(),
+            preferred_mode_id: Some("full-auto".into()),
+            preferred_config_values: BTreeMap::from([
+                ("model".to_string(), "gpt-6-sol".to_string()),
+                ("reasoning_effort".to_string(), "high".to_string()),
+            ]),
+            config_fingerprint: "cfg".into(),
+        };
+        ledger::admit(
+            &db.conn,
+            ledger::AdmissionInput {
+                task_id: "source-sel".into(),
+                parent_conversation_id: parent.id,
+                child_conversation_id: child.id,
+                source_task_id: None,
+                task: "first round".into(),
+                requested_working_dir: None,
+                resume_binding: binding,
+            },
+        )
+        .await
+        .unwrap();
+        ledger::finish(
+            &db.conn,
+            parent.id,
+            "source-sel",
+            &DelegationTaskReport {
+                task_id: Some("source-sel".into()),
+                status: TaskStatus::Completed,
+                child_conversation_id: Some(child.id),
+                agent_type: Some(AgentType::Codex),
+                text: Some("done".into()),
+                error_code: None,
+                message: None,
+                duration_ms: Some(1),
+                blocked_on: None,
+                selectors: None,
+            },
+        )
+        .await
+        .unwrap();
+        ledger::mark_released(&db.conn, parent.id, "source-sel")
+            .await
+            .unwrap();
+
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-cont".into())).await;
+        mock.queue_send(Ok(child.id)).await;
+        let broker = DelegationBroker::new(
+            mock.clone() as Arc<dyn ConnectionSpawner>,
+            Arc::new(MockDepth(vec![(parent.id, None)]))
+                as Arc<dyn ConversationDepthLookup>,
+        )
+        .with_ledger(db.clone());
+        enable_delegation(&broker).await;
+
+        let ack = broker
+            .start_delegation(DelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "pt-cont".into(),
+                agent_type: AgentType::Codex,
+                task: "second round".into(),
+                working_dir: Some("/tmp/broker-cont-sel".into()),
+                requested_working_dir: None,
+                continue_from_task_id: Some("source-sel".into()),
+                external_handle: None,
+                selectors: SelectorPreferences::default(),
+            })
+            .await;
+        assert_eq!(ack.status, TaskStatus::Running, "{ack:?}");
+
+        // The continuation launched with the source task's selections —
+        // strictly restored, not re-picked and not defaulted.
+        let args = mock.spawn_args.lock().await;
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].preferred_mode_id.as_deref(), Some("full-auto"));
+        assert_eq!(
+            args[0].preferred_config_values,
+            BTreeMap::from([
+                ("model".to_string(), "gpt-6-sol".to_string()),
+                ("reasoning_effort".to_string(), "high".to_string()),
+            ])
+        );
     }
 
     #[tokio::test]
@@ -10003,7 +10734,7 @@ mod tests {
     /// can still call get_delegation_status / cancel_delegation.
     #[test]
     fn running_ack_message_embeds_task_id() {
-        let report = running_ack("task-xyz".into(), 42, AgentType::Codex);
+        let report = running_ack("task-xyz".into(), 42, AgentType::Codex, None);
         assert_eq!(report.task_id.as_deref(), Some("task-xyz"));
         assert!(
             report.message.as_deref().unwrap().contains("task-xyz"),
@@ -10039,6 +10770,7 @@ mod tests {
             agent_type: AgentType::ClaudeCode,
             status: TaskStatus::Completed,
             text: Some("x".repeat(text_len)),
+            selectors: None,
             error_code: None,
             message: None,
             duration_ms: 0,

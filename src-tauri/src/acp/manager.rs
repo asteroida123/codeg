@@ -4489,9 +4489,15 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                 )
                 .await
                 .map_err(|e| SpawnerError::Send(e.to_string()))?;
-            return result.map(DelegationDispatch::Started).ok_or_else(|| {
-                SpawnerError::Send("delegation did not bind a conversation".into())
-            });
+            return result
+                .map(|cid| DelegationDispatch::Started {
+                    child_conversation_id: cid,
+                    // Legacy no-admission path never read a child snapshot.
+                    effective: None,
+                })
+                .ok_or_else(|| {
+                    SpawnerError::Send("delegation did not bind a conversation".into())
+                });
         };
 
         let (agent_type, state, fingerprint) = {
@@ -4525,8 +4531,19 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
             .map_err(|e| SpawnerError::Send(e.to_string()))?
             .id
         };
-        let resume_binding = match admission.resume_binding.clone() {
-            Some(binding) => binding,
+        // The admission snapshot doubles as the selector source for BOTH the
+        // durable resume binding and the requested-vs-effective report: the
+        // same read captures what the launch-time preferences actually landed
+        // as (mode + every advertised config option's current value), so a
+        // continuation strictly restores what the report said was effective.
+        let (resume_binding, effective) = match admission.resume_binding.clone() {
+            Some(binding) => {
+                let effective = crate::acp::delegation::types::AppliedSelectors {
+                    mode: binding.preferred_mode_id.clone(),
+                    config_values: binding.preferred_config_values.clone(),
+                };
+                (binding, Some(effective))
+            }
             None => {
                 let snapshot = state.read().await;
                 let effective_config_values = snapshot
@@ -4544,22 +4561,28 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                         (option.id.clone(), value)
                     })
                     .collect();
-                crate::db::service::delegation_task_service::ResumeBinding {
-                    agent_type,
-                    external_session_id: snapshot.external_id.clone().ok_or_else(|| {
-                        SpawnerError::Send("child has no external session id".into())
-                    })?,
-                    child_conversation_id,
-                    working_dir: snapshot
-                        .working_dir
-                        .as_ref()
-                        .ok_or_else(|| SpawnerError::Send("child has no working directory".into()))?
-                        .to_string_lossy()
-                        .to_string(),
-                    preferred_mode_id: snapshot.current_mode.clone(),
-                    preferred_config_values: effective_config_values,
-                    config_fingerprint: fingerprint,
-                }
+                let effective = crate::acp::delegation::types::AppliedSelectors {
+                    mode: snapshot.current_mode.clone(),
+                    config_values: effective_config_values,
+                };
+                let binding =
+                    crate::db::service::delegation_task_service::ResumeBinding {
+                        agent_type,
+                        external_session_id: snapshot.external_id.clone().ok_or_else(|| {
+                            SpawnerError::Send("child has no external session id".into())
+                        })?,
+                        child_conversation_id,
+                        working_dir: snapshot
+                            .working_dir
+                            .as_ref()
+                            .ok_or_else(|| SpawnerError::Send("child has no working directory".into()))?
+                            .to_string_lossy()
+                            .to_string(),
+                        preferred_mode_id: snapshot.current_mode.clone(),
+                        preferred_config_values: effective.config_values.clone(),
+                        config_fingerprint: fingerprint,
+                    };
+                (binding, Some(effective))
             }
         };
         let input = crate::db::service::delegation_task_service::AdmissionInput {
@@ -4615,6 +4638,7 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                 message: Some(error.to_string()),
                 duration_ms: Some(0),
                 blocked_on: None,
+                selectors: None,
             };
             crate::db::service::delegation_task_service::finish(
                 &self.db.conn,
@@ -4626,7 +4650,10 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
             .map_err(|e| SpawnerError::Send(e.to_string()))?;
             return Ok(DelegationDispatch::Failed(report));
         }
-        Ok(DelegationDispatch::Started(child_conversation_id))
+        Ok(DelegationDispatch::Started {
+            child_conversation_id,
+            effective,
+        })
     }
 
     async fn spawn_for_resume(
