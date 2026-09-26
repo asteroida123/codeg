@@ -3058,8 +3058,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             //
             // `engines.node: "^22.16.0 || ^24.0.0 || ^25.0.0"`.
             distribution: AgentDistribution::Npx {
-                version: "0.1.4",
-                package: "zcode-codeg-adapter@0.1.4",
+                version: "0.1.5",
+                package: "zcode-codeg-adapter@0.1.5",
                 cmd: "zcode-codeg-acp",
                 args: &[],
                 env: &[],
@@ -3420,8 +3420,8 @@ mod tests {
         // would leave the Upgrade button installing an unaudited build.
         assert_npx_version(
             AgentType::ZCode,
-            "0.1.4",
-            "zcode-codeg-adapter@0.1.4",
+            "0.1.5",
+            "zcode-codeg-adapter@0.1.5",
             Some("22.16.0"),
         );
         assert_binary_version(AgentType::OpenCode, "1.18.32", "/releases/download/v1.18.32/");
