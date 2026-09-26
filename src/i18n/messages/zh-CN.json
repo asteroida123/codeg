@@ -5676,7 +5676,12 @@
     "delegationStatusInterrupted": "已中断",
     "delegationContinuation": "续接轮次",
     "delegationOpenSession": "打开会话",
-    "freshSessionLabel": "启动新会话"
+    "freshSessionLabel": "启动新会话",
+    "blockedTitle": "等待开始",
+    "blockedReasonDependency": "需要先完成 {count} 个前置任务。",
+    "blockedReasonRuns": "该子任务已达到父任务的运行次数上限。",
+    "blockedReasonBudget": "父任务的 token 预算已用完。",
+    "blockedRemoveDependency": "移除该依赖"
   },
   "CustomSkillsSettings": {
     "loading": "正在加载自定义技能…",

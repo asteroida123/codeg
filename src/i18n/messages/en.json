@@ -5676,7 +5676,12 @@
     "delegationStatusInterrupted": "Interrupted",
     "delegationContinuation": "Continuation round",
     "delegationOpenSession": "Open session",
-    "freshSessionLabel": "Start a new session"
+    "freshSessionLabel": "Start a new session",
+    "blockedTitle": "Waiting to start",
+    "blockedReasonDependency": "Waiting for {count} earlier task(s) to finish first.",
+    "blockedReasonRuns": "This subtask has reached the parent task's run limit.",
+    "blockedReasonBudget": "The parent task's token budget is used up.",
+    "blockedRemoveDependency": "Remove this dependency"
   },
   "CustomSkillsSettings": {
     "loading": "Loading custom skills…",

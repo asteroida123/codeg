@@ -5676,7 +5676,12 @@
     "delegationStatusInterrupted": "متقطعة",
     "delegationContinuation": "جولة متابعة",
     "delegationOpenSession": "فتح الجلسة",
-    "freshSessionLabel": "بدء جلسة جديدة"
+    "freshSessionLabel": "بدء جلسة جديدة",
+    "blockedTitle": "في انتظار البدء",
+    "blockedReasonDependency": "يجب إنهاء {count} مهمة سابقة أولاً.",
+    "blockedReasonRuns": "وصلت هذه المهمة الفرعية إلى حد مرات التشغيل للمهمة الأصلية.",
+    "blockedReasonBudget": "تم استهلاك ميزانية الرموز للمهمة الأصلية.",
+    "blockedRemoveDependency": "إزالة هذا الاعتماد"
   },
   "CustomSkillsSettings": {
     "loading": "جارٍ تحميل المهارات المخصّصة…",

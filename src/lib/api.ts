@@ -3676,6 +3676,22 @@ export async function workTaskDelete(
   return getTransport().call("work_task_delete", { id, deleteWorktree })
 }
 
+/**
+ * Drop one dependency edge from a task. Dependencies are never removed
+ * automatically — a failed or deleted dependency leaves its dependent blocked
+ * on purpose, and this is the deliberate way out. Resolves `false` when the
+ * edge was already gone.
+ */
+export async function workTaskDependencyRemove(
+  taskId: number,
+  dependsOnTaskId: number
+): Promise<boolean> {
+  return getTransport().call("work_task_dependency_remove", {
+    taskId,
+    dependsOnTaskId,
+  })
+}
+
 export async function workTaskStart(id: number): Promise<void> {
   return getTransport().call("work_task_start", { id })
 }

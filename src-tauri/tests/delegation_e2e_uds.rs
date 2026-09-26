@@ -147,6 +147,13 @@ impl codeg_lib::acp::chat_authoring::ChatAuthoringAccess for NoAuthoring {
     ) -> codeg_lib::acp::chat_authoring::AuthoringOutcome {
         codeg_lib::acp::chat_authoring::AuthoringOutcome::rejected("work_task", "no authoring")
     }
+    async fn work_task_tool(
+        &self,
+        _ctx: codeg_lib::acp::chat_authoring::AuthoringContext,
+        _call: codeg_lib::acp::chat_authoring::WorkTaskToolCall,
+    ) -> codeg_lib::acp::chat_authoring::WorkTaskToolOutcome {
+        codeg_lib::acp::chat_authoring::WorkTaskToolOutcome::refused("no authoring")
+    }
 }
 
 /// Controllable question access for the ask round-trip test: `register_question`

@@ -225,6 +225,30 @@ pub async fn work_task_get(
     Ok(Json(result))
 }
 
+/// Remove one dependency edge from a task. Resolves `false` when the edge was
+/// not there — "nothing to remove" is an answer, not an error.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DependencyRemoveParams {
+    pub task_id: i32,
+    pub depends_on_task_id: i32,
+}
+
+pub async fn work_task_dependency_remove(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<DependencyRemoveParams>,
+) -> Result<Json<bool>, AppCommandError> {
+    let result = core::work_task_dependency_remove_core(
+        &state.emitter,
+        &state.db,
+        params.task_id,
+        params.depends_on_task_id,
+    )
+    .await
+    .map_err(AppCommandError::from)?;
+    Ok(Json(result))
+}
+
 pub async fn work_task_events(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<EventsParams>,

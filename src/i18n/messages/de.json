@@ -5676,7 +5676,12 @@
     "delegationStatusInterrupted": "Unterbrochen",
     "delegationContinuation": "Fortsetzungsrunde",
     "delegationOpenSession": "Sitzung öffnen",
-    "freshSessionLabel": "Neue Sitzung starten"
+    "freshSessionLabel": "Neue Sitzung starten",
+    "blockedTitle": "Wartet auf den Start",
+    "blockedReasonDependency": "Zuerst müssen {count} vorherige Aufgabe(n) fertig werden.",
+    "blockedReasonRuns": "Diese Unteraufgabe hat das Ausführungslimit der Hauptaufgabe erreicht.",
+    "blockedReasonBudget": "Das Token-Budget der Hauptaufgabe ist aufgebraucht.",
+    "blockedRemoveDependency": "Diese Abhängigkeit entfernen"
   },
   "CustomSkillsSettings": {
     "loading": "Benutzerdefinierte Skills werden geladen…",

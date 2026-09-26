@@ -1526,6 +1526,10 @@ pub fn build_router(
             post(handlers::work_task::work_task_delete),
         )
         .route(
+            "/work_task_dependency_remove",
+            post(handlers::work_task::work_task_dependency_remove),
+        )
+        .route(
             "/work_task_start",
             post(handlers::work_task::work_task_start),
         )

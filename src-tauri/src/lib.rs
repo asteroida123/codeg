@@ -1914,6 +1914,7 @@ mod tauri_app {
                 work_task_commands::work_task_update,
                 work_task_commands::work_task_reorder,
                 work_task_commands::work_task_delete,
+                work_task_commands::work_task_dependency_remove,
                 work_task_commands::work_task_start,
                 work_task_commands::work_task_start_all,
                 work_task_commands::work_task_retry,

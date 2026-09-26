@@ -23,11 +23,13 @@ use sea_orm::{
 };
 
 use crate::db::entities::work_task::WorkTaskStatus;
-use crate::db::entities::{folder, work_task, work_task_event, work_task_settings, work_task_template};
+use crate::db::entities::{
+    folder, work_task, work_task_dependency, work_task_event, work_task_settings, work_task_template,
+};
 use crate::db::error::DbError;
 use crate::models::{
-    WorkTaskConfig, WorkTaskDraft, WorkTaskEventInfo, WorkTaskFolderSettings, WorkTaskInfo,
-    WorkTaskMergeState, WorkTaskQueuedMerge,
+    WorkTaskBlocked, WorkTaskConfig, WorkTaskDependencyRef, WorkTaskDraft, WorkTaskEventInfo,
+    WorkTaskFolderSettings, WorkTaskInfo, WorkTaskMergeState, WorkTaskQueuedMerge,
 };
 
 // `WorkTaskPreflight` is referenced via `crate::models::` in its fns to keep
@@ -186,14 +188,21 @@ pub async fn list(
         .all(conn)
         .await?;
     let mut infos: Vec<WorkTaskInfo> = rows.into_iter().map(to_info).collect();
+    attach_live_progress(conn, &mut infos).await?;
+    Ok(infos)
+}
 
-    // What a live card says it is doing: the generation's latest
-    // `agent_progress` milestone, and whether it is currently parked on a
-    // pre-prompt context compaction. Both come from the same sweep.
-    //
-    // `preparing` is in the set because a round that resumes a session spends
-    // that status on a real agent turn — the compaction, which on a full
-    // context window runs for minutes with nothing else to show for it.
+/// Fill `latest_progress` / `compacting` on the rows of a list: the
+/// generation's latest `agent_progress` milestone, and whether it is currently
+/// parked on a pre-prompt context compaction. Both come from the same sweep.
+///
+/// `preparing` is in the set because a round that resumes a session spends
+/// that status on a real agent turn — the compaction, which on a full context
+/// window runs for minutes with nothing else to show for it.
+async fn attach_live_progress<C: ConnectionTrait>(
+    conn: &C,
+    infos: &mut [WorkTaskInfo],
+) -> Result<(), DbError> {
     let live_ids: Vec<i32> = infos
         .iter()
         .filter(|t| {
@@ -269,14 +278,14 @@ pub async fn list(
                 _ => {}
             }
         }
-        for t in &mut infos {
+        for t in infos.iter_mut() {
             if let Some(m) = latest.get(&t.id) {
                 t.latest_progress = Some(m.clone());
             }
             t.compacting = compacting.get(&t.id).copied().unwrap_or(false);
         }
     }
-    Ok(infos)
+    Ok(())
 }
 
 pub async fn get(conn: &DatabaseConnection, id: i32) -> Result<WorkTaskInfo, DbError> {
@@ -529,19 +538,76 @@ pub async fn create(
     let config_str = serde_json::to_string(&draft.config)
         .map_err(|e| DbError::Validation(format!("config not serializable: {e}")))?;
     let now = Utc::now();
-    let max_order = work_task::Entity::find()
-        .filter(work_task::Column::FolderId.eq(draft.folder_id))
+    let max_order = max_sort_order(conn, draft.folder_id).await?;
+
+    let txn = conn.begin().await?;
+    let row = insert_todo_row(
+        &txn,
+        &draft,
+        config_str,
+        max_order + 1,
+        now,
+        CreatedUnder::default(),
+    )
+    .await?;
+    record_event(&txn, row.id, "created", "user", None).await?;
+    txn.commit().await?;
+    Ok(to_info(row))
+}
+
+/// `create` for an agent-authored task: the same row, plus the conversation
+/// that asked for it. That stamp is the ONLY authorization anchor the
+/// orchestration tools have — a task created from chat is the caller's to
+/// start, cancel, and split, and nobody else's.
+pub async fn create_authored(
+    conn: &DatabaseConnection,
+    draft: WorkTaskDraft,
+    created_by_conversation_id: Option<i32>,
+) -> Result<WorkTaskInfo, DbError> {
+    validate_draft(&draft)?;
+    let folder = folder::Entity::find_by_id(draft.folder_id)
+        .one(conn)
+        .await?
+        .filter(|f| f.deleted_at.is_none())
+        .ok_or_else(|| DbError::NotFound(format!("folder {}", draft.folder_id)))?;
+    if folder.parent_id.is_some() {
+        return Err(DbError::Validation(
+            "tasks must target a project folder, not a worktree".into(),
+        ));
+    }
+    let config_str = serde_json::to_string(&draft.config)
+        .map_err(|e| DbError::Validation(format!("config not serializable: {e}")))?;
+    let now = Utc::now();
+    let max_order = max_sort_order(conn, draft.folder_id).await?;
+    let txn = conn.begin().await?;
+    let row = insert_todo_row(
+        &txn,
+        &draft,
+        config_str,
+        max_order + 1,
+        now,
+        CreatedUnder {
+            created_by_conversation_id,
+            ..Default::default()
+        },
+    )
+    .await?;
+    record_event(&txn, row.id, "created", "user", None).await?;
+    txn.commit().await?;
+    Ok(to_info(row))
+}
+
+/// Highest `sort_order` currently in the folder (0 when empty). Read outside
+/// the create transaction exactly like `create` does — a stale value only
+/// affects board ordering, never correctness.
+async fn max_sort_order(conn: &DatabaseConnection, folder_id: i32) -> Result<i32, DbError> {
+    Ok(work_task::Entity::find()
+        .filter(work_task::Column::FolderId.eq(folder_id))
         .order_by_desc(work_task::Column::SortOrder)
         .one(conn)
         .await?
         .map(|m| m.sort_order)
-        .unwrap_or(0);
-
-    let txn = conn.begin().await?;
-    let row = insert_todo_row(&txn, &draft, config_str, max_order, now, None).await?;
-    record_event(&txn, row.id, "created", "user", None).await?;
-    txn.commit().await?;
-    Ok(to_info(row))
+        .unwrap_or(0))
 }
 
 /// Outcome of a forge-triggered create: either the new task, or the ACTIVE
@@ -588,17 +654,22 @@ pub async fn create_from_forge(
     let config_str = serde_json::to_string(&draft.config)
         .map_err(|e| DbError::Validation(format!("config not serializable: {e}")))?;
     let now = Utc::now();
-    let max_order = work_task::Entity::find()
-        .filter(work_task::Column::FolderId.eq(draft.folder_id))
-        .order_by_desc(work_task::Column::SortOrder)
-        .one(conn)
-        .await?
-        .map(|m| m.sort_order)
-        .unwrap_or(0);
+    let max_order = max_sort_order(conn, draft.folder_id).await?;
 
     let txn = conn.begin().await?;
     // FIRST statement: the write. See the doc comment — this is load-bearing.
-    let row = insert_todo_row(&txn, &draft, config_str, max_order, now, Some(&source)).await?;
+    let row = insert_todo_row(
+        &txn,
+        &draft,
+        config_str,
+        max_order + 1,
+        now,
+        CreatedUnder {
+            source: Some(&source),
+            ..Default::default()
+        },
+    )
+    .await?;
     if !force {
         if let Some(existing) =
             other_active_with_same_source(&txn, row.id, &source.key).await?
@@ -687,15 +758,29 @@ pub async fn lookup_latest_by_source_keys(
         .collect())
 }
 
+/// Row-level provenance a create path stamps beyond the draft itself: forge
+/// source columns, the split parent, and the conversation that asked for the
+/// task (the authorization anchor for the agent-facing orchestration tools).
+#[derive(Default, Clone, Copy)]
+struct CreatedUnder<'a> {
+    source: Option<&'a crate::models::WorkTaskSource>,
+    parent_id: Option<i32>,
+    created_by_conversation_id: Option<i32>,
+}
+
+/// `sort_order` is passed in rather than derived here so a split can lay its
+/// children out in one ascending run while every other create path simply
+/// appends (see the callers' max_order read).
 async fn insert_todo_row<C: ConnectionTrait>(
     txn: &C,
     draft: &WorkTaskDraft,
     config_str: String,
-    max_order: i32,
+    sort_order: i32,
     now: chrono::DateTime<Utc>,
-    source: Option<&crate::models::WorkTaskSource>,
+    under: CreatedUnder<'_>,
 ) -> Result<work_task::Model, DbError> {
-    let source_meta = source
+    let source_meta = under
+        .source
         .map(|s| {
             serde_json::to_string(&s.meta)
                 .map_err(|e| DbError::Validation(format!("source meta not serializable: {e}")))
@@ -710,7 +795,7 @@ async fn insert_todo_row<C: ConnectionTrait>(
         failure_reason: Set(None),
         last_error: Set(None),
         run_seq: Set(0),
-        sort_order: Set(max_order + 1),
+        sort_order: Set(sort_order),
         worktree_folder_id: Set(None),
         conversation_id: Set(None),
         connection_id: Set(None),
@@ -730,11 +815,11 @@ async fn insert_todo_row<C: ConnectionTrait>(
         preflight: Set(None),
         archived_at: Set(None),
         scheduled_at: Set(None),
-        source_kind: Set(source.map(|s| s.kind.clone())),
-        source_key: Set(source.map(|s| s.key.clone())),
+        source_kind: Set(under.source.map(|s| s.kind.clone())),
+        source_key: Set(under.source.map(|s| s.key.clone())),
         source_meta: Set(source_meta),
-        parent_id: Set(None),
-        created_by_conversation_id: Set(None),
+        parent_id: Set(under.parent_id),
+        created_by_conversation_id: Set(under.created_by_conversation_id),
         max_concurrent_children: Set(None),
         max_runs_per_child: Set(None),
         token_budget: Set(None),
@@ -965,6 +1050,25 @@ async fn claim_inner(
         .one(&txn)
         .await?
         .ok_or_else(|| DbError::NotFound(format!("work task {id}")))?;
+    // The orchestration gate, inside the SAME transaction that just won the
+    // CAS. It only guards the `todo → queued` step, which is the one claim a
+    // dependency / parent limit is about: a retry of a `failed` task, a
+    // follow-up on `review` or a requeue of `canceled` are explicit user
+    // decisions about work that already ran, and re-gating them would strand a
+    // task whose dependency failed after its first attempt with no way back.
+    // Losing here is `Ok(None)`, exactly like losing the CAS — callers report a
+    // refusal, and the board derives the readable reason from the same
+    // `blocked_for` (see `annotate_blocked`).
+    if from == WorkTaskStatus::Todo {
+        if let Some(blocked) = blocked_for_claimed(&txn, &claimed).await? {
+            txn.rollback().await?;
+            tracing::info!(
+                "[work_task] claim of {id} refused: blocked ({})",
+                blocked.reason
+            );
+            return Ok(None);
+        }
+    }
     // Resurrection guard, inside the SAME transaction as the winning CAS: a
     // failed/canceled forge task must not come back to life while ANOTHER
     // active task already handles the same work item ("trigger a replacement,
@@ -1037,21 +1141,35 @@ pub async fn reorder(
 /// reservation safe against concurrent manual starts. `max_concurrent <= 0`
 /// means unlimited. Returns the claimed task id, or `None` when the folder has
 /// no todo task or the budget is spent.
+///
+/// A BLOCKED head must not stall the folder behind it: a todo whose
+/// dependencies are unmet (or whose parent's limits are spent) is skipped, and
+/// the scan moves on to the next candidate. Without that, one unmeetable
+/// dependency would park every later todo in the folder forever — and, since
+/// the head would be re-read unchanged, it would also spin. `excluded` carries
+/// the ids this pass has already ruled out (blocked, or lost to a concurrent
+/// claim) so each iteration makes progress and the loop always terminates.
 pub async fn auto_claim_next(
     conn: &DatabaseConnection,
     folder_id: i32,
     max_concurrent: i32,
 ) -> Result<Option<i32>, DbError> {
+    let mut excluded: Vec<i32> = Vec::new();
     loop {
         // Head lookup runs outside the transaction so the write stays first;
         // the CAS below re-checks the status and simply retries on a miss.
-        let head = work_task::Entity::find()
+        let mut head_query = work_task::Entity::find()
             .filter(work_task::Column::DeletedAt.is_null())
             .filter(work_task::Column::FolderId.eq(folder_id))
             .filter(work_task::Column::Status.eq(WorkTaskStatus::Todo))
             .filter(work_task::Column::ScheduledAt.is_null())
             .inner_join(folder::Entity)
-            .filter(folder::Column::DeletedAt.is_null())
+            .filter(folder::Column::DeletedAt.is_null());
+        if !excluded.is_empty() {
+            head_query =
+                head_query.filter(work_task::Column::Id.is_not_in(excluded.iter().copied()));
+        }
+        let head = head_query
             .order_by_asc(work_task::Column::SortOrder)
             .order_by_asc(work_task::Column::Id)
             .one(conn)
@@ -1088,8 +1206,20 @@ pub async fn auto_claim_next(
             .await?;
         if res.rows_affected != 1 {
             // Someone moved the head (manual start, edit, delete, a plan) —
-            // retry with the fresh head.
+            // move on to the next candidate.
             txn.rollback().await?;
+            excluded.push(head.id);
+            continue;
+        }
+        let claimed = work_task::Entity::find_by_id(head.id)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| DbError::NotFound(format!("work task {}", head.id)))?;
+        // Dependency / parent-limit gate, inside the transaction. Rejected ⇒
+        // skip this candidate and try the next one (see the doc comment).
+        if blocked_for_claimed(&txn, &claimed).await?.is_some() {
+            txn.rollback().await?;
+            excluded.push(head.id);
             continue;
         }
         if max_concurrent > 0 {
@@ -1190,6 +1320,15 @@ pub async fn claim_due_scheduled(
 
     let mut claimed = Vec::new();
     for row in due {
+        // The same orchestration gate every other todo claim runs. Checked
+        // BEFORE the transaction (cheap, no write churn) and again inside it —
+        // the plan is deliberately NOT consumed on a refusal: it stays parked
+        // until the dependencies land or the user removes the edge, and the
+        // board's derived `blocked` explains why it has not started. Nothing is
+        // auto-failed, and nothing is auto-removed.
+        if blocked_for(conn, &row).await?.is_some() {
+            continue;
+        }
         let txn = conn.begin().await?;
         let res = work_task::Entity::update_many()
             .col_expr(
@@ -1223,6 +1362,17 @@ pub async fn claim_due_scheduled(
             .await?;
         if res.rows_affected != 1 {
             // Started by hand, re-planned, or deleted since the scan.
+            txn.rollback().await?;
+            continue;
+        }
+        // Authoritative re-check inside the transaction: the pre-check above
+        // could be stale, and consuming the plan for a task that is not
+        // actually claimable would lose the user's chosen time.
+        let claimed_row = work_task::Entity::find_by_id(row.id)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| DbError::NotFound(format!("work task {}", row.id)))?;
+        if blocked_for_claimed(&txn, &claimed_row).await?.is_some() {
             txn.rollback().await?;
             continue;
         }
@@ -2178,6 +2328,8 @@ pub async fn complete_delivered(
     )
     .await?;
     txn.commit().await?;
+    // A `done` task lifts the dependency gate of everything waiting on it.
+    wake_dependents(conn, id).await;
     Ok(true)
 }
 
@@ -2234,6 +2386,8 @@ pub async fn merge_landed(
     )
     .await?;
     txn.commit().await?;
+    // A `done` task lifts the dependency gate of everything waiting on it.
+    wake_dependents(conn, id).await;
     Ok(true)
 }
 
@@ -2284,6 +2438,8 @@ pub async fn complete_without_merge(
     )
     .await?;
     txn.commit().await?;
+    // A `done` task lifts the dependency gate of everything waiting on it.
+    wake_dependents(conn, id).await;
     Ok(true)
 }
 
@@ -2687,6 +2843,964 @@ pub async fn boot_reconcile_interrupted(conn: &DatabaseConnection) -> Result<u64
         }
     }
     Ok(n)
+}
+
+// ── orchestration: children, dependencies, claim gates ─────────────────────
+//
+// The hierarchy is capped at two levels: children exist only under a TOP-LEVEL
+// task (`parent_id IS NULL`), and they live in the parent's folder. A parent
+// stays an ordinary runnable task; that is how "integrate after the pieces"
+// works — `parent_depends_on_children` simply points the parent's own
+// dependency gate at its children.
+//
+// Dependencies are a HARD gate that never auto-fails anything. An edge only
+// ever blocks a claim: a failed / canceled / deleted dependency leaves its
+// dependent in `todo` with a derived `blocked` reason, and the user (or the
+// agent that built the split) decides whether to fix the dependency or drop
+// the edge. Nothing is auto-removed, nothing is auto-failed.
+//
+// The limits live on the PARENT row and gate a CHILD's claim, inside the same
+// transaction as that claim's status CAS — never mid-run:
+//   * `max_concurrent_children` — how many of the parent's children may hold a
+//     run slot (queued → merging) at once,
+//   * `max_runs_per_child` — how many execution generations one child may have,
+//   * `token_budget` — total tokens across the parent's own conversation plus
+//     all of its children's current conversations.
+// `<= 0` means "no limit" on all three, the same convention the folder's
+// `max_concurrent` uses.
+
+/// How many children one `split_work_task` call may create. A bound, not a
+/// policy: one tool call should not be able to fill a board.
+pub const MAX_SPLIT_CHILDREN: usize = 20;
+
+/// Statuses that occupy a run slot for `max_concurrent_children`. Deliberately
+/// narrower than [`ACTIVE_STATUSES`], which also counts `todo` (a card waiting
+/// on the board) and `review` (a finished round waiting on the user): a
+/// CONCURRENCY limit counts children competing for execution, and counting a
+/// sibling's `todo` row would make the parent's plan unclaimable from the
+/// start.
+pub const CHILD_RUNNING_STATUSES: [WorkTaskStatus; 5] = [
+    WorkTaskStatus::Queued,
+    WorkTaskStatus::Preparing,
+    WorkTaskStatus::Running,
+    WorkTaskStatus::AwaitingInput,
+    WorkTaskStatus::Merging,
+];
+
+/// One child a split call creates.
+#[derive(Debug, Clone)]
+pub struct WorkTaskChildDraft {
+    pub title: String,
+    pub config: serde_json::Value,
+    /// 0-based indexes into the SAME call's child list — intra-call edges of
+    /// the split's dependency chain.
+    pub depends_on_index: Vec<usize>,
+}
+
+/// A validated `split_work_task` request, handed to
+/// [`split_task`] by the agent-facing access impl.
+#[derive(Debug, Clone)]
+pub struct SplitTaskRequest {
+    pub parent_id: i32,
+    pub children: Vec<WorkTaskChildDraft>,
+    /// Extra dependencies applied to EVERY created child (ids of existing live
+    /// tasks in the parent's folder).
+    pub depends_on_task_ids: Vec<i32>,
+    /// Per-child limits written onto the parent row; `None` leaves the stored
+    /// value alone.
+    pub max_concurrent_children: Option<i32>,
+    pub max_runs_per_child: Option<i32>,
+    pub token_budget: Option<i64>,
+    /// Wire the parent's own gate to every child, so the parent can only start
+    /// once all the pieces are `done`.
+    pub parent_depends_on_children: bool,
+    /// The conversation that asked — stamped on every child so the
+    /// orchestration tools can later tell whose tasks they are.
+    pub created_by_conversation_id: Option<i32>,
+}
+
+/// What a split created, in board order.
+#[derive(Debug, Clone)]
+pub struct SplitTaskOutcome {
+    pub parent_id: i32,
+    pub children: Vec<WorkTaskInfo>,
+}
+
+/// Create a split's children under `parent`, wire the dependency edges, and
+/// write the parent's limits — all in ONE transaction, so a rejected edge
+/// (cycle, cross-folder, self) can never leave half a split behind.
+///
+/// Ordering: all reads (parent, child validation, edge validation, max
+/// sort_order) happen BEFORE the transaction's first write, following the
+/// repo's write-first-under-WAL idiom — a deferred read-then-write transaction
+/// can fail to upgrade its lock instead of waiting. The validation snapshot is
+/// therefore advisory; the post-insert cycle check inside the transaction is
+/// the authoritative one and rolls the whole call back.
+pub async fn split_task(
+    conn: &DatabaseConnection,
+    req: SplitTaskRequest,
+) -> Result<SplitTaskOutcome, DbError> {
+    if req.children.is_empty() {
+        return Err(DbError::Validation("a split needs at least one subtask".into()));
+    }
+    if req.children.len() > MAX_SPLIT_CHILDREN {
+        return Err(DbError::Validation(format!(
+            "a split creates at most {MAX_SPLIT_CHILDREN} subtasks ({} requested)",
+            req.children.len()
+        )));
+    }
+    validate_child_limits(
+        req.max_concurrent_children,
+        req.max_runs_per_child,
+        req.token_budget,
+    )?;
+    let parent = get_model(conn, req.parent_id).await?;
+    if parent.parent_id.is_some() {
+        return Err(DbError::Validation(
+            "the split parent must be a top-level task: the hierarchy is two levels deep".into(),
+        ));
+    }
+
+    // Each child is validated exactly like a solo create (title + prompt).
+    let mut drafts = Vec::with_capacity(req.children.len());
+    for child in &req.children {
+        let draft = WorkTaskDraft {
+            folder_id: parent.folder_id,
+            title: child.title.clone(),
+            config: child.config.clone(),
+        };
+        validate_draft(&draft)?;
+        drafts.push(draft);
+    }
+
+    // Intra-call edges: every index must be in range and never the child
+    // itself; a cycle among the new children is refused up front for a
+    // readable error.
+    for (idx, child) in req.children.iter().enumerate() {
+        for dep in &child.depends_on_index {
+            if *dep >= req.children.len() {
+                return Err(DbError::Validation(format!(
+                    "subtask {} depends_on_index {dep} is out of range (0..{})",
+                    idx,
+                    req.children.len()
+                )));
+            }
+            if *dep == idx {
+                return Err(DbError::Validation(format!(
+                    "subtask {idx} cannot depend on itself"
+                )));
+            }
+        }
+    }
+    if intra_call_has_cycle(&req.children) {
+        return Err(DbError::Validation(
+            "the subtasks' depends_on_index list contains a cycle".into(),
+        ));
+    }
+
+    // Extra deps must exist, be live, and live in the parent's folder.
+    let mut extra_deps: Vec<i32> = Vec::new();
+    for raw in &req.depends_on_task_ids {
+        if extra_deps.contains(raw) {
+            continue;
+        }
+        if *raw == req.parent_id {
+            return Err(DbError::Validation(
+                "a subtask cannot depend on the task being split".into(),
+            ));
+        }
+        let row = work_task::Entity::find_by_id(*raw)
+            .one(conn)
+            .await?
+            .filter(|m| m.deleted_at.is_none())
+            .ok_or_else(|| {
+                DbError::Validation(format!("dependency {raw} does not exist"))
+            })?;
+        if row.folder_id != parent.folder_id {
+            return Err(DbError::Validation(format!(
+                "dependency {raw} is in another project folder; dependencies are same-folder only"
+            )));
+        }
+        extra_deps.push(*raw);
+    }
+
+    let now = Utc::now();
+    let mut next_order = max_sort_order(conn, parent.folder_id).await? + 1;
+    let txn = conn.begin().await?;
+
+    // Children, in call order, so their board order mirrors the split.
+    let mut child_models = Vec::with_capacity(drafts.len());
+    for draft in &drafts {
+        let config_str = serde_json::to_string(&draft.config)
+            .map_err(|e| DbError::Validation(format!("config not serializable: {e}")))?;
+        let row = insert_todo_row(
+            &txn,
+            draft,
+            config_str,
+            next_order,
+            now,
+            CreatedUnder {
+                parent_id: Some(parent.id),
+                created_by_conversation_id: req.created_by_conversation_id,
+                ..Default::default()
+            },
+        )
+        .await?;
+        next_order += 1;
+        record_event(
+            &txn,
+            row.id,
+            "created",
+            "agent",
+            Some(serde_json::json!({ "parent_id": parent.id, "split": true })),
+        )
+        .await?;
+        child_models.push(row);
+    }
+
+    // Intra-call edges (child → earlier/later sibling), then the extra deps.
+    for (idx, child) in req.children.iter().enumerate() {
+        let task_id = child_models[idx].id;
+        for dep in &child.depends_on_index {
+            insert_dependency_row(&txn, task_id, child_models[*dep].id).await?;
+        }
+        for dep in &extra_deps {
+            insert_dependency_row(&txn, task_id, *dep).await?;
+        }
+    }
+    // "Integrate after the pieces": the PARENT waits for its children.
+    if req.parent_depends_on_children {
+        for child in &child_models {
+            insert_dependency_row(&txn, parent.id, child.id).await?;
+        }
+    }
+
+    // Authoritative cycle check over the whole folder's edges, new ones
+    // included (the parent→child edges can close a loop through an extra dep
+    // that already waits on the parent).
+    if folder_edge_cycle(&txn, parent.folder_id).await? {
+        txn.rollback().await?;
+        return Err(DbError::Validation(
+            "these dependencies would create a cycle in this project's tasks".into(),
+        ));
+    }
+
+    // Limits: only the fields the caller passed move.
+    if req.max_concurrent_children.is_some()
+        || req.max_runs_per_child.is_some()
+        || req.token_budget.is_some()
+    {
+        let mut update = work_task::Entity::update_many()
+            .col_expr(work_task::Column::UpdatedAt, Expr::value(now))
+            .filter(work_task::Column::Id.eq(parent.id))
+            .filter(work_task::Column::DeletedAt.is_null());
+        if let Some(v) = req.max_concurrent_children {
+            update = update.col_expr(work_task::Column::MaxConcurrentChildren, Expr::value(Some(v)));
+        }
+        if let Some(v) = req.max_runs_per_child {
+            update = update.col_expr(work_task::Column::MaxRunsPerChild, Expr::value(Some(v)));
+        }
+        if let Some(v) = req.token_budget {
+            update = update.col_expr(work_task::Column::TokenBudget, Expr::value(Some(v)));
+        }
+        update.exec(&txn).await?;
+        record_event(
+            &txn,
+            parent.id,
+            "limits_set",
+            "agent",
+            Some(serde_json::json!({
+                "max_concurrent_children": req.max_concurrent_children,
+                "max_runs_per_child": req.max_runs_per_child,
+                "token_budget": req.token_budget,
+            })),
+        )
+        .await?;
+    }
+
+    txn.commit().await?;
+    Ok(SplitTaskOutcome {
+        parent_id: parent.id,
+        children: child_models.into_iter().map(to_info).collect(),
+    })
+}
+
+fn validate_child_limits(
+    max_concurrent_children: Option<i32>,
+    max_runs_per_child: Option<i32>,
+    token_budget: Option<i64>,
+) -> Result<(), DbError> {
+    // `<= 0` already reads as "unlimited" everywhere else, so a non-positive
+    // value here is a caller bug, not an instruction to disable the gate.
+    if let Some(v) = max_concurrent_children {
+        if v <= 0 {
+            return Err(DbError::Validation(
+                "max_concurrent_children must be a positive number".into(),
+            ));
+        }
+    }
+    if let Some(v) = max_runs_per_child {
+        if v <= 0 {
+            return Err(DbError::Validation(
+                "max_runs_per_child must be a positive number".into(),
+            ));
+        }
+    }
+    if let Some(v) = token_budget {
+        if v <= 0 {
+            return Err(DbError::Validation(
+                "token_budget must be a positive number of tokens".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Cycle check over one child list's `depends_on_index` edges (i → j means "i
+/// waits for j"). Depth-first with a three-colour marking: a grey node reached
+/// again is a back edge.
+fn intra_call_has_cycle(children: &[WorkTaskChildDraft]) -> bool {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mark {
+        White,
+        Grey,
+        Black,
+    }
+    fn visit(children: &[WorkTaskChildDraft], idx: usize, marks: &mut Vec<Mark>) -> bool {
+        match marks[idx] {
+            Mark::Grey => return true,
+            Mark::Black => return false,
+            Mark::White => {}
+        }
+        marks[idx] = Mark::Grey;
+        for dep in &children[idx].depends_on_index {
+            if visit(children, *dep, marks) {
+                return true;
+            }
+        }
+        marks[idx] = Mark::Black;
+        false
+    }
+    let mut marks = vec![Mark::White; children.len()];
+    (0..children.len()).any(|idx| visit(children, idx, &mut marks))
+}
+
+/// Insert one dependency edge. Duplicate pairs are silently ignored (`INSERT
+/// OR IGNORE` semantics via an existence probe) — "ensure this edge exists" is
+/// what a split means on a re-run, and the unique index would otherwise turn a
+/// harmless repeat into an error.
+async fn insert_dependency_row<C: ConnectionTrait>(
+    conn: &C,
+    task_id: i32,
+    depends_on_task_id: i32,
+) -> Result<(), DbError> {
+    if task_id == depends_on_task_id {
+        return Err(DbError::Validation("a task cannot depend on itself".into()));
+    }
+    let existing = work_task_dependency::Entity::find()
+        .filter(work_task_dependency::Column::TaskId.eq(task_id))
+        .filter(work_task_dependency::Column::DependsOnTaskId.eq(depends_on_task_id))
+        .one(conn)
+        .await?;
+    if existing.is_some() {
+        return Ok(());
+    }
+    let active = work_task_dependency::ActiveModel {
+        id: NotSet,
+        task_id: Set(task_id),
+        depends_on_task_id: Set(depends_on_task_id),
+        created_at: Set(Utc::now()),
+    };
+    active.insert(conn).await?;
+    Ok(())
+}
+
+/// Remove one dependency edge (the user's escape hatch for a dependency that
+/// failed or was deleted). Returns `false` when the edge did not exist, so the
+/// caller can answer "nothing to remove" without inventing an error. Recorded
+/// on the dependent's timeline: the gate it was waiting on is gone.
+pub async fn remove_dependency(
+    conn: &DatabaseConnection,
+    task_id: i32,
+    depends_on_task_id: i32,
+) -> Result<bool, DbError> {
+    let txn = conn.begin().await?;
+    let res = work_task_dependency::Entity::delete_many()
+        .filter(work_task_dependency::Column::TaskId.eq(task_id))
+        .filter(work_task_dependency::Column::DependsOnTaskId.eq(depends_on_task_id))
+        .exec(&txn)
+        .await?;
+    if res.rows_affected == 0 {
+        txn.rollback().await?;
+        return Ok(false);
+    }
+    record_event(
+        &txn,
+        task_id,
+        "dependency_removed",
+        "user",
+        Some(serde_json::json!({ "depends_on_task_id": depends_on_task_id })),
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(true)
+}
+
+/// Every dependency edge pointing AT `task_id` whose dependent is still
+/// pending on the board — the folders whose pump must be nudged when this task
+/// reaches `done`.
+pub async fn pending_dependents_folders(
+    conn: &DatabaseConnection,
+    task_id: i32,
+) -> Result<Vec<i32>, DbError> {
+    let dependents: Vec<i32> = work_task_dependency::Entity::find()
+        .filter(work_task_dependency::Column::DependsOnTaskId.eq(task_id))
+        .all(conn)
+        .await?
+        .into_iter()
+        .map(|e| e.task_id)
+        .collect();
+    if dependents.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = work_task::Entity::find()
+        .filter(work_task::Column::Id.is_in(dependents))
+        .filter(work_task::Column::DeletedAt.is_null())
+        .filter(
+            work_task::Column::Status
+                .is_in([WorkTaskStatus::Todo, WorkTaskStatus::Queued]),
+        )
+        .all(conn)
+        .await?;
+    let mut folders: Vec<i32> = rows.into_iter().map(|m| m.folder_id).collect();
+    folders.sort_unstable();
+    folders.dedup();
+    Ok(folders)
+}
+
+/// Wake the folders holding tasks that depend on a task that just reached
+/// `done`: the dependency gate that was holding them has lifted, and an
+/// `auto_process` folder should claim the newly-unblocked head now rather than
+/// at the next reconcile tick.
+///
+/// Best-effort by construction — a process that does not own the task engine
+/// simply has no pump to nudge, and its owning process's tick picks the change
+/// up from the database. Called ONLY on a successful `done` write, so the
+/// common case (no dependents at all) is one indexed query.
+async fn wake_dependents(conn: &DatabaseConnection, task_id: i32) {
+    let folders = match pending_dependents_folders(conn, task_id).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!("[work_task] dependent lookup failed for {task_id}: {e}");
+            return;
+        }
+    };
+    if folders.is_empty() {
+        return;
+    }
+    let Some(engine) = crate::work_task::engine() else {
+        return;
+    };
+    for folder_id in folders {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.pump_folder(folder_id).await });
+    }
+}
+
+/// The dependency rows of a task (both directions of "unmet" are derived by the
+/// caller from the upstream rows).
+async fn dependency_edges<C: ConnectionTrait>(
+    conn: &C,
+    task_id: i32,
+) -> Result<Vec<work_task_dependency::Model>, DbError> {
+    Ok(work_task_dependency::Entity::find()
+        .filter(work_task_dependency::Column::TaskId.eq(task_id))
+        .order_by_asc(work_task_dependency::Column::Id)
+        .all(conn)
+        .await?)
+}
+
+/// A dependency is met only by a LIVE task that is `done`. A deleted upstream
+/// is never met — that is what leaves the dependent visibly blocked with a
+/// removable edge as the escape hatch.
+fn dependency_met(upstream: &work_task::Model) -> bool {
+    upstream.deleted_at.is_none() && upstream.status == WorkTaskStatus::Done
+}
+
+/// Why a task cannot be claimed right now — DERIVED, never stored. `None` means
+/// every gate this service owns is open.
+///
+/// Generic over the connection so the claim paths can run it INSIDE their
+/// transaction: the gate and the status CAS must see one snapshot, or two
+/// concurrent claims could both pass a limit meant to admit one.
+pub async fn blocked_for<C: ConnectionTrait>(
+    conn: &C,
+    task: &work_task::Model,
+) -> Result<Option<WorkTaskBlocked>, DbError> {
+    blocked_for_runs_used(conn, task, task.run_seq).await
+}
+
+/// [`blocked_for`] for a row whose claim CAS has ALREADY bumped `run_seq`: the
+/// run budget compares generations *spent*, and the just-claimed one is not
+/// spent yet. Reading the stored column here would refuse the first run of a
+/// `max_runs_per_child = 1` subtask.
+async fn blocked_for_claimed<C: ConnectionTrait>(
+    conn: &C,
+    claimed: &work_task::Model,
+) -> Result<Option<WorkTaskBlocked>, DbError> {
+    blocked_for_runs_used(conn, claimed, claimed.run_seq.saturating_sub(1)).await
+}
+
+async fn blocked_for_runs_used<C: ConnectionTrait>(
+    conn: &C,
+    task: &work_task::Model,
+    runs_used: i32,
+) -> Result<Option<WorkTaskBlocked>, DbError> {
+    // 1. Dependencies: every edge must point at a live `done` task.
+    let mut unmet: Vec<WorkTaskDependencyRef> = Vec::new();
+    for edge in dependency_edges(conn, task.id).await? {
+        let Some(upstream) = work_task::Entity::find_by_id(edge.depends_on_task_id)
+            .one(conn)
+            .await?
+        else {
+            continue; // dangling edge (upstream hard-deleted): nothing to report
+        };
+        if !dependency_met(&upstream) {
+            unmet.push(WorkTaskDependencyRef {
+                task_id: upstream.id,
+                title: upstream.title.clone(),
+                status: upstream.status,
+            });
+        }
+    }
+    if !unmet.is_empty() {
+        return Ok(Some(WorkTaskBlocked {
+            reason: "dependency".to_string(),
+            dependencies: unmet,
+            detail: None,
+        }));
+    }
+
+    // The limits live on the parent row and gate a CHILD's claim only.
+    let Some(parent_id) = task.parent_id else {
+        return Ok(None);
+    };
+    let Some(parent) = work_task::Entity::find_by_id(parent_id).one(conn).await? else {
+        return Ok(None);
+    };
+    if parent.deleted_at.is_some() {
+        return Ok(None);
+    }
+
+    if let Some(max) = parent.max_runs_per_child.filter(|m| *m > 0) {
+        if runs_used >= max {
+            return Ok(Some(WorkTaskBlocked {
+                reason: "runs".to_string(),
+                dependencies: Vec::new(),
+                detail: Some(format!("this subtask has used {runs_used}/{max} runs")),
+            }));
+        }
+    }
+
+    if let Some(max) = parent.max_concurrent_children.filter(|m| *m > 0) {
+        let active = work_task::Entity::find()
+            .filter(work_task::Column::ParentId.eq(parent.id))
+            .filter(work_task::Column::DeletedAt.is_null())
+            .filter(work_task::Column::Id.ne(task.id))
+            .filter(work_task::Column::Status.is_in(CHILD_RUNNING_STATUSES))
+            .count(conn)
+            .await?;
+        if active >= max as u64 {
+            return Ok(Some(WorkTaskBlocked {
+                reason: "runs".to_string(),
+                dependencies: Vec::new(),
+                detail: Some(format!(
+                    "{active}/{max} sibling subtasks are already running"
+                )),
+            }));
+        }
+    }
+
+    if let Some(budget) = parent.token_budget.filter(|b| *b > 0) {
+        let spent = parent_spend(conn, &parent).await?;
+        if spent >= budget {
+            return Ok(Some(WorkTaskBlocked {
+                reason: "budget".to_string(),
+                dependencies: Vec::new(),
+                detail: Some(format!("{spent}/{budget} tokens used")),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// One-line human phrasing of a derived block, shared by the engine's start
+/// refusal, the agent tool's per-id notes, and the board's tooltip copy — so
+/// the same gate always reads the same way wherever it is reported.
+pub fn blocked_message(blocked: &WorkTaskBlocked) -> String {
+    if blocked.reason == "dependency" {
+        let waiting: Vec<String> = blocked
+            .dependencies
+            .iter()
+            .map(|d| format!("#{} \"{}\" ({})", d.task_id, d.title, status_str(d.status)))
+            .collect();
+        if waiting.is_empty() {
+            return "waiting for a dependency to finish".to_string();
+        }
+        return format!("waiting for {}", waiting.join(", "));
+    }
+    blocked
+        .detail
+        .clone()
+        .unwrap_or_else(|| format!("blocked ({})", blocked.reason))
+}
+
+/// Tokens recorded for the parent's own conversation plus every current
+/// conversation of its children — the budget's spending read. Best-effort, as
+/// the token pipeline itself is: a missing fact row contributes 0.
+async fn parent_spend<C: ConnectionTrait>(
+    conn: &C,
+    parent: &work_task::Model,
+) -> Result<i64, DbError> {
+    let children = work_task::Entity::find()
+        .filter(work_task::Column::ParentId.eq(parent.id))
+        .filter(work_task::Column::DeletedAt.is_null())
+        .all(conn)
+        .await?;
+    let mut conversations: Vec<i32> = parent.conversation_id.into_iter().collect();
+    conversations.extend(children.iter().filter_map(|c| c.conversation_id));
+    conversations.sort_unstable();
+    conversations.dedup();
+    crate::db::service::token_usage_service::total_tokens_for_conversations(conn, &conversations)
+        .await
+}
+
+/// Stamp `blocked` on a whole list at read time, in batched queries. Called by
+/// the list / get commands (and by the agent's `list_work_tasks`), so the board
+/// and the tool answer from one derivation.
+///
+/// Only `todo` rows are examined: every other status has either already passed
+/// the gate or is no longer claimable, and `WorkTaskBlocked` documents itself as
+/// "why a TO-DO cannot be claimed".
+pub async fn annotate_blocked(
+    conn: &DatabaseConnection,
+    infos: &mut [WorkTaskInfo],
+) -> Result<(), DbError> {
+    let todo_ids: Vec<i32> = infos
+        .iter()
+        .filter(|t| t.status == WorkTaskStatus::Todo)
+        .map(|t| t.id)
+        .collect();
+    if todo_ids.is_empty() {
+        return Ok(());
+    }
+
+    // Edges of every listed todo, then every upstream row they name (live or
+    // not — a deleted upstream still has to render its chip).
+    let edges = work_task_dependency::Entity::find()
+        .filter(work_task_dependency::Column::TaskId.is_in(todo_ids.iter().copied()))
+        .order_by_asc(work_task_dependency::Column::Id)
+        .all(conn)
+        .await?;
+    let upstream_ids: Vec<i32> = {
+        let mut ids: Vec<i32> = edges.iter().map(|e| e.depends_on_task_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+    let upstreams: std::collections::HashMap<i32, work_task::Model> = if upstream_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        work_task::Entity::find()
+            .filter(work_task::Column::Id.is_in(upstream_ids))
+            .all(conn)
+            .await?
+            .into_iter()
+            .map(|m| (m.id, m))
+            .collect()
+    };
+    let mut unmet_by_task: std::collections::HashMap<i32, Vec<WorkTaskDependencyRef>> =
+        std::collections::HashMap::new();
+    for edge in &edges {
+        let Some(upstream) = upstreams.get(&edge.depends_on_task_id) else {
+            continue;
+        };
+        if !dependency_met(upstream) {
+            unmet_by_task
+                .entry(edge.task_id)
+                .or_default()
+                .push(WorkTaskDependencyRef {
+                    task_id: upstream.id,
+                    title: upstream.title.clone(),
+                    status: upstream.status,
+                });
+        }
+    }
+
+    // The parents (and their children) of every listed todo, for the limits.
+    let parent_ids: Vec<i32> = {
+        let mut ids: Vec<i32> = infos
+            .iter()
+            .filter(|t| t.status == WorkTaskStatus::Todo)
+            .filter_map(|t| t.parent_id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+    let parents: std::collections::HashMap<i32, work_task::Model> = if parent_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        work_task::Entity::find()
+            .filter(work_task::Column::Id.is_in(parent_ids.iter().copied()))
+            .all(conn)
+            .await?
+            .into_iter()
+            .filter(|m| m.deleted_at.is_none())
+            .map(|m| (m.id, m))
+            .collect()
+    };
+    // One query for every sibling group's slot count and one for the
+    // conversation ids the budget reads.
+    let mut running_by_parent: std::collections::HashMap<i32, u64> =
+        std::collections::HashMap::new();
+    let mut conversations_by_parent: std::collections::HashMap<i32, Vec<i32>> =
+        std::collections::HashMap::new();
+    if !parent_ids.is_empty() {
+        let siblings = work_task::Entity::find()
+            .filter(work_task::Column::ParentId.is_in(parent_ids.iter().copied()))
+            .filter(work_task::Column::DeletedAt.is_null())
+            .all(conn)
+            .await?;
+        for sibling in &siblings {
+            if CHILD_RUNNING_STATUSES.contains(&sibling.status) {
+                *running_by_parent.entry(sibling.parent_id.unwrap_or(0)).or_default() += 1;
+            }
+            if let Some(cid) = sibling.conversation_id {
+                conversations_by_parent
+                    .entry(sibling.parent_id.unwrap_or(0))
+                    .or_default()
+                    .push(cid);
+            }
+        }
+    }
+    let mut spend_by_parent: std::collections::HashMap<i32, i64> = std::collections::HashMap::new();
+    for (parent_id, parent) in &parents {
+        if parent.token_budget.filter(|b| *b > 0).is_none() {
+            continue;
+        }
+        let mut conversations: Vec<i32> = parent.conversation_id.into_iter().collect();
+        conversations.extend(
+            conversations_by_parent
+                .get(parent_id)
+                .into_iter()
+                .flatten()
+                .copied(),
+        );
+        conversations.sort_unstable();
+        conversations.dedup();
+        let spent = crate::db::service::token_usage_service::total_tokens_for_conversations(
+            conn,
+            &conversations,
+        )
+        .await?;
+        spend_by_parent.insert(*parent_id, spent);
+    }
+
+    for info in infos.iter_mut().filter(|t| t.status == WorkTaskStatus::Todo) {
+        if let Some(unmet) = unmet_by_task.remove(&info.id) {
+            info.blocked = Some(WorkTaskBlocked {
+                reason: "dependency".to_string(),
+                dependencies: unmet,
+                detail: None,
+            });
+            continue;
+        }
+        // A listed todo that is itself a child: its parent's limits apply.
+        let Some(parent) = info.parent_id.and_then(|id| parents.get(&id)) else {
+            continue;
+        };
+        if let Some(max) = parent.max_runs_per_child.filter(|m| *m > 0) {
+            if info.run_seq >= max {
+                info.blocked = Some(WorkTaskBlocked {
+                    reason: "runs".to_string(),
+                    dependencies: Vec::new(),
+                    detail: Some(format!("this subtask has used {}/{max} runs", info.run_seq)),
+                });
+                continue;
+            }
+        }
+        if let Some(max) = parent.max_concurrent_children.filter(|m| *m > 0) {
+            let active = running_by_parent.get(&parent.id).copied().unwrap_or(0);
+            if active >= max as u64 {
+                info.blocked = Some(WorkTaskBlocked {
+                    reason: "runs".to_string(),
+                    dependencies: Vec::new(),
+                    detail: Some(format!(
+                        "{active}/{max} sibling subtasks are already running"
+                    )),
+                });
+                continue;
+            }
+        }
+        if let Some(budget) = parent.token_budget.filter(|b| *b > 0) {
+            let spent = spend_by_parent.get(&parent.id).copied().unwrap_or(0);
+            if spent >= budget {
+                info.blocked = Some(WorkTaskBlocked {
+                    reason: "budget".to_string(),
+                    dependencies: Vec::new(),
+                    detail: Some(format!("{spent}/{budget} tokens used")),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Depth-first cycle check over every dependency edge of a folder's live
+/// tasks. Used after inserting new edges: the service validates each add, but
+/// a combination (a split's parent→child edges plus an extra dependency that
+/// already waits on the parent) can only be judged against the whole graph.
+async fn folder_edge_cycle<C: ConnectionTrait>(conn: &C, folder_id: i32) -> Result<bool, DbError> {
+    let tasks = work_task::Entity::find()
+        .filter(work_task::Column::FolderId.eq(folder_id))
+        .filter(work_task::Column::DeletedAt.is_null())
+        .all(conn)
+        .await?;
+    if tasks.len() < 2 {
+        return Ok(false);
+    }
+    let ids: Vec<i32> = tasks.iter().map(|t| t.id).collect();
+    let edges = work_task_dependency::Entity::find()
+        .filter(work_task_dependency::Column::TaskId.is_in(ids.iter().copied()))
+        .filter(work_task_dependency::Column::DependsOnTaskId.is_in(ids.iter().copied()))
+        .all(conn)
+        .await?;
+    let mut adjacency: std::collections::HashMap<i32, Vec<i32>> =
+        std::collections::HashMap::new();
+    for edge in edges {
+        adjacency
+            .entry(edge.task_id)
+            .or_default()
+            .push(edge.depends_on_task_id);
+    }
+    // Iterative DFS with an explicit stack so a long chain cannot blow the
+    // call stack. `on_path` is the grey set; `done` the black one.
+    let mut done: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    for start in ids {
+        if done.contains(&start) {
+            continue;
+        }
+        let mut on_path: std::collections::HashSet<i32> = std::collections::HashSet::new();
+        let mut stack: Vec<(i32, usize)> = vec![(start, 0)];
+        while let Some((node, index)) = stack.pop() {
+            if index == 0 {
+                on_path.insert(node);
+            }
+            let neighbours = adjacency.get(&node).map(Vec::as_slice).unwrap_or(&[]);
+            if index >= neighbours.len() {
+                on_path.remove(&node);
+                done.insert(node);
+                continue;
+            }
+            stack.push((node, index + 1));
+            let next = neighbours[index];
+            if on_path.contains(&next) {
+                return Ok(true);
+            }
+            if !done.contains(&next) {
+                stack.push((next, 0));
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Live rows for an explicit id set, board order — the agent tools' "show me
+/// these tasks". Missing / soft-deleted ids simply have no entry.
+pub async fn list_by_ids(
+    conn: &DatabaseConnection,
+    ids: &[i32],
+) -> Result<Vec<WorkTaskInfo>, DbError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = work_task::Entity::find()
+        .filter(work_task::Column::Id.is_in(ids.iter().copied()))
+        .filter(work_task::Column::DeletedAt.is_null())
+        .inner_join(folder::Entity)
+        .filter(folder::Column::DeletedAt.is_null())
+        .order_by_asc(work_task::Column::SortOrder)
+        .order_by_asc(work_task::Column::Id)
+        .all(conn)
+        .await?;
+    let mut infos: Vec<WorkTaskInfo> = rows.into_iter().map(to_info).collect();
+    attach_live_progress(conn, &mut infos).await?;
+    Ok(infos)
+}
+
+/// Children of one parent, in the order a split created them. Live rows only.
+pub async fn children_of(
+    conn: &DatabaseConnection,
+    parent_id: i32,
+) -> Result<Vec<WorkTaskInfo>, DbError> {
+    let rows = work_task::Entity::find()
+        .filter(work_task::Column::ParentId.eq(parent_id))
+        .filter(work_task::Column::DeletedAt.is_null())
+        .inner_join(folder::Entity)
+        .filter(folder::Column::DeletedAt.is_null())
+        .order_by_asc(work_task::Column::SortOrder)
+        .order_by_asc(work_task::Column::Id)
+        .all(conn)
+        .await?;
+    let mut infos: Vec<WorkTaskInfo> = rows.into_iter().map(to_info).collect();
+    attach_live_progress(conn, &mut infos).await?;
+    Ok(infos)
+}
+
+/// Tasks an agent conversation created — the default window of the
+/// `list_work_tasks` tool. Children created by a later split carry the same
+/// stamp, so they are included.
+pub async fn list_created_by_conversation(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<Vec<WorkTaskInfo>, DbError> {
+    let rows = work_task::Entity::find()
+        .filter(work_task::Column::CreatedByConversationId.eq(conversation_id))
+        .filter(work_task::Column::DeletedAt.is_null())
+        .inner_join(folder::Entity)
+        .filter(folder::Column::DeletedAt.is_null())
+        .order_by_asc(work_task::Column::SortOrder)
+        .order_by_asc(work_task::Column::Id)
+        .all(conn)
+        .await?;
+    let mut infos: Vec<WorkTaskInfo> = rows.into_iter().map(to_info).collect();
+    attach_live_progress(conn, &mut infos).await?;
+    Ok(infos)
+}
+
+/// Whether `conversation_id` owns this task: it created the task itself, or it
+/// created the task's parent. This is the whole authorization rule of the
+/// agent-facing orchestration tools — deliberately NARROW (a task created in
+/// the UI belongs to no conversation and is therefore off limits to an agent).
+pub async fn is_owned_by_conversation(
+    conn: &DatabaseConnection,
+    task: &work_task::Model,
+    conversation_id: Option<i32>,
+) -> Result<bool, DbError> {
+    let Some(cid) = conversation_id else {
+        return Ok(false);
+    };
+    if task.created_by_conversation_id == Some(cid) {
+        return Ok(true);
+    }
+    let Some(parent_id) = task.parent_id else {
+        return Ok(false);
+    };
+    Ok(work_task::Entity::find_by_id(parent_id)
+        .one(conn)
+        .await?
+        .is_some_and(|p| p.created_by_conversation_id == Some(cid) && p.deleted_at.is_none()))
 }
 
 // ── per-folder settings ─────────────────────────────────────────────────────
@@ -5064,5 +6178,720 @@ mod tests {
         .unwrap()
         .is_some());
         let _ = replacement;
+    }
+
+    // ── orchestration: children, dependencies, claim gates ──────────────────
+    //
+    // One appended section (the foundation's tests above stay untouched, since
+    // a merge splices sections). Fixtures are local to it.
+
+    /// Direct column writes for states these tests need but the service has no
+    /// API for (a finished task, a conversation link, a tombstone).
+    async fn patch_task(
+        conn: &DatabaseConnection,
+        id: i32,
+        patch: impl FnOnce(&mut work_task::ActiveModel),
+    ) {
+        let mut active = get_model(conn, id).await.unwrap().into_active_model();
+        patch(&mut active);
+        active.update(conn).await.unwrap();
+    }
+
+    async fn mark(conn: &DatabaseConnection, id: i32, status: WorkTaskStatus) {
+        patch_task(conn, id, |a| a.status = Set(status)).await;
+    }
+
+    async fn status_of(conn: &DatabaseConnection, id: i32) -> WorkTaskStatus {
+        get(conn, id).await.unwrap().status
+    }
+
+    fn piece_draft(title: &str, depends_on_index: Vec<usize>) -> WorkTaskChildDraft {
+        WorkTaskChildDraft {
+            title: title.to_string(),
+            config: serde_json::json!({
+                "display_text": "piece",
+                "prompt_blocks": [{ "type": "text", "text": "piece" }],
+            }),
+            depends_on_index,
+        }
+    }
+
+    fn split_request(
+        parent_id: i32,
+        children: Vec<WorkTaskChildDraft>,
+        extra: Vec<i32>,
+    ) -> SplitTaskRequest {
+        SplitTaskRequest {
+            parent_id,
+            children,
+            depends_on_task_ids: extra,
+            max_concurrent_children: None,
+            max_runs_per_child: None,
+            token_budget: None,
+            parent_depends_on_children: false,
+            created_by_conversation_id: Some(77),
+        }
+    }
+
+    async fn run_split(conn: &DatabaseConnection, req: SplitTaskRequest) -> SplitTaskOutcome {
+        split_task(conn, req).await.expect("split")
+    }
+
+    /// The un-met gate of a task, or `None` when it is claimable.
+    async fn gate_of(
+        conn: &DatabaseConnection,
+        id: i32,
+    ) -> Option<crate::models::WorkTaskBlocked> {
+        let row = get_model(conn, id).await.unwrap();
+        blocked_for(conn, &row).await.unwrap()
+    }
+
+    async fn edges_of(conn: &DatabaseConnection, task_id: i32) -> Vec<i32> {
+        let mut ids: Vec<i32> = dependency_edges(conn, task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.depends_on_task_id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[tokio::test]
+    async fn a_dependency_gates_the_claim_until_it_is_done() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-gate-deps").await;
+        let upstream = create(&db.conn, draft(folder_id, "upstream")).await.unwrap();
+        let dependent = create(&db.conn, draft(folder_id, "dependent")).await.unwrap();
+        insert_dependency_row(&db.conn, dependent.id, upstream.id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            claim_for_run(&db.conn, dependent.id, WorkTaskStatus::Todo, "user")
+                .await
+                .unwrap(),
+            None,
+            "a todo with an unfinished dependency is not claimable"
+        );
+        assert_eq!(
+            status_of(&db.conn, dependent.id).await,
+            WorkTaskStatus::Todo,
+            "a refused claim leaves the task exactly where it was"
+        );
+        let blocked = gate_of(&db.conn, dependent.id).await.expect("blocked");
+        assert_eq!(blocked.reason, "dependency");
+        assert_eq!(blocked.dependencies.len(), 1);
+        assert_eq!(blocked.dependencies[0].task_id, upstream.id);
+        assert_eq!(blocked.dependencies[0].title, "upstream");
+        assert_eq!(blocked.dependencies[0].status, WorkTaskStatus::Todo);
+        assert!(blocked_message(&blocked).contains("waiting for"));
+
+        mark(&db.conn, upstream.id, WorkTaskStatus::Done).await;
+        assert_eq!(
+            claim_for_run(&db.conn, dependent.id, WorkTaskStatus::Todo, "user")
+                .await
+                .unwrap(),
+            Some(1),
+            "a done dependency opens the gate"
+        );
+        assert!(gate_of(&db.conn, dependent.id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_canceled_or_deleted_dependency_never_fails_the_dependent() {
+        for dead in [WorkTaskStatus::Failed, WorkTaskStatus::Canceled] {
+            let db = fresh_in_memory_db().await;
+            let folder_id = seed_folder(&db, "/tmp/wt-gate-dead").await;
+            let upstream = create(&db.conn, draft(folder_id, "upstream")).await.unwrap();
+            let dependent = create(&db.conn, draft(folder_id, "dependent")).await.unwrap();
+            insert_dependency_row(&db.conn, dependent.id, upstream.id)
+                .await
+                .unwrap();
+            mark(&db.conn, upstream.id, dead).await;
+
+            assert_eq!(
+                claim_for_run(&db.conn, dependent.id, WorkTaskStatus::Todo, "user")
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                status_of(&db.conn, dependent.id).await,
+                WorkTaskStatus::Todo,
+                "nothing auto-fails the dependent"
+            );
+            let blocked = gate_of(&db.conn, dependent.id).await.expect("blocked");
+            assert_eq!(blocked.dependencies[0].status, dead);
+            assert_eq!(
+                edges_of(&db.conn, dependent.id).await,
+                vec![upstream.id],
+                "nothing auto-removes the edge"
+            );
+        }
+
+        // The same for a soft-deleted dependency — the edge is still the user's
+        // to remove.
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-gate-deleted").await;
+        let upstream = create(&db.conn, draft(folder_id, "upstream")).await.unwrap();
+        let dependent = create(&db.conn, draft(folder_id, "dependent")).await.unwrap();
+        insert_dependency_row(&db.conn, dependent.id, upstream.id)
+            .await
+            .unwrap();
+        patch_task(&db.conn, upstream.id, |a| {
+            a.deleted_at = Set(Some(Utc::now()))
+        })
+        .await;
+        assert_eq!(
+            claim_for_run(&db.conn, dependent.id, WorkTaskStatus::Todo, "user")
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(gate_of(&db.conn, dependent.id).await.is_some());
+        assert_eq!(edges_of(&db.conn, dependent.id).await, vec![upstream.id]);
+    }
+
+    #[tokio::test]
+    async fn dependencies_stay_in_one_folder_and_reject_self_and_cycles() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-dep-rules").await;
+        let other_folder = seed_folder(&db, "/tmp/wt-dep-rules-other").await;
+        let parent = create(&db.conn, draft(folder_id, "parent")).await.unwrap();
+        let elsewhere = create(&db.conn, draft(other_folder, "elsewhere"))
+            .await
+            .unwrap();
+
+        // Cross-folder dependency.
+        let err = split_task(
+            &db.conn,
+            split_request(
+                parent.id,
+                vec![piece_draft("a", vec![])],
+                vec![elsewhere.id],
+            ),
+        )
+        .await
+        .expect_err("cross-folder dependency");
+        assert!(err.to_string().contains("another project folder"));
+        assert!(
+            children_of(&db.conn, parent.id).await.unwrap().is_empty(),
+            "a refused split writes nothing"
+        );
+
+        // Self edge and out-of-range index.
+        assert!(split_task(
+            &db.conn,
+            split_request(parent.id, vec![piece_draft("a", vec![0])], vec![]),
+        )
+        .await
+        .is_err());
+        assert!(split_task(
+            &db.conn,
+            split_request(parent.id, vec![piece_draft("a", vec![3])], vec![]),
+        )
+        .await
+        .is_err());
+
+        // Intra-call cycle.
+        let err = split_task(
+            &db.conn,
+            split_request(
+                parent.id,
+                vec![piece_draft("a", vec![1]), piece_draft("b", vec![0])],
+                vec![],
+            ),
+        )
+        .await
+        .expect_err("intra-call cycle");
+        assert!(err.to_string().contains("cycle"));
+
+        // A cycle that only closes through an EXISTING edge: X waits for the
+        // parent, the new child waits for X, and the parent is wired to wait
+        // for its children. The whole split rolls back.
+        let x = create(&db.conn, draft(folder_id, "x")).await.unwrap();
+        insert_dependency_row(&db.conn, x.id, parent.id).await.unwrap();
+        let err = split_task(
+            &db.conn,
+            SplitTaskRequest {
+                parent_depends_on_children: true,
+                ..split_request(parent.id, vec![piece_draft("a", vec![])], vec![x.id])
+            },
+        )
+        .await
+        .expect_err("cycle through an existing edge");
+        assert!(err.to_string().contains("cycle"));
+        assert!(
+            children_of(&db.conn, parent.id).await.unwrap().is_empty(),
+            "the whole split is one transaction"
+        );
+
+        // A repeated extra dependency is "ensure", not an error.
+        let outcome = run_split(
+            &db.conn,
+            split_request(parent.id, vec![piece_draft("a", vec![])], vec![x.id, x.id]),
+        )
+        .await;
+        assert_eq!(
+            edges_of(&db.conn, outcome.children[0].id).await,
+            vec![x.id]
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_dependency_edge_unblocks_the_dependent() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-dep-remove").await;
+        let upstream = create(&db.conn, draft(folder_id, "upstream")).await.unwrap();
+        let dependent = create(&db.conn, draft(folder_id, "dependent")).await.unwrap();
+        insert_dependency_row(&db.conn, dependent.id, upstream.id)
+            .await
+            .unwrap();
+        mark(&db.conn, upstream.id, WorkTaskStatus::Failed).await;
+        assert_eq!(
+            claim_for_run(&db.conn, dependent.id, WorkTaskStatus::Todo, "user")
+                .await
+                .unwrap(),
+            None
+        );
+
+        assert!(remove_dependency(&db.conn, dependent.id, upstream.id)
+            .await
+            .unwrap());
+        assert!(
+            !remove_dependency(&db.conn, dependent.id, upstream.id)
+                .await
+                .unwrap(),
+            "removing a missing edge is a no-op answer, not an error"
+        );
+        assert!(edges_of(&db.conn, dependent.id).await.is_empty());
+        assert_eq!(
+            claim_for_run(&db.conn, dependent.id, WorkTaskStatus::Todo, "user")
+                .await
+                .unwrap(),
+            Some(1),
+            "with the edge gone the task is claimable again"
+        );
+        let events = list_events(&db.conn, dependent.id, 100).await.unwrap();
+        assert!(events.iter().any(|e| e.kind == "dependency_removed"));
+    }
+
+    #[tokio::test]
+    async fn max_runs_per_child_gates_the_next_claim() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-max-runs").await;
+        let parent = create(&db.conn, draft(folder_id, "parent")).await.unwrap();
+        let outcome = run_split(
+            &db.conn,
+            SplitTaskRequest {
+                max_runs_per_child: Some(1),
+                ..split_request(parent.id, vec![piece_draft("only", vec![])], vec![])
+            },
+        )
+        .await;
+        let child = outcome.children[0].id;
+
+        assert_eq!(
+            claim_for_run(&db.conn, child, WorkTaskStatus::Todo, "user")
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert!(cancel(&db.conn, child, None).await.unwrap());
+        assert!(requeue_canceled(&db.conn, child, None, &[], false)
+            .await
+            .unwrap());
+        assert_eq!(status_of(&db.conn, child).await, WorkTaskStatus::Todo);
+        assert_eq!(get(&db.conn, child).await.unwrap().run_seq, 1);
+
+        let blocked = gate_of(&db.conn, child).await.expect("runs gate");
+        assert_eq!(blocked.reason, "runs");
+        assert!(blocked.detail.unwrap().contains("1/1"));
+        assert_eq!(
+            claim_for_run(&db.conn, child, WorkTaskStatus::Todo, "user")
+                .await
+                .unwrap(),
+            None,
+            "the child has spent its run budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_concurrent_children_counts_siblings_in_a_run_slot() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-max-children").await;
+        let parent = create(&db.conn, draft(folder_id, "parent")).await.unwrap();
+        let outcome = run_split(
+            &db.conn,
+            SplitTaskRequest {
+                max_concurrent_children: Some(1),
+                ..split_request(
+                    parent.id,
+                    vec![piece_draft("one", vec![]), piece_draft("two", vec![])],
+                    vec![],
+                )
+            },
+        )
+        .await;
+        let (first, second) = (outcome.children[0].id, outcome.children[1].id);
+
+        assert_eq!(
+            claim_for_run(&db.conn, first, WorkTaskStatus::Todo, "user")
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        let blocked = gate_of(&db.conn, second).await.expect("concurrency gate");
+        assert_eq!(blocked.reason, "runs");
+        assert!(blocked.detail.unwrap().contains("1/1"));
+        assert_eq!(
+            claim_for_run(&db.conn, second, WorkTaskStatus::Todo, "user")
+                .await
+                .unwrap(),
+            None
+        );
+
+        // The sibling leaving its run slot frees the next child. A task waiting
+        // in `todo` does not count against the limit — otherwise a split with a
+        // limit of 1 could never start at all.
+        mark(&db.conn, first, WorkTaskStatus::Failed).await;
+        assert_eq!(
+            claim_for_run(&db.conn, second, WorkTaskStatus::Todo, "user")
+                .await
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn token_budget_covers_the_parent_and_every_child_conversation() {
+        use crate::db::service::token_usage_service::{replace_conversation_facts, UsageFact};
+
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-budget").await;
+        let parent = create(&db.conn, draft(folder_id, "parent")).await.unwrap();
+        let parent_conv = crate::db::test_helpers::seed_conversation(
+            &db,
+            folder_id,
+            crate::models::agent::AgentType::ClaudeCode,
+        )
+        .await;
+        patch_task(&db.conn, parent.id, |a| {
+            a.conversation_id = Set(Some(parent_conv))
+        })
+        .await;
+        let outcome = run_split(
+            &db.conn,
+            SplitTaskRequest {
+                token_budget: Some(100),
+                ..split_request(parent.id, vec![piece_draft("one", vec![])], vec![])
+            },
+        )
+        .await;
+        let child = outcome.children[0].id;
+        let child_conv = crate::db::test_helpers::seed_conversation(
+            &db,
+            folder_id,
+            crate::models::agent::AgentType::ClaudeCode,
+        )
+        .await;
+        patch_task(&db.conn, child, |a| {
+            a.conversation_id = Set(Some(child_conv))
+        })
+        .await;
+
+        let fact = |key: &str, input: i64| UsageFact {
+            turn_key: key.to_string(),
+            occurred_at: Utc::now(),
+            model: Some("test-model".into()),
+            input_tokens: input,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            duration_ms: 1,
+        };
+        // The parent's own session alone is under budget…
+        replace_conversation_facts(&db.conn, parent_conv, Utc::now(), &[fact("p", 60)])
+            .await
+            .unwrap();
+        assert!(gate_of(&db.conn, child).await.is_none());
+
+        // …and the child's session pushes the total over it.
+        replace_conversation_facts(&db.conn, child_conv, Utc::now(), &[fact("c", 50)])
+            .await
+            .unwrap();
+        let blocked = gate_of(&db.conn, child).await.expect("budget gate");
+        assert_eq!(blocked.reason, "budget");
+        assert!(blocked.detail.unwrap().contains("110/100"));
+        assert_eq!(
+            claim_for_run(&db.conn, child, WorkTaskStatus::Todo, "user")
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Facts are best-effort: dropping the child's rows frees the gate.
+        replace_conversation_facts(&db.conn, child_conv, Utc::now(), &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            claim_for_run(&db.conn, child, WorkTaskStatus::Todo, "user")
+                .await
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blocked_head_does_not_stall_the_auto_claim() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-auto-head").await;
+        let dead = create(&db.conn, draft(folder_id, "dead upstream")).await.unwrap();
+        mark(&db.conn, dead.id, WorkTaskStatus::Failed).await;
+        // The blocked card is the folder's FIRST todo (lowest sort_order)…
+        let blocked = create(&db.conn, draft(folder_id, "blocked head")).await.unwrap();
+        insert_dependency_row(&db.conn, blocked.id, dead.id)
+            .await
+            .unwrap();
+        // …and a free card sits behind it.
+        let free = create(&db.conn, draft(folder_id, "free")).await.unwrap();
+
+        assert_eq!(
+            auto_claim_next(&db.conn, folder_id, 0).await.unwrap(),
+            Some(free.id),
+            "the scan moves past the blocked head instead of parking the folder"
+        );
+        assert_eq!(status_of(&db.conn, blocked.id).await, WorkTaskStatus::Todo);
+        // The free card was claimed (queued), the blocked one was not.
+        assert_eq!(status_of(&db.conn, free.id).await, WorkTaskStatus::Queued);
+        // A second pass finds nothing claimable and terminates.
+        assert_eq!(auto_claim_next(&db.conn, folder_id, 0).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_blocked_scheduled_task_keeps_its_plan() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-scheduled-blocked").await;
+        let upstream = create(&db.conn, draft(folder_id, "upstream")).await.unwrap();
+        let planned = create(&db.conn, draft(folder_id, "planned")).await.unwrap();
+        insert_dependency_row(&db.conn, planned.id, upstream.id)
+            .await
+            .unwrap();
+        assert!(
+            set_schedule(&db.conn, planned.id, Some(Utc::now() - chrono::Duration::minutes(5)))
+                .await
+                .unwrap()
+        );
+
+        assert!(
+            claim_due_scheduled(&db.conn, Utc::now())
+                .await
+                .unwrap()
+                .is_empty(),
+            "a blocked task does not fire its plan"
+        );
+        assert!(
+            get(&db.conn, planned.id).await.unwrap().scheduled_at.is_some(),
+            "the user's chosen time survives the refusal"
+        );
+        assert_eq!(status_of(&db.conn, planned.id).await, WorkTaskStatus::Todo);
+
+        mark(&db.conn, upstream.id, WorkTaskStatus::Done).await;
+        assert_eq!(
+            claim_due_scheduled(&db.conn, Utc::now()).await.unwrap(),
+            vec![(planned.id, folder_id)],
+            "the plan fires as soon as the gate opens"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_creates_children_under_the_parent_and_wires_every_edge() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-split").await;
+        let parent = create(&db.conn, draft(folder_id, "integrate the pieces")).await.unwrap();
+        let earlier = create(&db.conn, draft(folder_id, "earlier work")).await.unwrap();
+
+        let outcome = run_split(
+            &db.conn,
+            SplitTaskRequest {
+                parent_depends_on_children: true,
+                max_concurrent_children: Some(2),
+                max_runs_per_child: Some(3),
+                token_budget: Some(9_000),
+                ..split_request(
+                    parent.id,
+                    vec![piece_draft("one", vec![]), piece_draft("two", vec![0])],
+                    vec![earlier.id, earlier.id],
+                )
+            },
+        )
+        .await;
+        assert_eq!(outcome.parent_id, parent.id);
+        assert_eq!(outcome.children.len(), 2);
+        let (one, two) = (outcome.children[0].id, outcome.children[1].id);
+
+        for child in &outcome.children {
+            let row = get_model(&db.conn, child.id).await.unwrap();
+            assert_eq!(row.parent_id, Some(parent.id));
+            assert_eq!(row.folder_id, parent.folder_id, "a child lives in the parent's folder");
+            assert_eq!(row.created_by_conversation_id, Some(77));
+            assert_eq!(row.status, WorkTaskStatus::Todo);
+        }
+        assert_eq!(edges_of(&db.conn, one).await, vec![earlier.id]);
+        assert_eq!(edges_of(&db.conn, two).await, vec![earlier.id, one]);
+        assert_eq!(edges_of(&db.conn, parent.id).await, vec![one, two]);
+
+        let parent_row = get_model(&db.conn, parent.id).await.unwrap();
+        assert_eq!(parent_row.max_concurrent_children, Some(2));
+        assert_eq!(parent_row.max_runs_per_child, Some(3));
+        assert_eq!(parent_row.token_budget, Some(9_000));
+        // "Integrate after the pieces" is a DERIVED state on the parent.
+        let blocked = blocked_for(&db.conn, &parent_row).await.unwrap().unwrap();
+        assert_eq!(blocked.reason, "dependency");
+        assert_eq!(blocked.dependencies.len(), 2);
+        // And the second piece waits on the first.
+        let two_blocked = gate_of(&db.conn, two).await.expect("waits on its sibling");
+        let wait_set: std::collections::HashSet<i32> = two_blocked
+            .dependencies
+            .iter()
+            .map(|d| d.task_id)
+            .collect();
+        assert_eq!(
+            wait_set,
+            [earlier.id, one].into_iter().collect::<std::collections::HashSet<_>>()
+        );
+
+        // An empty split and an over-long one are refused without a write.
+        assert!(split_task(&db.conn, split_request(parent.id, vec![], vec![]))
+            .await
+            .is_err());
+        let too_many: Vec<WorkTaskChildDraft> = (0..=MAX_SPLIT_CHILDREN)
+            .map(|i| piece_draft(&format!("piece {i}"), vec![]))
+            .collect();
+        let before = children_of(&db.conn, parent.id).await.unwrap().len();
+        assert!(split_task(&db.conn, split_request(parent.id, too_many, vec![]))
+            .await
+            .is_err());
+        assert_eq!(children_of(&db.conn, parent.id).await.unwrap().len(), before);
+    }
+
+    #[tokio::test]
+    async fn annotate_blocked_reports_the_board_gates_in_batches() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-annotate").await;
+        let dead = create(&db.conn, draft(folder_id, "dead")).await.unwrap();
+        mark(&db.conn, dead.id, WorkTaskStatus::Failed).await;
+        let blocked = create(&db.conn, draft(folder_id, "blocked")).await.unwrap();
+        insert_dependency_row(&db.conn, blocked.id, dead.id)
+            .await
+            .unwrap();
+        let free = create(&db.conn, draft(folder_id, "free")).await.unwrap();
+        // A task that already passed the gate is never annotated, even with an
+        // unmet-looking edge on it.
+        let queued = create(&db.conn, draft(folder_id, "queued")).await.unwrap();
+        insert_dependency_row(&db.conn, queued.id, dead.id)
+            .await
+            .unwrap();
+        assert!(
+            claim_for_run(&db.conn, queued.id, WorkTaskStatus::Todo, "user")
+                .await
+                .unwrap()
+                .is_none(),
+            "…which it cannot reach while the edge is unmet"
+        );
+        // Force it queued for the annotation check (the gate is deliberately
+        // not re-applied mid-run).
+        mark(&db.conn, queued.id, WorkTaskStatus::Queued).await;
+
+        let mut infos = list(&db.conn, Some(folder_id)).await.unwrap();
+        annotate_blocked(&db.conn, &mut infos).await.unwrap();
+        let find = |id: i32| infos.iter().find(|t| t.id == id).cloned().unwrap();
+        let blocked_info = find(blocked.id);
+        assert_eq!(blocked_info.blocked.as_ref().unwrap().reason, "dependency");
+        assert_eq!(
+            blocked_info.blocked.as_ref().unwrap().dependencies[0].task_id,
+            dead.id
+        );
+        assert!(find(free.id).blocked.is_none());
+        assert!(find(dead.id).blocked.is_none(), "terminal rows are not annotated");
+        assert!(
+            find(queued.id).blocked.is_none(),
+            "only todo rows carry the derived gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_dependents_name_only_the_rows_still_waiting() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-pending-deps").await;
+        let upstream = create(&db.conn, draft(folder_id, "upstream")).await.unwrap();
+        let waiting = create(&db.conn, draft(folder_id, "waiting")).await.unwrap();
+        insert_dependency_row(&db.conn, waiting.id, upstream.id)
+            .await
+            .unwrap();
+        let finished = create(&db.conn, draft(folder_id, "finished")).await.unwrap();
+        insert_dependency_row(&db.conn, finished.id, upstream.id)
+            .await
+            .unwrap();
+        mark(&db.conn, finished.id, WorkTaskStatus::Done).await;
+
+        assert_eq!(
+            pending_dependents_folders(&db.conn, upstream.id).await.unwrap(),
+            vec![folder_id],
+            "the done dependent is not something a pump has to wake"
+        );
+        assert!(pending_dependents_folders(&db.conn, waiting.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn ownership_is_the_creating_conversation_or_its_children() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-ownership").await;
+        let mine = create_authored(&db.conn, draft(folder_id, "mine"), Some(11))
+            .await
+            .unwrap();
+        let theirs = create_authored(&db.conn, draft(folder_id, "theirs"), Some(22))
+            .await
+            .unwrap();
+        let unowned = create(&db.conn, draft(folder_id, "ui made")).await.unwrap();
+        let child = run_split(
+            &db.conn,
+            split_request(mine.id, vec![piece_draft("piece", vec![])], vec![]),
+        )
+        .await
+        .children[0]
+            .id;
+
+        let owned = |row: &work_task::Model, conv: i32| {
+            let conn = db.conn.clone();
+            let row = row.clone();
+            async move {
+                is_owned_by_conversation(&conn, &row, Some(conv))
+                    .await
+                    .unwrap()
+            }
+        };
+        let mine_row = get_model(&db.conn, mine.id).await.unwrap();
+        assert!(owned(&mine_row, 11).await, "the creator owns it");
+        assert!(!owned(&mine_row, 22).await);
+        let child_row = get_model(&db.conn, child).await.unwrap();
+        assert!(
+            owned(&child_row, 11).await,
+            "a child of an owned task is owned too"
+        );
+        assert!(!owned(&child_row, 99).await);
+        let unowned_row = get_model(&db.conn, unowned.id).await.unwrap();
+        assert!(
+            !owned(&unowned_row, 22).await,
+            "a task created in the UI belongs to no conversation"
+        );
+        assert!(!is_owned_by_conversation(&db.conn, &unowned_row, None)
+            .await
+            .unwrap());
+        let _ = theirs;
     }
 }

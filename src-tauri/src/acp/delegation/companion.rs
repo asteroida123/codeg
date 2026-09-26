@@ -42,7 +42,9 @@ use serde_json::{json, Value};
 use tokio::sync::{oneshot, Mutex};
 
 use crate::acp::chat_authoring::{
-    NewAutomationSpec, NewWorkTaskSpec, MAX_PROMPT_CHARS, MAX_TITLE_CHARS,
+    NewAutomationSpec, NewWorkTaskSpec, ListWorkTasksSpec, SplitSubtaskSpec, SplitWorkTaskSpec,
+    WorkTaskChildLimits, WorkTaskIdsSpec, WorkTaskToolCall, MAX_PROMPT_CHARS, MAX_TITLE_CHARS,
+    MAX_TOOL_TASK_IDS,
 };
 use crate::acp::delegation::transport::{
     client_ask_round_trip, client_browser_act_round_trip, client_browser_capture_round_trip,
@@ -54,7 +56,8 @@ use crate::acp::delegation::transport::{
     client_create_automation_round_trip, client_create_work_task_round_trip,
     client_feedback_round_trip, client_resume_task_round_trip, client_round_trip,
     client_session_round_trip, client_status_round_trip, client_task_complete_round_trip,
-    client_task_progress_round_trip, BrokerAskRequest, BrokerBrowserActRequest, BrokerBrowserCaptureRequest, BrokerBrowserConsoleRequest,
+    client_task_progress_round_trip, client_work_task_tool_round_trip,
+    BrokerAskRequest, BrokerBrowserActRequest, BrokerBrowserCaptureRequest, BrokerBrowserConsoleRequest,
     BrokerBrowserEvalRequest, BrokerBrowserSnapshotRequest, BrokerBrowserTabOpRequest,
     BrokerBrowserTabsRequest,
     BrokerCancelRequest,
@@ -62,7 +65,7 @@ use crate::acp::delegation::transport::{
     BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest, BrokerFeedbackRequest,
     BrokerRequest, BrokerResponse,
     BrokerResumeTaskRequest, BrokerSessionRequest, BrokerStatusRequest,
-    BrokerTaskCompleteRequest, BrokerTaskProgressRequest,
+    BrokerTaskCompleteRequest, BrokerTaskProgressRequest, BrokerWorkTaskToolRequest,
 };
 use crate::acp::question::parse_questions;
 use crate::acp::session_info::MAX_SESSION_MESSAGES;
@@ -242,7 +245,8 @@ impl CompanionFeatures {
             "get_session_info" => self.sessions,
             "task_progress" | "task_complete" => self.tasks,
             "create_automation" => self.automations,
-            "create_work_task" => self.taskboard,
+            "create_work_task" | "split_work_task" | "list_work_tasks" | "start_work_task"
+            | "cancel_work_task" => self.taskboard,
             "browser_list_tabs" | "browser_snapshot" | "browser_console_messages"
             | "browser_screenshot" | "browser_click" | "browser_hover" | "browser_type"
             | "browser_press_key" | "browser_select_option" | "browser_open_tab"
@@ -968,6 +972,25 @@ async fn build_tools_call_spawn(
                 Box::pin(async move { client_create_work_task_round_trip(&socket, &req).await });
             register_and_spawn(inflight, id, None, round_trip, render_authoring_result).await
         }
+        "split_work_task" | "list_work_tasks" | "start_work_task" | "cancel_work_task" => {
+            // Four names, one request: they share a feature group, an
+            // authorization rule and an answer shape, and validating here means
+            // a malformed call gets a synchronous -32602 the LLM can fix rather
+            // than a round trip into the DB layer's error path.
+            let call = match parse_work_task_tool_call(name.as_str(), &arguments) {
+                Ok(c) => c,
+                Err(msg) => return LineAction::Respond(err(id, -32602, msg)),
+            };
+            let req = BrokerWorkTaskToolRequest {
+                token: ctx.token.clone(),
+                call,
+            };
+            // No external_handle: these are bounded DB operations (the list
+            // wait is capped at 60s), so canceling only suppresses the answer.
+            let round_trip =
+                Box::pin(async move { client_work_task_tool_round_trip(&socket, &req).await });
+            register_and_spawn(inflight, id, None, round_trip, render_work_task_tool_result).await
+        }
         other => LineAction::Respond(err(id, -32602, format!("unknown tool: {other}"))),
     }
 }
@@ -1573,6 +1596,235 @@ fn parse_work_task_spec(arguments: &Value) -> Result<NewWorkTaskSpec, String> {
         agent_type: optional_string(arguments, "agent_type"),
         folder_path: optional_string(arguments, "folder_path"),
     })
+}
+
+/// Validate one of the four orchestration tools into a [`WorkTaskToolCall`].
+///
+/// Structural errors are `-32602` (the shape is wrong and the LLM can fix it);
+/// everything semantic — an unknown parent, a foreign task, a dependency that
+/// would cycle — is decided by the access impl and comes back as a soft note.
+fn parse_work_task_tool_call(tool: &str, arguments: &Value) -> Result<WorkTaskToolCall, String> {
+    match tool {
+        "split_work_task" => Ok(WorkTaskToolCall::Split(parse_split_spec(arguments)?)),
+        "list_work_tasks" => Ok(WorkTaskToolCall::List(parse_list_spec(arguments))),
+        "start_work_task" => Ok(WorkTaskToolCall::Start(parse_ids_spec(
+            arguments,
+            "start_work_task",
+        )?)),
+        "cancel_work_task" => Ok(WorkTaskToolCall::Cancel(parse_ids_spec(
+            arguments,
+            "cancel_work_task",
+        )?)),
+        other => Err(format!("unknown work-task tool: {other}")),
+    }
+}
+
+fn parse_split_spec(arguments: &Value) -> Result<SplitWorkTaskSpec, String> {
+    const TOOL: &str = "split_work_task";
+    let parent_task_id = required_i32(arguments, "parent_task_id", TOOL)?;
+    let raw = arguments
+        .get("subtasks")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("{TOOL} requires a non-empty `subtasks` array"))?;
+    if raw.is_empty() {
+        return Err(format!("{TOOL} requires a non-empty `subtasks` array"));
+    }
+    let mut subtasks = Vec::with_capacity(raw.len());
+    for (idx, item) in raw.iter().enumerate() {
+        let title = item
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("{TOOL}: subtasks[{idx}] needs a non-empty `title`"))?;
+        let prompt = item
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("{TOOL}: subtasks[{idx}] needs a non-empty `prompt`"))?;
+        let depends_on_index = item
+            .get("depends_on_index")
+            .map(|v| parse_index_list(v, idx, TOOL))
+            .transpose()?
+            .unwrap_or_default();
+        subtasks.push(SplitSubtaskSpec {
+            title: truncate_chars(title, MAX_TITLE_CHARS),
+            prompt: truncate_chars(prompt, MAX_PROMPT_CHARS),
+            agent_type: item
+                .get("agent_type")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            depends_on_index,
+        });
+    }
+    let depends_on_task_ids = arguments
+        .get("depends_on_task_ids")
+        .map(|v| parse_id_list(v, "depends_on_task_ids", TOOL))
+        .transpose()?
+        .unwrap_or_default();
+    let limits = arguments
+        .get("limits")
+        .map(parse_limits)
+        .transpose()?
+        .unwrap_or_default();
+    Ok(SplitWorkTaskSpec {
+        parent_task_id,
+        subtasks,
+        depends_on_task_ids,
+        limits,
+        parent_depends_on_children: arguments
+            .get("parent_depends_on_children")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    })
+}
+
+/// Parse the `limits` object. A `0` (or negative) is rejected HERE rather than
+/// silently meaning "unlimited" (which is what `<= 0` means for the folder
+/// setting): someone writing 0 meant something, and guessing is worse than a
+/// synchronous error the LLM can fix.
+fn parse_limits(value: &Value) -> Result<WorkTaskChildLimits, String> {
+    let Some(obj) = value.as_object() else {
+        return Err("split_work_task: `limits` must be an object".to_string());
+    };
+    let positive_i32 = |key: &str| -> Result<Option<i32>, String> {
+        match obj.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => {
+                let n = v
+                    .as_i64()
+                    .ok_or_else(|| format!("split_work_task: limits.{key} must be a number"))?;
+                let n = i32::try_from(n)
+                    .map_err(|_| format!("split_work_task: limits.{key} is out of range"))?;
+                if n <= 0 {
+                    return Err(format!(
+                        "split_work_task: limits.{key} must be positive (omit it for no limit)"
+                    ));
+                }
+                Ok(Some(n))
+            }
+        }
+    };
+    let token_budget = match obj.get("token_budget") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let n = v
+                .as_i64()
+                .ok_or_else(|| "split_work_task: limits.token_budget must be a number".to_string())?;
+            if n <= 0 {
+                return Err(
+                    "split_work_task: limits.token_budget must be positive (omit it for no limit)"
+                        .to_string(),
+                );
+            }
+            Some(n)
+        }
+    };
+    Ok(WorkTaskChildLimits {
+        max_concurrent_children: positive_i32("max_concurrent_children")?,
+        max_runs_per_child: positive_i32("max_runs_per_child")?,
+        token_budget,
+    })
+}
+
+fn parse_list_spec(arguments: &Value) -> ListWorkTasksSpec {
+    let task_ids = arguments
+        .get("task_ids")
+        .map(|v| parse_id_list(v, "task_ids", "list_work_tasks"))
+        .transpose()
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    ListWorkTasksSpec {
+        task_ids,
+        parent_task_id: arguments.get("parent_task_id").and_then(json_i32),
+        // Clamped here so a call can never park longer than the documented cap;
+        // the access impl clamps again (it is the authority).
+        wait_ms: arguments
+            .get("wait_ms")
+            .and_then(|v| v.as_u64())
+            .map(|ms| ms.min(crate::acp::chat_authoring::MAX_LIST_WAIT_MS)),
+    }
+}
+
+fn parse_ids_spec(arguments: &Value, tool: &str) -> Result<WorkTaskIdsSpec, String> {
+    let raw = arguments
+        .get("task_ids")
+        .ok_or_else(|| format!("{tool} requires a non-empty `task_ids` array"))?;
+    let ids = parse_id_list(raw, "task_ids", tool)?;
+    if ids.is_empty() {
+        return Err(format!("{tool} requires a non-empty `task_ids` array"));
+    }
+    Ok(WorkTaskIdsSpec { task_ids: ids })
+}
+
+/// A JSON number or numeric string → i32, consistent with how `session_id`
+/// tolerates hosts that stringify integers.
+fn json_i32(value: &Value) -> Option<i32> {
+    if let Some(n) = value.as_i64() {
+        return i32::try_from(n).ok();
+    }
+    if let Some(s) = value.as_str() {
+        return s.trim().parse::<i32>().ok();
+    }
+    None
+}
+
+/// A list of task ids: numbers, numeric strings, de-duplicated, order
+/// preserved, capped at [`MAX_TOOL_TASK_IDS`].
+fn parse_id_list(value: &Value, field: &str, tool: &str) -> Result<Vec<i32>, String> {
+    let arr = value
+        .as_array()
+        .ok_or_else(|| format!("{tool}: `{field}` must be an array of task ids"))?;
+    if arr.len() > MAX_TOOL_TASK_IDS {
+        return Err(format!(
+            "{tool}: `{field}` names at most {MAX_TOOL_TASK_IDS} tasks ({} given)",
+            arr.len()
+        ));
+    }
+    let mut ids: Vec<i32> = Vec::with_capacity(arr.len());
+    for item in arr {
+        let id = json_i32(item)
+            .ok_or_else(|| format!("{tool}: `{field}` must contain integer task ids"))?;
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+/// A subtask's `depends_on_index` list: 0-based positions, de-duplicated.
+fn parse_index_list(value: &Value, subtask: usize, tool: &str) -> Result<Vec<usize>, String> {
+    let arr = value
+        .as_array()
+        .ok_or_else(|| format!("{tool}: subtasks[{subtask}].depends_on_index must be an array"))?;
+    let mut out: Vec<usize> = Vec::with_capacity(arr.len());
+    for item in arr {
+        let idx = item
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| {
+                format!(
+                    "{tool}: subtasks[{subtask}].depends_on_index must contain non-negative \
+                     integers"
+                )
+            })?;
+        if !out.contains(&idx) {
+            out.push(idx);
+        }
+    }
+    Ok(out)
+}
+
+/// A required integer argument (JSON number or numeric string).
+fn required_i32(arguments: &Value, field: &str, tool: &str) -> Result<i32, String> {
+    arguments
+        .get(field)
+        .and_then(json_i32)
+        .ok_or_else(|| format!("{tool} requires an integer `{field}`"))
 }
 
 /// Character-safe truncation shared by both spec parsers.
@@ -2567,6 +2819,108 @@ pub fn render_task_ack(outcome: &Value) -> Value {
             "Not recorded."
         })
         .to_string();
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": false,
+        "structuredContent": outcome.clone(),
+    })
+}
+
+/// Map a `split_work_task` / `list_work_tasks` / `start_work_task` /
+/// `cancel_work_task` round-trip outcome (a serialized
+/// [`crate::acp::chat_authoring::WorkTaskToolOutcome`]) into an MCP
+/// `tools/call` result.
+///
+/// Like the authoring renderer, every refusal is `isError: false` text: a
+/// feature turned off, a task that is not this conversation's, a task that
+/// cannot be canceled — all things the LLM reads and reports, none of them
+/// reasons to abort the turn.
+pub fn render_work_task_tool_result(outcome: &Value) -> Value {
+    let s = |k: &str| outcome.get(k).and_then(|v| v.as_str());
+    let ok = outcome
+        .get("ok")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut lines: Vec<String> = Vec::new();
+
+    if let Some(tasks) = outcome.get("tasks").and_then(|v| v.as_array()) {
+        for task in tasks {
+            let id = task.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let title = task
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(untitled)");
+            let status = task
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let mut line = format!("#{id} [{status}] {title}");
+            if let Some(parent) = task.get("parent_id").and_then(|v| v.as_i64()) {
+                line.push_str(&format!(" (subtask of #{parent})"));
+            }
+            if let Some(progress) = task.get("latest_progress").and_then(|v| v.as_str()) {
+                line.push_str(&format!(" — {progress}"));
+            }
+            lines.push(line);
+            if let Some(blocked) = task.get("blocked") {
+                let reason = blocked
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("blocked");
+                let mut detail = format!("    blocked ({reason})");
+                if let Some(deps) = blocked.get("dependencies").and_then(|v| v.as_array()) {
+                    let refs: Vec<String> = deps
+                        .iter()
+                        .map(|d| {
+                            let id = d.get("task_id").and_then(|v| v.as_i64()).unwrap_or(0);
+                            let status = d.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                            format!("#{id} ({status})")
+                        })
+                        .collect();
+                    if !refs.is_empty() {
+                        detail.push_str(&format!(": waiting for {}", refs.join(", ")));
+                    }
+                }
+                if let Some(extra) = blocked.get("detail").and_then(|v| v.as_str()) {
+                    detail.push_str(&format!(": {extra}"));
+                }
+                lines.push(detail);
+            }
+            if let Some(failure) = task.get("failure_reason").and_then(|v| v.as_str()) {
+                lines.push(format!("    failed: {failure}"));
+            }
+        }
+    }
+    if let Some(results) = outcome.get("results").and_then(|v| v.as_array()) {
+        for result in results {
+            let id = result.get("task_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let verdict = result
+                .get("outcome")
+                .and_then(|v| v.as_str())
+                .unwrap_or("refused");
+            let mut line = format!("#{id}: {verdict}");
+            if let Some(status) = result.get("status").and_then(|v| v.as_str()) {
+                line.push_str(&format!(" ({status})"));
+            }
+            if let Some(note) = result.get("note").and_then(|v| v.as_str()) {
+                line.push_str(&format!(" — {note}"));
+            }
+            lines.push(line);
+        }
+    }
+    if let Some(note) = s("note") {
+        lines.push(note.to_string());
+    }
+
+    let text = if lines.is_empty() {
+        if ok {
+            "Done.".to_string()
+        } else {
+            "The request was refused; no reason was reported.".to_string()
+        }
+    } else {
+        lines.join("\n")
+    };
     json!({
         "content": [{ "type": "text", "text": text }],
         "isError": false,
@@ -3913,7 +4267,17 @@ mod tests {
         assert_eq!(names, vec!["create_automation".to_string()]);
 
         let names = list_tool_names(dispatch_with_features(TASKBOARD_ONLY, list).await);
-        assert_eq!(names, vec!["create_work_task".to_string()]);
+        assert_eq!(
+            names,
+            vec![
+                "create_work_task".to_string(),
+                "split_work_task".to_string(),
+                "list_work_tasks".to_string(),
+                "start_work_task".to_string(),
+                "cancel_work_task".to_string(),
+            ],
+            "the taskboard group carries the create tool plus the four orchestration tools"
+        );
     }
 
     /// Calling a tool whose group is off is rejected as an unknown tool — same
@@ -5206,6 +5570,167 @@ mod tests {
         );
         // Being refused is not a failed tool call: the turn carries on.
         assert_eq!(refused["isError"], false);
+    }
+
+    // ── work-task orchestration tools ──────────────────────────────────────
+
+    /// The four orchestration tools belong to the taskboard group and are
+    /// rejected as unknown when it is off — the same no-leak shape as every
+    /// other gated tool.
+    #[tokio::test]
+    async fn orchestration_tools_are_taskboard_gated() {
+        for name in [
+            "split_work_task",
+            "list_work_tasks",
+            "start_work_task",
+            "cancel_work_task",
+        ] {
+            assert!(TASKBOARD_ONLY.allows_tool(name), "{name} is taskboard-gated");
+            assert!(!CompanionFeatures::parse(None).allows_tool(name));
+            assert!(!AUTOMATIONS_ONLY.allows_tool(name));
+        }
+        let line = json!({
+            "jsonrpc": "2.0", "id": 61, "method": "tools/call",
+            "params": { "name": "list_work_tasks", "arguments": {} }
+        })
+        .to_string();
+        let resp = unwrap_respond(dispatch_for_test(&line).await);
+        assert!(resp.error.unwrap().message.contains("unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn split_work_task_parses_and_rejects_bad_shapes() {
+        let line = json!({
+            "jsonrpc": "2.0", "id": 62, "method": "tools/call",
+            "params": { "name": "split_work_task", "arguments": {
+                "parent_task_id": 7,
+                "subtasks": [
+                    { "title": "one", "prompt": "do one" },
+                    { "title": "two", "prompt": "do two", "depends_on_index": [0] }
+                ],
+                "depends_on_task_ids": [3],
+                "limits": { "max_concurrent_children": 2, "token_budget": 5000 },
+                "parent_depends_on_children": true
+            }}
+        })
+        .to_string();
+        assert!(matches!(
+            dispatch_with_features(TASKBOARD_ONLY, &line).await,
+            LineAction::Spawn(_)
+        ));
+
+        // Every structural error is a synchronous -32602 the LLM can fix.
+        for (args, expect) in [
+            (json!({ "subtasks": [] }), "parent_task_id"),
+            (json!({ "parent_task_id": 7 }), "subtasks"),
+            (json!({ "parent_task_id": 7, "subtasks": [] }), "subtasks"),
+            (
+                json!({ "parent_task_id": 7, "subtasks": [{ "title": "t" }] }),
+                "prompt",
+            ),
+            (
+                json!({ "parent_task_id": 7, "subtasks": [{ "prompt": "p" }] }),
+                "title",
+            ),
+            (
+                json!({ "parent_task_id": 7, "subtasks": [{ "title": "t", "prompt": "p" }],
+                        "limits": { "max_runs_per_child": 0 } }),
+                "positive",
+            ),
+        ] {
+            let line = json!({
+                "jsonrpc": "2.0", "id": 63, "method": "tools/call",
+                "params": { "name": "split_work_task", "arguments": args }
+            })
+            .to_string();
+            let resp = unwrap_respond(dispatch_with_features(TASKBOARD_ONLY, &line).await);
+            let e = resp.error.expect("bad arguments must be rejected");
+            assert_eq!(e.code, -32602);
+            assert!(e.message.contains(expect), "got: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn list_work_tasks_spec_clamps_the_wait_and_dedupes_ids() {
+        let spec = parse_list_spec(&json!({
+            "task_ids": [4, "4", 9],
+            "parent_task_id": "12",
+            "wait_ms": 900_000
+        }));
+        assert_eq!(spec.task_ids, vec![4, 9]);
+        assert_eq!(spec.parent_task_id, Some(12));
+        assert_eq!(
+            spec.wait_ms,
+            Some(crate::acp::chat_authoring::MAX_LIST_WAIT_MS),
+            "a call can never park longer than the documented cap"
+        );
+        let immediate = parse_list_spec(&json!({}));
+        assert_eq!(immediate.wait_ms, None);
+        assert!(immediate.task_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_and_cancel_require_a_non_empty_id_list() {
+        for name in ["start_work_task", "cancel_work_task"] {
+            for args in [json!({}), json!({ "task_ids": [] })] {
+                let line = json!({
+                    "jsonrpc": "2.0", "id": 64, "method": "tools/call",
+                    "params": { "name": name, "arguments": args }
+                })
+                .to_string();
+                let resp = unwrap_respond(dispatch_with_features(TASKBOARD_ONLY, &line).await);
+                let e = resp.error.expect("bad arguments must be rejected");
+                assert_eq!(e.code, -32602);
+                assert!(e.message.contains("task_ids"), "got: {}", e.message);
+            }
+            let line = json!({
+                "jsonrpc": "2.0", "id": 65, "method": "tools/call",
+                "params": { "name": name, "arguments": { "task_ids": [1, 2] } }
+            })
+            .to_string();
+            assert!(matches!(
+                dispatch_with_features(TASKBOARD_ONLY, &line).await,
+                LineAction::Spawn(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn render_work_task_tool_result_reports_tasks_results_and_notes() {
+        let outcome = json!({
+            "ok": true,
+            "tasks": [
+                { "id": 5, "title": "wire the API", "status": "todo", "run_seq": 0,
+                  "parent_id": 2,
+                  "blocked": { "reason": "dependency",
+                               "dependencies": [{ "task_id": 4, "title": "schema", "status": "failed" }] } }
+            ],
+            "results": [
+                { "task_id": 5, "outcome": "refused", "note": "it cannot start yet" }
+            ],
+            "note": "Created 1 subtask."
+        });
+        let rendered = render_work_task_tool_result(&outcome);
+        assert_eq!(rendered["isError"], false);
+        let text = rendered["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("#5 [todo] wire the API"));
+        assert!(text.contains("subtask of #2"));
+        assert!(text.contains("blocked (dependency)"));
+        assert!(text.contains("waiting for #4 (failed)"));
+        assert!(text.contains("#5: refused"));
+        assert!(text.contains("Created 1 subtask."));
+        assert_eq!(rendered["structuredContent"]["ok"], true);
+
+        // A whole-call refusal is readable text, not a tool error.
+        let refused = render_work_task_tool_result(&json!({
+            "ok": false,
+            "note": "Task #9 is not one of this conversation's tasks."
+        }));
+        assert_eq!(refused["isError"], false);
+        assert!(refused["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("not one of this conversation's tasks"));
     }
 
 }

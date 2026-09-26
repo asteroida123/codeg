@@ -5676,7 +5676,12 @@
     "delegationStatusInterrupted": "중단됨",
     "delegationContinuation": "이어가기 라운드",
     "delegationOpenSession": "세션 열기",
-    "freshSessionLabel": "새 세션 시작"
+    "freshSessionLabel": "새 세션 시작",
+    "blockedTitle": "시작 대기 중",
+    "blockedReasonDependency": "먼저 {count}개의 선행 작업이 완료되어야 합니다.",
+    "blockedReasonRuns": "이 하위 작업은 상위 작업의 실행 횟수 한도에 도달했습니다.",
+    "blockedReasonBudget": "상위 작업의 토큰 예산이 모두 사용되었습니다.",
+    "blockedRemoveDependency": "이 의존성 제거"
   },
   "CustomSkillsSettings": {
     "loading": "사용자 지정 스킬 불러오는 중…",

@@ -5676,7 +5676,12 @@
     "delegationStatusInterrupted": "Interrumpida",
     "delegationContinuation": "Ronda de continuación",
     "delegationOpenSession": "Abrir sesión",
-    "freshSessionLabel": "Iniciar una sesión nueva"
+    "freshSessionLabel": "Iniciar una sesión nueva",
+    "blockedTitle": "En espera de inicio",
+    "blockedReasonDependency": "Antes deben terminar {count} tarea(s) previa(s).",
+    "blockedReasonRuns": "Esta subtarea alcanzó el límite de ejecuciones de la tarea principal.",
+    "blockedReasonBudget": "El presupuesto de tokens de la tarea principal se agotó.",
+    "blockedRemoveDependency": "Quitar esta dependencia"
   },
   "CustomSkillsSettings": {
     "loading": "Cargando habilidades personalizadas…",

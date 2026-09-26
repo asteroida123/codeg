@@ -5676,7 +5676,12 @@
     "delegationStatusInterrupted": "Interrompu",
     "delegationContinuation": "Tour de continuation",
     "delegationOpenSession": "Ouvrir la session",
-    "freshSessionLabel": "Démarrer une nouvelle session"
+    "freshSessionLabel": "Démarrer une nouvelle session",
+    "blockedTitle": "En attente de démarrage",
+    "blockedReasonDependency": "{count} tâche(s) précédente(s) doivent d'abord se terminer.",
+    "blockedReasonRuns": "Cette sous-tâche a atteint la limite d'exécutions de la tâche parente.",
+    "blockedReasonBudget": "Le budget de jetons de la tâche parente est épuisé.",
+    "blockedRemoveDependency": "Supprimer cette dépendance"
   },
   "CustomSkillsSettings": {
     "loading": "Chargement des compétences personnalisées…",

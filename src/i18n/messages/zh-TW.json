@@ -5676,7 +5676,12 @@
     "delegationStatusInterrupted": "已中斷",
     "delegationContinuation": "續接輪次",
     "delegationOpenSession": "開啟工作階段",
-    "freshSessionLabel": "啟動新工作階段"
+    "freshSessionLabel": "啟動新工作階段",
+    "blockedTitle": "等待開始",
+    "blockedReasonDependency": "需要先完成 {count} 個前置任務。",
+    "blockedReasonRuns": "此子任務已達到父任務的執行次數上限。",
+    "blockedReasonBudget": "父任務的 token 預算已用完。",
+    "blockedRemoveDependency": "移除此依賴"
   },
   "CustomSkillsSettings": {
     "loading": "正在載入自訂技能…",

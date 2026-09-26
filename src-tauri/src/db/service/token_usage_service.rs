@@ -15,8 +15,8 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult, JoinType, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set, TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult, JoinType,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set, TransactionTrait,
 };
 
 use crate::db::entities::{conversation, folder, token_usage_sync, token_usage_turn};
@@ -209,8 +209,12 @@ pub async fn fetch_facts(
 /// A conversation with no fact rows (yet) contributes 0: the token pipeline is
 /// best-effort and lags behind a live run, and inventing history to make a
 /// budget look tighter would be just as wrong as ignoring real spend.
-pub async fn total_tokens_for_conversations(
-    conn: &DatabaseConnection,
+///
+/// Generic over the connection so the work-task claim gate can read it INSIDE
+/// its claim transaction — the budget check has to see the same snapshot as the
+/// status CAS it guards.
+pub async fn total_tokens_for_conversations<C: ConnectionTrait>(
+    conn: &C,
     conversation_ids: &[i32],
 ) -> Result<i64, DbError> {
     if conversation_ids.is_empty() {

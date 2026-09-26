@@ -62,6 +62,10 @@ pub async fn work_task_list_core(
     let mut infos = work_task_service::list(&db.conn, folder_id).await?;
     annotate_worktree_missing(db, &mut infos).await?;
     annotate_agent_type(db, &mut infos).await?;
+    // The orchestration gate, derived for the whole page in batched queries —
+    // never stored, so a dependency that failed shows up on the next poll
+    // without any pump needing to touch the dependent row.
+    work_task_service::annotate_blocked(&db.conn, &mut infos).await?;
     Ok(infos)
 }
 
@@ -69,7 +73,35 @@ pub async fn work_task_get_core(db: &AppDatabase, id: i32) -> Result<WorkTaskInf
     let mut infos = vec![work_task_service::get(&db.conn, id).await?];
     annotate_worktree_missing(db, &mut infos).await?;
     annotate_agent_type(db, &mut infos).await?;
+    work_task_service::annotate_blocked(&db.conn, &mut infos).await?;
     Ok(infos.pop().expect("annotated the one row"))
+}
+
+/// Drop one dependency edge — the user's escape hatch for a dependency that
+/// failed, was canceled, or was deleted (nothing removes edges automatically;
+/// the dependent simply stays blocked until someone decides).
+pub async fn work_task_dependency_remove_core(
+    emitter: &EventEmitter,
+    db: &AppDatabase,
+    task_id: i32,
+    depends_on_task_id: i32,
+) -> Result<bool, DbError> {
+    let removed =
+        work_task_service::remove_dependency(&db.conn, task_id, depends_on_task_id).await?;
+    if !removed {
+        return Ok(false);
+    }
+    emit_event(
+        emitter,
+        WORK_TASK_CHANGED_EVENT,
+        WorkTaskChange::Upsert { id: task_id },
+    );
+    // The dependent may be claimable now (auto_process folders especially) —
+    // exactly the wake a `done` dependency would have caused.
+    if let Ok(task) = work_task_service::get_model(&db.conn, task_id).await {
+        nudge_pump(task.folder_id);
+    }
+    Ok(true)
 }
 
 /// Stamp `worktree_missing` on every row whose recorded worktree can no longer
@@ -245,6 +277,30 @@ pub async fn work_task_create_core(
     draft: WorkTaskDraft,
 ) -> Result<WorkTaskInfo, DbError> {
     let info = work_task_service::create(&db.conn, draft).await?;
+    emit_event(
+        emitter,
+        WORK_TASK_CHANGED_EVENT,
+        WorkTaskChange::Upsert { id: info.id },
+    );
+    nudge_pump(info.folder_id);
+    Ok(info)
+}
+
+/// `work_task_create_core` for a task an agent asked for from chat: the same
+/// row and the same broadcast, plus the conversation stamp that later lets the
+/// orchestration tools tell the caller's own tasks from everyone else's.
+pub async fn work_task_create_authored_core(
+    emitter: &EventEmitter,
+    db: &AppDatabase,
+    draft: WorkTaskDraft,
+    created_by_conversation_id: Option<i32>,
+) -> Result<WorkTaskInfo, DbError> {
+    let info = work_task_service::create_authored(
+        &db.conn,
+        draft,
+        created_by_conversation_id,
+    )
+    .await?;
     emit_event(
         emitter,
         WORK_TASK_CHANGED_EVENT,
@@ -966,6 +1022,23 @@ pub async fn work_task_delete(
         &db,
         id,
         delete_worktree.unwrap_or(false),
+    )
+    .await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_dependency_remove(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    task_id: i32,
+    depends_on_task_id: i32,
+) -> Result<bool, DbError> {
+    work_task_dependency_remove_core(
+        &EventEmitter::Tauri(app),
+        &db,
+        task_id,
+        depends_on_task_id,
     )
     .await
 }
