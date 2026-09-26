@@ -2794,6 +2794,58 @@ impl ConnectionManager {
         }
     }
 
+    /// The modes + config options a live connection of `agent_type` has
+    /// ALREADY advertised, read straight out of its `SessionState`. This is a
+    /// cache read, never a probe: it answers only from connections that exist
+    /// (a chat the user opened, or a delegation child that ran), so a
+    /// capability listing never launches an agent process.
+    ///
+    /// A connection still mid-handshake may not have published its selectors
+    /// yet, so a `selectors_ready` connection is preferred over one that is
+    /// merely connected; absent any ready connection, a connected one's
+    /// partial advertisement still answers (better than "unknown", and the
+    /// capability entry's notes already carry the honesty caveats).
+    /// Delegation children count: they are ordinary connections, so after a
+    /// delegation to an agent has run once, that agent's advertisement is
+    /// available here even with no chat session open.
+    ///
+    /// Lock discipline mirrors `list_active_sessions`: hold the connections
+    /// mutex while taking each per-session read lock (each read is
+    /// microseconds and released before the next).
+    pub async fn advertised_options_for_agent(
+        &self,
+        agent_type: AgentType,
+    ) -> Option<AgentOptionsSnapshot> {
+        let connections = self.connections.lock().await;
+        let mut fallback: Option<AgentOptionsSnapshot> = None;
+        for conn in connections.values() {
+            if conn.agent_type != agent_type {
+                continue;
+            }
+            let state = conn.state.read().await;
+            if !state.selectors_ready {
+                // Remember the first not-yet-ready advertisement as a
+                // fallback, but keep looking for a ready one.
+                if fallback.is_none() {
+                    fallback = Some(AgentOptionsSnapshot {
+                        modes: state.modes.clone(),
+                        config_options: state.config_options.clone().unwrap_or_default(),
+                        available_commands: Vec::new(),
+                        prompt_capabilities: None,
+                    });
+                }
+                continue;
+            }
+            return Some(AgentOptionsSnapshot {
+                modes: state.modes.clone(),
+                config_options: state.config_options.clone().unwrap_or_default(),
+                available_commands: Vec::new(),
+                prompt_capabilities: None,
+            });
+        }
+        fallback
+    }
+
     /// Wait until recovery has applied its selector preferences, then verify
     /// the immutable session identity before a continuation prompt is sent.
     #[allow(clippy::too_many_arguments)]
@@ -4806,6 +4858,129 @@ impl SessionPlanApprovalAccess for ConnectionManagerPlanApprovalLookup {
         self.manager
             .cancel_plan_approvals_by_parent(parent_connection_id)
             .await
+    }
+}
+
+/// Production impl of [`CapabilityCatalogAccess`] for the delegation
+/// listener's `get_delegation_capabilities` arm. Mirrors the other
+/// `ConnectionManager*Lookup`s so the listener stays unit-testable with an
+/// in-memory stub.
+///
+/// Source policy, per agent, in order:
+///
+/// 1. **Static** — agents whose catalogs live in a file codeg can read
+///    without starting anything: Codex (the `model_catalog_json` chain codex
+///    itself resolves, else its bundled catalog) and ZCode (the
+///    `~/.zcode/v2/config.json` provider table). Static lists win when both
+///    sources exist — a static read is deterministic and reflects exactly
+///    what the agent's own config says.
+/// 2. **Advertised** — every other agent answers from whatever a live
+///    connection of that type has already published
+///    ([`ConnectionManager::advertised_options_for_agent`]); the static
+///    catalogs carry no session modes, so a live advertisement also fills the
+///    `modes` of a static entry.
+/// 3. **Unknown** — nothing was readable and nothing is live: empty lists and
+///    notes, never a guess.
+///
+/// The catalog describes REGISTERED agents (`registry::all_acp_agents`) — the
+/// same set the user can actually launch. A filter slug that matches nothing
+/// (typo, or a custom agent since removed) comes back as an envelope note,
+/// not an error.
+#[derive(Clone)]
+pub struct ConnectionManagerCapabilityCatalog {
+    pub manager: Arc<ConnectionManager>,
+}
+
+#[async_trait::async_trait]
+impl crate::acp::capability_catalog::CapabilityCatalogAccess
+    for ConnectionManagerCapabilityCatalog
+{
+    async fn resolve(
+        &self,
+        agent_type: Option<&str>,
+    ) -> crate::acp::capability_catalog::CapabilitiesReport {
+        use crate::acp::capability_catalog as cc;
+
+        let agents = crate::acp::registry::all_acp_agents();
+        let selected: Vec<AgentType> = match agent_type.map(str::trim).filter(|s| !s.is_empty()) {
+            // No filter: every registered agent.
+            None => agents,
+            Some(slug) => match agents.into_iter().find(|a| a.as_wire() == slug) {
+                Some(one) => vec![one],
+                None => {
+                    return cc::CapabilitiesReport {
+                        agents: Vec::new(),
+                        note: Some(format!(
+                            "No delegable agent matches agent_type {slug:?}. The slugs \
+                             delegate_to_agent accepts are the ones this codeg has \
+                             registered (built-ins plus the user's custom agents)."
+                        )),
+                    };
+                }
+            },
+        };
+
+        let mut out = Vec::with_capacity(selected.len());
+        for agent in selected {
+            let meta = crate::acp::registry::get_agent_meta(agent);
+            let slug = agent.as_wire().to_string();
+            let name = meta.name.to_string();
+            let advertised = self.manager.advertised_options_for_agent(agent).await;
+            let mut entry = match agent {
+                AgentType::Codex => {
+                    let (models, note) =
+                        cc::codex_catalog_models(&crate::commands::acp::codex_home_dir());
+                    let mut e = cc::from_codex_catalog(&slug, &name, &models);
+                    if let Some(note) = note {
+                        e.notes.push(note);
+                    }
+                    e
+                }
+                AgentType::ZCode => {
+                    match cc::zcode_provider_config_raw(dirs::home_dir().as_deref())
+                        .as_deref()
+                        .and_then(cc::parse_zcode_provider_config)
+                    {
+                        Some(catalog) => cc::from_zcode_provider_catalog(&slug, &name, &catalog),
+                        // Unreadable / absent config: fall through to the
+                        // advertised cache; without one, unknown.
+                        None => advertised
+                            .as_ref()
+                            .map(|snap| {
+                                cc::from_advertised(
+                                    &slug,
+                                    &name,
+                                    snap.modes.as_ref(),
+                                    &snap.config_options,
+                                )
+                            })
+                            .unwrap_or_else(|| cc::AgentCapabilities::unknown(&slug, &name)),
+                    }
+                }
+                _ => advertised
+                    .as_ref()
+                    .map(|snap| {
+                        cc::from_advertised(&slug, &name, snap.modes.as_ref(), &snap.config_options)
+                    })
+                    .unwrap_or_else(|| cc::AgentCapabilities::unknown(&slug, &name)),
+            };
+            // Static catalogs know nothing of session modes; a live
+            // advertisement of the same agent fills exactly that gap.
+            if matches!(entry.source, cc::CapabilitySource::Static) {
+                if let Some(snap) = advertised.as_ref() {
+                    if let Some(modes) = snap.modes.as_ref() {
+                        cc::merge_advertised_modes(&mut entry, modes);
+                    }
+                }
+            }
+            out.push(entry);
+        }
+        let mut report = cc::CapabilitiesReport {
+            agents: out,
+            note: None,
+        };
+        cc::dedupe_agents(&mut report);
+        report
     }
 }
 
@@ -10188,5 +10363,94 @@ mod tests {
             .is_empty());
         // Commit on a missing connection is a safe no-op.
         mgr.commit_feedback_delivered("nope", vec!["x".into()]).await;
+    }
+
+    /// `advertised_options_for_agent` answers from a live connection's
+    /// SessionState only: a selectors-ready connection wins, a not-yet-ready
+    /// one still answers as a fallback, and an agent with no live connection
+    /// answers `None` (a cache miss, never a probe).
+    #[tokio::test]
+    async fn advertised_options_come_from_live_connections_only() {
+        use crate::acp::types::{
+            SessionConfigKindInfo, SessionConfigOptionInfo, SessionConfigSelectInfo,
+            SessionConfigSelectOptionInfo, SessionModeInfo, SessionModeStateInfo,
+        };
+
+        let mgr = ConnectionManager::new();
+        // No connection at all → None (unknown), for any agent.
+        assert!(mgr
+            .advertised_options_for_agent(AgentType::Codex)
+            .await
+            .is_none());
+
+        // A selectors-READY codex connection advertising a model select.
+        mgr.insert_test_connection("c1", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        {
+            let state = mgr.get_state("c1").await.unwrap();
+            let mut s = state.write().await;
+            s.selectors_ready = true;
+            s.modes = Some(SessionModeStateInfo {
+                current_mode_id: "default".into(),
+                available_modes: vec![SessionModeInfo {
+                    id: "default".into(),
+                    name: "Default".into(),
+                    description: None,
+                }],
+            });
+            s.config_options = Some(vec![SessionConfigOptionInfo {
+                id: "model".into(),
+                name: "Model".into(),
+                description: None,
+                category: Some("model".into()),
+                kind: SessionConfigKindInfo::Select(SessionConfigSelectInfo {
+                    current_value: "m1".into(),
+                    options: vec![SessionConfigSelectOptionInfo {
+                        value: "m1".into(),
+                        name: "M1".into(),
+                        description: None,
+                    }],
+                    groups: Vec::new(),
+                }),
+                recommended_value: None,
+            }]);
+        }
+        let snap = mgr
+            .advertised_options_for_agent(AgentType::Codex)
+            .await
+            .expect("live codex advertisement");
+        assert_eq!(
+            snap.modes.as_ref().unwrap().available_modes.len(),
+            1,
+            "modes flow through"
+        );
+        assert_eq!(snap.config_options.len(), 1, "config options flow through");
+        assert_eq!(snap.config_options[0].id, "model");
+
+        // Other agents are unaffected by codex's live session.
+        assert!(mgr
+            .advertised_options_for_agent(AgentType::Gemini)
+            .await
+            .is_none());
+
+        // A second codex connection still mid-handshake must NOT displace the
+        // ready one's advertisement.
+        mgr.insert_test_connection("c2", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        let still = mgr
+            .advertised_options_for_agent(AgentType::Codex)
+            .await
+            .expect("ready connection still answers");
+        assert_eq!(still.config_options.len(), 1);
+
+        // And with ONLY a not-yet-ready connection, its partial advertisement
+        // still answers (better than unknown).
+        let mgr2 = ConnectionManager::new();
+        mgr2.insert_test_connection("g1", AgentType::Gemini, None, EventEmitter::Noop)
+            .await;
+        assert!(mgr2
+            .advertised_options_for_agent(AgentType::Gemini)
+            .await
+            .is_some());
     }
 }

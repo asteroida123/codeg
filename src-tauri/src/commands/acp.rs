@@ -2644,7 +2644,10 @@ fn home_dir_or_default() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn codex_home_dir() -> PathBuf {
+/// `CODEX_HOME`-aware codex config dir (default `~/.codex`). `pub(crate)` so
+/// the delegation capability catalog can read the same `model_catalog_json`
+/// chain codex itself resolves at launch.
+pub(crate) fn codex_home_dir() -> PathBuf {
     let configured = std::env::var("CODEX_HOME").ok().and_then(|raw| {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
