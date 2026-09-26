@@ -4637,6 +4637,8 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                 error_code: Some("spawn_failed".into()),
                 message: Some(error.to_string()),
                 duration_ms: Some(0),
+                turn_count: None,
+                token_usage: None,
                 blocked_on: None,
                 selectors: None,
             };

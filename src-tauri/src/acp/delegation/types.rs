@@ -200,7 +200,9 @@ pub enum DelegationError {
     /// accepted spellings ride along so the caller can self-correct in one
     /// retry. Only raised against a KNOWN list — an unknown capability source
     /// passes the value through as a preference instead.
-    #[error("invalid {field} {value:?}: not one of this agent's known options (accepted: {accepted:?})")]
+    #[error(
+        "invalid {field} {value:?}: not one of this agent's known options (accepted: {accepted:?})"
+    )]
     InvalidSelector {
         field: String,
         value: String,
@@ -366,6 +368,16 @@ pub struct DelegationTaskReport {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Child turn count for a completed task (from `DelegationSuccess`).
+    /// Absent on running / failed / canceled reports. Persisted by the ledger
+    /// as a queryable column for the delegation performance dashboard (#724).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_count: Option<u32>,
+    /// Token spend of the completed child run, when the child reported one.
+    /// Absent otherwise — many agents do not report usage per turn, and the
+    /// ledger stores NULL rather than a zero that would understate cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<TokenUsage>,
     /// Set only on a `Running` report whose child is parked on a user decision.
     /// Absent means "actually working" — so its absence is as informative as its
     /// presence, and neither breaks a consumer that doesn't know the field.
@@ -450,7 +462,8 @@ mod tests {
         ];
         for (err, expected) in cases {
             let display = err.to_string();
-            let DelegationOutcome::Err { code, message, .. } = DelegationOutcome::from_err(err, None)
+            let DelegationOutcome::Err { code, message, .. } =
+                DelegationOutcome::from_err(err, None)
             else {
                 panic!("from_err must produce an Err outcome");
             };
@@ -505,9 +518,10 @@ mod tests {
             },
             effective: Some(AppliedSelectors {
                 mode: Some("default".into()),
-                config_values: BTreeMap::from([
-                    (String::from("model"), String::from("gpt-6-astra")),
-                ]),
+                config_values: BTreeMap::from([(
+                    String::from("model"),
+                    String::from("gpt-6-astra"),
+                )]),
             }),
         };
         let v = serde_json::to_value(&report).unwrap();
@@ -524,5 +538,44 @@ mod tests {
         })
         .unwrap();
         assert!(bare.get("effective").is_none());
+    }
+
+    /// `turn_count` / `token_usage` ride the report the same additive way:
+    /// absent means NOTHING on the wire (pre-existing payloads stay
+    /// byte-identical), present round-trips losslessly into the ledger JSON.
+    #[test]
+    fn report_metrics_serialize_additively() {
+        let mut report = DelegationTaskReport {
+            task_id: Some("t0".into()),
+            status: TaskStatus::Completed,
+            child_conversation_id: Some(7),
+            agent_type: None,
+            text: None,
+            error_code: None,
+            message: None,
+            duration_ms: Some(100),
+            turn_count: None,
+            token_usage: None,
+            blocked_on: None,
+            selectors: None,
+        };
+        let bare = serde_json::to_value(&report).unwrap();
+        assert!(bare.get("turn_count").is_none());
+        assert!(bare.get("token_usage").is_none());
+
+        report.turn_count = Some(3);
+        report.token_usage = Some(TokenUsage {
+            input: 1_200,
+            output: 340,
+        });
+        let full = serde_json::to_value(&report).unwrap();
+        assert_eq!(full["turn_count"], 3);
+        assert_eq!(full["token_usage"]["input"], 1_200);
+        assert_eq!(full["token_usage"]["output"], 340);
+        let back: DelegationTaskReport = serde_json::from_value(full).unwrap();
+        assert_eq!(back.turn_count, Some(3));
+        let usage = back.token_usage.expect("usage round-trips");
+        assert_eq!(usage.input, 1_200);
+        assert_eq!(usage.output, 340);
     }
 }

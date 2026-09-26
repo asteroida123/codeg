@@ -312,9 +312,12 @@ mod tests {
         conn.execute(sql("PRAGMA foreign_keys=ON;"))
             .await
             .expect("foreign keys after reopen");
-        Migrator::up(&conn, Some(1))
+        // Production migrates to HEAD on startup; pinning this fixture to
+        // "one step past pre-ledger" would break every later migration that
+        // touches delegation_task (the entity always selects all columns).
+        Migrator::up(&conn, None)
             .await
-            .expect("apply ledger migration");
+            .expect("apply ledger + later migrations");
         assert!(
             SchemaManager::new(&conn)
                 .has_table("delegation_task")

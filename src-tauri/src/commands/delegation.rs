@@ -184,7 +184,9 @@ pub async fn set_delegation_enabled_core(
         .await
         .map_err(AppCommandError::from)?;
     let settings = load_delegation_settings(conn).await;
-    broker.set_config(settings.clone().into_broker_config()).await;
+    broker
+        .set_config(settings.clone().into_broker_config())
+        .await;
     emit_event(emitter, DELEGATION_SETTINGS_CHANGED_EVENT, &settings);
     Ok(settings)
 }
@@ -266,6 +268,34 @@ pub async fn set_delegation_settings(
     #[cfg(not(feature = "tauri-runtime"))]
     {
         let _ = settings;
+        Err(AppCommandError::configuration_invalid("tauri-only command"))
+    }
+}
+
+/// Sub-agent performance dashboard (upstream #724): aggregate the delegation
+/// ledger by agent / effective model. Pure read — the `_core` helper is the
+/// whole body because no broker or event state is involved, so the Tauri
+/// command and the HTTP handler share it directly.
+pub async fn get_delegation_performance_core(
+    conn: &DatabaseConnection,
+) -> Result<crate::db::service::delegation_task_service::DelegationPerformanceReport, AppCommandError>
+{
+    crate::db::service::delegation_task_service::performance_report(conn)
+        .await
+        .map_err(AppCommandError::from)
+}
+
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn get_delegation_performance(
+    #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, crate::db::AppDatabase>,
+) -> Result<crate::db::service::delegation_task_service::DelegationPerformanceReport, AppCommandError>
+{
+    #[cfg(feature = "tauri-runtime")]
+    {
+        get_delegation_performance_core(&db.conn).await
+    }
+    #[cfg(not(feature = "tauri-runtime"))]
+    {
         Err(AppCommandError::configuration_invalid("tauri-only command"))
     }
 }
