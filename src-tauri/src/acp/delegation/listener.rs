@@ -1836,7 +1836,8 @@ mod tests {
     }
 
     use crate::acp::chat_authoring::{
-        NewAutomationSpec, NewWorkTaskSpec, WorkTaskToolCall, WorkTaskToolOutcome,
+        ListWorkTasksSpec, NewAutomationSpec, NewWorkTaskSpec, WorkTaskIdsSpec, WorkTaskToolCall,
+        WorkTaskToolOutcome,
     };
 
     /// Records what the listener handed down and returns a canned outcome, so
@@ -3985,5 +3986,81 @@ mod tests {
             path.as_os_str().len(),
             dialed.err()
         );
+    }
+
+    // ── work-task orchestration round trips ────────────────────────────────
+
+    /// The orchestration arm resolves the caller exactly like the authoring
+    /// arms do — conversation (the authorization anchor) plus working
+    /// directory — and hands the parsed call down untouched.
+    #[tokio::test]
+    async fn work_task_tool_reaches_the_impl_with_the_callers_context() {
+        let authoring = Arc::new(StubAuthoring::default());
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry {
+                    parent_connection_id: "parent-conn".into(),
+                    working_dir: PathBuf::from("/repo/app"),
+                },
+            )
+            .await;
+        let listener = make_authoring_listener(tokens, authoring.clone(), Some(42));
+
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+        let msg = BrokerMessage::WorkTaskTool(BrokerWorkTaskToolRequest {
+            token: "tok".into(),
+            call: WorkTaskToolCall::List(ListWorkTasksSpec {
+                task_ids: vec![5, 6],
+                parent_task_id: Some(2),
+                wait_ms: Some(1_500),
+            }),
+        });
+        write_frame(&mut client, &msg).await.unwrap();
+        let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap();
+
+        assert_eq!(resp.outcome["ok"], true);
+        let calls = authoring.work_task_calls.lock().await;
+        let (ctx, call) = calls.first().expect("impl was called");
+        assert_eq!(ctx.conversation_id, Some(42));
+        assert_eq!(ctx.working_dir, PathBuf::from("/repo/app"));
+        match call {
+            WorkTaskToolCall::List(spec) => {
+                assert_eq!(spec.task_ids, vec![5, 6]);
+                assert_eq!(spec.parent_task_id, Some(2));
+                assert_eq!(spec.wait_ms, Some(1_500));
+            }
+            other => panic!("wrong call variant: {other:?}"),
+        }
+    }
+
+    /// An invalid token is the same soft refusal every authoring arm gives, and
+    /// the impl is never reached.
+    #[tokio::test]
+    async fn work_task_tool_with_an_invalid_token_refuses_softly() {
+        let authoring = Arc::new(StubAuthoring::default());
+        let tokens = Arc::new(TokenRegistry::default());
+        let listener = make_authoring_listener(tokens, authoring.clone(), Some(42));
+
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+        let msg = BrokerMessage::WorkTaskTool(BrokerWorkTaskToolRequest {
+            token: "nope".into(),
+            call: WorkTaskToolCall::Cancel(WorkTaskIdsSpec { task_ids: vec![1] }),
+        });
+        write_frame(&mut client, &msg).await.unwrap();
+        let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap();
+
+        assert_eq!(resp.outcome["ok"], false);
+        assert_eq!(resp.outcome["note"], "invalid token");
+        assert!(authoring.work_task_calls.lock().await.is_empty());
     }
 }

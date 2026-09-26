@@ -651,3 +651,102 @@ async fn delegation_performance_requires_a_token() {
         .await;
     assert_eq!(resp.status_code(), 401);
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Work-task orchestration: the derived blocked state and the edge escape hatch
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The board's blocked state travels over HTTP, and the dependency-removal
+/// route is the deliberate way out of an edge whose upstream failed. Both go
+/// through the same `_core` functions the desktop commands call.
+#[tokio::test]
+async fn work_task_blocked_state_and_dependency_removal_over_http() {
+    use codeg_lib::db::service::work_task_service::{self, WorkTaskChildDraft};
+    use codeg_lib::db::service::folder_service;
+    use codeg_lib::models::WorkTaskDraft;
+
+    let (server, _data, _static, conn) = build_test_server_with_db().await;
+    let folder = folder_service::add_folder(&conn, "/tmp/api-orchestration")
+        .await
+        .expect("folder");
+    let draft = |title: &str| WorkTaskDraft {
+        folder_id: folder.id,
+        title: title.to_string(),
+        config: json!({
+            "display_text": "do it",
+            "prompt_blocks": [{ "type": "text", "text": "do it" }],
+        }),
+    };
+    let parent = work_task_service::create(&conn, draft("integrate"))
+        .await
+        .expect("parent");
+    // The parent waits for its child, so it is blocked by the gate.
+    work_task_service::split_task(
+        &conn,
+        work_task_service::SplitTaskRequest {
+            parent_id: parent.id,
+            children: vec![WorkTaskChildDraft {
+                title: "piece".to_string(),
+                config: json!({
+                    "display_text": "do the piece",
+                    "prompt_blocks": [{ "type": "text", "text": "do the piece" }],
+                }),
+                depends_on_index: vec![],
+            }],
+            depends_on_task_ids: vec![],
+            max_concurrent_children: None,
+            max_runs_per_child: None,
+            token_budget: None,
+            parent_depends_on_children: true,
+            created_by_conversation_id: None,
+        },
+    )
+    .await
+    .expect("split");
+    let child = work_task_service::children_of(&conn, parent.id)
+        .await
+        .expect("children")[0]
+        .id;
+
+    let resp = server
+        .post("/api/work_task_get")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({ "id": parent.id }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: Value = resp.json();
+    assert_eq!(body["blocked"]["reason"], "dependency", "got {body}");
+    assert_eq!(body["blocked"]["dependencies"][0]["task_id"], child);
+
+    // Removing the edge unblocks it — and the second call reports "nothing to
+    // remove" rather than failing.
+    let resp = server
+        .post("/api/work_task_dependency_remove")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({ "taskId": parent.id, "dependsOnTaskId": child }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    assert_eq!(resp.json::<Value>(), Value::Bool(true));
+
+    let resp = server
+        .post("/api/work_task_get")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({ "id": parent.id }))
+        .await;
+    let body: Value = resp.json();
+    assert!(body.get("blocked").is_none(), "got {body}");
+
+    let resp = server
+        .post("/api/work_task_dependency_remove")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({ "taskId": parent.id, "dependsOnTaskId": child }))
+        .await;
+    assert_eq!(resp.json::<Value>(), Value::Bool(false));
+
+    // The route is protected like every other one.
+    let resp = server
+        .post("/api/work_task_dependency_remove")
+        .json(&json!({ "taskId": parent.id, "dependsOnTaskId": child }))
+        .await;
+    assert_eq!(resp.status_code(), 401);
+}

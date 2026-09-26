@@ -12979,4 +12979,72 @@ mod tests {
         f.engine.release_compact_slot(f.task_id, f.run_seq).await;
         assert!(f.engine.compacting.lock().await.is_empty());
     }
+
+    // ── orchestration gate at the Start button ──────────────────────────────
+
+    /// A blocked start explains itself: the claim would lose the CAS and the
+    /// caller would hear a bare "not in todo", so `start` asks the same
+    /// derivation the board renders and refuses with the reason.
+    #[tokio::test]
+    async fn start_refuses_a_blocked_subtask_with_its_reason() {
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-engine-gate").await;
+        let engine = test_engine(db);
+        let conn = engine.db.conn.clone();
+        let draft = |title: &str| crate::models::WorkTaskDraft {
+            folder_id,
+            title: title.to_string(),
+            config: serde_json::json!({
+                "display_text": "do it",
+                "prompt_blocks": [{ "type": "text", "text": "do it" }],
+            }),
+        };
+        let parent = work_task_service::create(&conn, draft("integrate")).await.unwrap();
+        let split = work_task_service::split_task(
+            &conn,
+            work_task_service::SplitTaskRequest {
+                parent_id: parent.id,
+                children: vec![work_task_service::WorkTaskChildDraft {
+                    title: "piece".to_string(),
+                    config: serde_json::json!({
+                        "display_text": "do the piece",
+                        "prompt_blocks": [{ "type": "text", "text": "do the piece" }],
+                    }),
+                    depends_on_index: vec![],
+                }],
+                depends_on_task_ids: vec![],
+                max_concurrent_children: None,
+                max_runs_per_child: None,
+                token_budget: None,
+                parent_depends_on_children: true,
+                created_by_conversation_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = engine
+            .start(parent.id)
+            .await
+            .expect_err("the parent waits for its child");
+        assert!(err.contains("cannot start yet"), "got: {err}");
+        assert!(err.contains("waiting for"), "got: {err}");
+        assert_eq!(
+            work_task_service::get(&conn, parent.id).await.unwrap().status,
+            WorkTaskStatus::Todo,
+            "a refused start changes nothing"
+        );
+        // The gate closes only what it should: the child itself is claimable.
+        assert!(work_task_service::claim_for_run(
+            &conn,
+            split.children[0].id,
+            WorkTaskStatus::Todo,
+            "user",
+        )
+        .await
+        .unwrap()
+        .is_some());
+    }
 }

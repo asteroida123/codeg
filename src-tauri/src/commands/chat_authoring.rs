@@ -1396,4 +1396,466 @@ mod tests {
         assert!(fresh.automations_enabled().await);
         assert!(!fresh.work_tasks_enabled().await);
     }
+
+    // ── orchestration tools: split / list / start / cancel ─────────────────
+
+    use crate::acp::chat_authoring::{
+        ListWorkTasksSpec, SplitSubtaskSpec, SplitWorkTaskSpec, WorkTaskChildLimits,
+        WorkTaskIdsSpec, WorkTaskToolCall,
+    };
+    use crate::db::entities::work_task::WorkTaskStatus;
+    use crate::models::{WorkTaskDraft, WorkTaskInfo};
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, IntoActiveModel};
+
+    const CONV: i32 = 7;
+
+    fn ctx_conv(dir: &str, conversation_id: i32) -> AuthoringContext {
+        AuthoringContext {
+            conversation_id: Some(conversation_id),
+            working_dir: std::path::PathBuf::from(dir),
+        }
+    }
+
+    fn task_draft(folder_id: i32, title: &str) -> WorkTaskDraft {
+        WorkTaskDraft {
+            folder_id,
+            title: title.to_string(),
+            config: serde_json::json!({
+                "display_text": "do the thing",
+                "prompt_blocks": [{ "type": "text", "text": "do the thing" }],
+            }),
+        }
+    }
+
+    async fn authored(db: &AppDatabase, folder_id: i32, conv: i32, title: &str) -> WorkTaskInfo {
+        work_task_service::create_authored(&db.conn, task_draft(folder_id, title), Some(conv))
+            .await
+            .expect("create authored")
+    }
+
+    async fn patch_status(db: &AppDatabase, id: i32, status: WorkTaskStatus) {
+        let mut active = work_task_service::get_model(&db.conn, id)
+            .await
+            .unwrap()
+            .into_active_model();
+        active.status = Set(status);
+        active.update(&db.conn).await.unwrap();
+    }
+
+    /// A pre-wired split call against the given access (paths resolve through
+    /// the conversation, which the harness runs out of `/repo/app`).
+    async fn split_of(
+        access: &DbChatAuthoring,
+        parent_id: i32,
+        titles: &[&str],
+        extra_deps: Vec<i32>,
+    ) -> WorkTaskToolOutcome {
+        access
+            .work_task_tool(
+                ctx_conv("/repo/app", CONV),
+                WorkTaskToolCall::Split(SplitWorkTaskSpec {
+                    parent_task_id: parent_id,
+                    subtasks: titles
+                        .iter()
+                        .map(|t| SplitSubtaskSpec {
+                            title: (*t).to_string(),
+                            prompt: format!("do {t}"),
+                            agent_type: None,
+                            depends_on_index: vec![],
+                        })
+                        .collect(),
+                    depends_on_task_ids: extra_deps,
+                    limits: WorkTaskChildLimits::default(),
+                    parent_depends_on_children: false,
+                }),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn orchestration_refuses_everything_while_the_switch_is_off() {
+        let (db, access, _cfg) = harness(false, false).await;
+        folder_service::add_folder(&db.conn, "/repo/app").await.unwrap();
+        let parent = authored(&db, 1, CONV, "parent").await;
+
+        for call in [
+            WorkTaskToolCall::Split(SplitWorkTaskSpec {
+                parent_task_id: parent.id,
+                subtasks: vec![SplitSubtaskSpec {
+                    title: "piece".into(),
+                    prompt: "do it".into(),
+                    agent_type: None,
+                    depends_on_index: vec![],
+                }],
+                depends_on_task_ids: vec![],
+                limits: WorkTaskChildLimits::default(),
+                parent_depends_on_children: false,
+            }),
+            WorkTaskToolCall::List(ListWorkTasksSpec::default()),
+            WorkTaskToolCall::Start(WorkTaskIdsSpec {
+                task_ids: vec![parent.id],
+            }),
+            WorkTaskToolCall::Cancel(WorkTaskIdsSpec {
+                task_ids: vec![parent.id],
+            }),
+        ] {
+            let out = access
+                .work_task_tool(ctx_conv("/repo/app", CONV), call)
+                .await;
+            assert!(!out.ok);
+            assert!(out.note.unwrap().contains("turned off"));
+        }
+        // Nothing was written: the parent is still alone on the board.
+        assert_eq!(work_task_service::list(&db.conn, None).await.unwrap().len(), 1);
+        assert_eq!(
+            work_task_service::get(&db.conn, parent.id).await.unwrap().status,
+            WorkTaskStatus::Todo
+        );
+    }
+
+    /// The whole authorization rule: a task this conversation created, or a
+    /// child of one. Everything else hears the same non-confirming refusal as
+    /// an id that does not exist.
+    #[tokio::test]
+    async fn split_only_touches_this_conversations_tasks() {
+        let (db, access, _cfg) = harness(false, true).await;
+        let folder = folder_service::add_folder(&db.conn, "/repo/app")
+            .await
+            .unwrap();
+        let mine = authored(&db, folder.id, CONV, "mine").await;
+        let theirs = authored(&db, folder.id, 99, "theirs").await;
+
+        let out = access
+            .work_task_tool(
+                ctx_conv("/repo/app", CONV),
+                WorkTaskToolCall::Split(SplitWorkTaskSpec {
+                    parent_task_id: mine.id,
+                    subtasks: vec![
+                        SplitSubtaskSpec {
+                            title: "one".to_string(),
+                            prompt: "do one".to_string(),
+                            agent_type: None,
+                            depends_on_index: vec![],
+                        },
+                        SplitSubtaskSpec {
+                            title: "two".to_string(),
+                            prompt: "do two".to_string(),
+                            agent_type: Some("claude_code".to_string()),
+                            depends_on_index: vec![0],
+                        },
+                    ],
+                    depends_on_task_ids: vec![],
+                    limits: WorkTaskChildLimits {
+                        max_concurrent_children: Some(1),
+                        ..Default::default()
+                    },
+                    parent_depends_on_children: true,
+                }),
+            )
+            .await;
+        assert!(out.ok, "note: {:?}", out.note);
+        assert_eq!(out.tasks.len(), 2);
+        let children = work_task_service::children_of(&db.conn, mine.id).await.unwrap();
+        assert_eq!(children.len(), 2);
+        for child in &children {
+            let row = work_task_service::get_model(&db.conn, child.id).await.unwrap();
+            assert_eq!(row.parent_id, Some(mine.id));
+            assert_eq!(row.created_by_conversation_id, Some(CONV));
+        }
+        // The second piece waits on the first, so the answer says so.
+        let second = out.tasks.iter().find(|t| t.id == children[1].id).unwrap();
+        assert_eq!(second.blocked.as_ref().unwrap().reason, "dependency");
+        // The parent's limits were written.
+        let parent_row = work_task_service::get_model(&db.conn, mine.id).await.unwrap();
+        assert_eq!(parent_row.max_concurrent_children, Some(1));
+
+        // Another conversation's task: refused, and the refusal reads exactly
+        // like the one for an id that does not exist.
+        let foreign = split_of(&access, theirs.id, &["piece"], vec![]).await;
+        assert!(!foreign.ok);
+        let unknown = split_of(&access, 9_999, &["piece"], vec![]).await;
+        assert!(!unknown.ok);
+        // Both refusals read the same — the foreign id is only echoed back, it
+        // is never confirmed to exist.
+        let foreign_note = foreign.note.clone().unwrap();
+        let unknown_note = unknown.note.clone().unwrap();
+        assert!(foreign_note.contains("not one of this conversation's tasks"));
+        assert!(unknown_note.contains("not one of this conversation's tasks"));
+        assert_eq!(
+            foreign_note.replace(&theirs.id.to_string(), "N"),
+            unknown_note.replace("9999", "N")
+        );
+        assert!(work_task_service::children_of(&db.conn, theirs.id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // A conversation-less caller owns nothing at all.
+        let anonym = access
+            .work_task_tool(
+                ctx_at("/repo/app"),
+                WorkTaskToolCall::List(ListWorkTasksSpec::default()),
+            )
+            .await;
+        assert!(!anonym.ok);
+        assert!(anonym.note.unwrap().contains("no codeg session"));
+    }
+
+    /// `create_work_task` now stamps the conversation — the anchor the four
+    /// orchestration tools match on later.
+    #[tokio::test]
+    async fn create_work_task_stamps_the_calling_conversation() {
+        let (db, access, _cfg) = harness(false, true).await;
+        folder_service::add_folder(&db.conn, "/repo/app").await.unwrap();
+
+        let out = access
+            .create_work_task(ctx_conv("/repo/app", CONV), work_task_spec())
+            .await;
+        assert!(out.created, "note: {:?}", out.note);
+        let row = work_task_service::get_model(&db.conn, out.id.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(row.created_by_conversation_id, Some(CONV));
+        // The plain UI path stays unowned.
+        let ui = work_task_service::create(&db.conn, task_draft(1, "from the board"))
+            .await
+            .unwrap();
+        assert!(work_task_service::get_model(&db.conn, ui.id)
+            .await
+            .unwrap()
+            .created_by_conversation_id
+            .is_none());
+    }
+
+    /// Start reports the gate per id instead of forcing it through, and a
+    /// foreign id is refused in the same words as a missing one.
+    #[tokio::test]
+    async fn start_answers_every_id_with_its_outcome() {
+        let (db, access, _cfg) = harness(false, true).await;
+        let folder = folder_service::add_folder(&db.conn, "/repo/app")
+            .await
+            .unwrap();
+        let upstream = authored(&db, folder.id, 99, "upstream").await;
+        patch_status(&db, upstream.id, WorkTaskStatus::Failed).await;
+        let mine = authored(&db, folder.id, CONV, "mine").await;
+        let child = split_of(&access, mine.id, &["piece"], vec![upstream.id])
+            .await
+            .tasks[0]
+            .id;
+        let free = authored(&db, folder.id, CONV, "free").await;
+
+        let out = access
+            .work_task_tool(
+                ctx_conv("/repo/app", CONV),
+                WorkTaskToolCall::Start(WorkTaskIdsSpec {
+                    task_ids: vec![child, free.id, 9_999],
+                }),
+            )
+            .await;
+        assert!(out.ok, "the batch itself is not a failure");
+        assert_eq!(out.results.len(), 3);
+        let by_id = |id: i32| {
+            out.results
+                .iter()
+                .find(|r| r.task_id == id)
+                .cloned()
+                .unwrap()
+        };
+        let blocked = by_id(child);
+        assert_eq!(blocked.outcome, "refused");
+        assert!(blocked.note.clone().unwrap().contains("waiting for"));
+        let started = by_id(free.id);
+        assert_eq!(started.outcome, "ok");
+        assert_eq!(
+            work_task_service::get(&db.conn, free.id).await.unwrap().status,
+            WorkTaskStatus::Queued
+        );
+        let unknown = by_id(9_999);
+        assert_eq!(unknown.outcome, "refused");
+        assert!(unknown
+            .note
+            .unwrap()
+            .contains("not one of this conversation's tasks"));
+        // The blocked one was not claimed.
+        assert_eq!(
+            work_task_service::get(&db.conn, child).await.unwrap().status,
+            WorkTaskStatus::Todo
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_a_live_task_and_refuses_the_rest() {
+        let (db, access, _cfg) = harness(false, true).await;
+        let folder_service = folder_service::add_folder(&db.conn, "/repo/app").await.unwrap();
+        let todo = authored(&db, folder_service.id, CONV, "todo").await;
+        let done = authored(&db, folder_service.id, CONV, "done").await;
+        patch_status(&db, done.id, WorkTaskStatus::Done).await;
+        let merging = authored(&db, folder_service.id, CONV, "merging").await;
+        patch_status(&db, merging.id, WorkTaskStatus::Merging).await;
+        let theirs = authored(&db, folder_service.id, 99, "theirs").await;
+
+        let out = access
+            .work_task_tool(
+                ctx_conv("/repo/app", CONV),
+                WorkTaskToolCall::Cancel(WorkTaskIdsSpec {
+                    task_ids: vec![todo.id, done.id, merging.id, theirs.id],
+                }),
+            )
+            .await;
+        assert!(out.ok);
+        let note_for = |id: i32| {
+            out.results
+                .iter()
+                .find(|r| r.task_id == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(note_for(todo.id).outcome, "ok");
+        assert_eq!(
+            work_task_service::get(&db.conn, todo.id).await.unwrap().status,
+            WorkTaskStatus::Canceled
+        );
+        let finished = note_for(done.id);
+        assert_eq!(finished.outcome, "refused");
+        assert!(finished.note.unwrap().contains("already finished"));
+        let merging = note_for(merging.id);
+        assert_eq!(merging.outcome, "refused");
+        assert!(merging.note.unwrap().contains("merge is in flight"));
+        assert_eq!(note_for(theirs.id).outcome, "refused");
+    }
+
+    /// List is a window over the caller's own tasks: a foreign id is dropped
+    /// (with a note that does not confirm it exists) rather than reported.
+    #[tokio::test]
+    async fn list_reports_the_conversations_own_window_with_the_blocked_state() {
+        let (db, access, _cfg) = harness(false, true).await;
+        let folder = folder_service::add_folder(&db.conn, "/repo/app")
+            .await
+            .unwrap();
+        let upstream = authored(&db, folder.id, 99, "upstream").await;
+        patch_status(&db, upstream.id, WorkTaskStatus::Failed).await;
+        let mine = authored(&db, folder.id, CONV, "mine").await;
+        let child = split_of(&access, mine.id, &["piece"], vec![upstream.id])
+            .await
+            .tasks[0]
+            .id;
+        let theirs = authored(&db, folder.id, 99, "theirs").await;
+
+        // Explicit ids: only the owned ones come back.
+        let out = access
+            .work_task_tool(
+                ctx_conv("/repo/app", CONV),
+                WorkTaskToolCall::List(ListWorkTasksSpec {
+                    task_ids: vec![child, theirs.id, 9_999],
+                    parent_task_id: None,
+                    wait_ms: None,
+                }),
+            )
+            .await;
+        assert!(out.ok);
+        assert_eq!(out.tasks.len(), 1);
+        assert_eq!(out.tasks[0].id, child);
+        assert_eq!(out.tasks[0].parent_id, Some(mine.id));
+        assert_eq!(out.tasks[0].blocked.as_ref().unwrap().reason, "dependency");
+        assert!(out.note.unwrap().contains("left out"));
+
+        // A parent window includes the parent and its children.
+        let out = access
+            .work_task_tool(
+                ctx_conv("/repo/app", CONV),
+                WorkTaskToolCall::List(ListWorkTasksSpec {
+                    task_ids: vec![],
+                    parent_task_id: Some(mine.id),
+                    wait_ms: None,
+                }),
+            )
+            .await;
+        let ids: Vec<i32> = out.tasks.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&mine.id) && ids.contains(&child));
+
+        // A foreign parent window is the non-confirming refusal.
+        let out = access
+            .work_task_tool(
+                ctx_conv("/repo/app", CONV),
+                WorkTaskToolCall::List(ListWorkTasksSpec {
+                    task_ids: vec![],
+                    parent_task_id: Some(theirs.id),
+                    wait_ms: None,
+                }),
+            )
+            .await;
+        assert!(!out.ok);
+        assert!(out.note.unwrap().contains("not one of this conversation's tasks"));
+
+        // No window at all: everything this conversation created.
+        let out = access
+            .work_task_tool(
+                ctx_conv("/repo/app", CONV),
+                WorkTaskToolCall::List(ListWorkTasksSpec::default()),
+            )
+            .await;
+        let ids: Vec<i32> = out.tasks.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&mine.id) && ids.contains(&child));
+        assert!(!ids.contains(&theirs.id));
+    }
+
+    /// The long-poll returns as soon as a listed task's status changes — and
+    /// well before its cap when a terminal-only window cannot change at all.
+    #[tokio::test]
+    async fn list_waits_for_a_status_change_within_the_cap() {
+        let (db, access, _cfg) = harness(false, true).await;
+        let folder = folder_service::add_folder(&db.conn, "/repo/app")
+            .await
+            .unwrap();
+        let mine = authored(&db, folder.id, CONV, "mine").await;
+        let db_for_task = db.clone();
+        let task_id = mine.id;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let _ = work_task_service::claim_for_run(
+                &db_for_task.conn,
+                task_id,
+                WorkTaskStatus::Todo,
+                "user",
+            )
+            .await;
+        });
+
+        let started = std::time::Instant::now();
+        let out = access
+            .work_task_tool(
+                ctx_conv("/repo/app", CONV),
+                WorkTaskToolCall::List(ListWorkTasksSpec {
+                    task_ids: vec![mine.id],
+                    parent_task_id: None,
+                    wait_ms: Some(5_000),
+                }),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        assert_eq!(out.tasks[0].status, "queued");
+        assert!(
+            elapsed < std::time::Duration::from_millis(4_000),
+            "returned early: {elapsed:?}"
+        );
+
+        // A terminal-only window cannot change, so it answers immediately.
+        patch_status(&db, mine.id, WorkTaskStatus::Done).await;
+        let started = std::time::Instant::now();
+        let out = access
+            .work_task_tool(
+                ctx_conv("/repo/app", CONV),
+                WorkTaskToolCall::List(ListWorkTasksSpec {
+                    task_ids: vec![mine.id],
+                    parent_task_id: None,
+                    wait_ms: Some(5_000),
+                }),
+            )
+            .await;
+        assert_eq!(out.tasks[0].status, "done");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1_500),
+            "a finished window does not wait"
+        );
+    }
 }

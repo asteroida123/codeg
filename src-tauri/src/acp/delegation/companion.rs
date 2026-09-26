@@ -4267,7 +4267,17 @@ mod tests {
         assert_eq!(names, vec!["create_automation".to_string()]);
 
         let names = list_tool_names(dispatch_with_features(TASKBOARD_ONLY, list).await);
-        assert_eq!(names, vec!["create_work_task".to_string()]);
+        assert_eq!(
+            names,
+            vec![
+                "create_work_task".to_string(),
+                "split_work_task".to_string(),
+                "list_work_tasks".to_string(),
+                "start_work_task".to_string(),
+                "cancel_work_task".to_string(),
+            ],
+            "the taskboard group carries the create tool plus the four orchestration tools"
+        );
     }
 
     /// Calling a tool whose group is off is rejected as an unknown tool — same
@@ -5560,6 +5570,167 @@ mod tests {
         );
         // Being refused is not a failed tool call: the turn carries on.
         assert_eq!(refused["isError"], false);
+    }
+
+    // ── work-task orchestration tools ──────────────────────────────────────
+
+    /// The four orchestration tools belong to the taskboard group and are
+    /// rejected as unknown when it is off — the same no-leak shape as every
+    /// other gated tool.
+    #[tokio::test]
+    async fn orchestration_tools_are_taskboard_gated() {
+        for name in [
+            "split_work_task",
+            "list_work_tasks",
+            "start_work_task",
+            "cancel_work_task",
+        ] {
+            assert!(TASKBOARD_ONLY.allows_tool(name), "{name} is taskboard-gated");
+            assert!(!CompanionFeatures::parse(None).allows_tool(name));
+            assert!(!AUTOMATIONS_ONLY.allows_tool(name));
+        }
+        let line = json!({
+            "jsonrpc": "2.0", "id": 61, "method": "tools/call",
+            "params": { "name": "list_work_tasks", "arguments": {} }
+        })
+        .to_string();
+        let resp = unwrap_respond(dispatch_for_test(&line).await);
+        assert!(resp.error.unwrap().message.contains("unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn split_work_task_parses_and_rejects_bad_shapes() {
+        let line = json!({
+            "jsonrpc": "2.0", "id": 62, "method": "tools/call",
+            "params": { "name": "split_work_task", "arguments": {
+                "parent_task_id": 7,
+                "subtasks": [
+                    { "title": "one", "prompt": "do one" },
+                    { "title": "two", "prompt": "do two", "depends_on_index": [0] }
+                ],
+                "depends_on_task_ids": [3],
+                "limits": { "max_concurrent_children": 2, "token_budget": 5000 },
+                "parent_depends_on_children": true
+            }}
+        })
+        .to_string();
+        assert!(matches!(
+            dispatch_with_features(TASKBOARD_ONLY, &line).await,
+            LineAction::Spawn(_)
+        ));
+
+        // Every structural error is a synchronous -32602 the LLM can fix.
+        for (args, expect) in [
+            (json!({ "subtasks": [] }), "parent_task_id"),
+            (json!({ "parent_task_id": 7 }), "subtasks"),
+            (json!({ "parent_task_id": 7, "subtasks": [] }), "subtasks"),
+            (
+                json!({ "parent_task_id": 7, "subtasks": [{ "title": "t" }] }),
+                "prompt",
+            ),
+            (
+                json!({ "parent_task_id": 7, "subtasks": [{ "prompt": "p" }] }),
+                "title",
+            ),
+            (
+                json!({ "parent_task_id": 7, "subtasks": [{ "title": "t", "prompt": "p" }],
+                        "limits": { "max_runs_per_child": 0 } }),
+                "positive",
+            ),
+        ] {
+            let line = json!({
+                "jsonrpc": "2.0", "id": 63, "method": "tools/call",
+                "params": { "name": "split_work_task", "arguments": args }
+            })
+            .to_string();
+            let resp = unwrap_respond(dispatch_with_features(TASKBOARD_ONLY, &line).await);
+            let e = resp.error.expect("bad arguments must be rejected");
+            assert_eq!(e.code, -32602);
+            assert!(e.message.contains(expect), "got: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn list_work_tasks_spec_clamps_the_wait_and_dedupes_ids() {
+        let spec = parse_list_spec(&json!({
+            "task_ids": [4, "4", 9],
+            "parent_task_id": "12",
+            "wait_ms": 900_000
+        }));
+        assert_eq!(spec.task_ids, vec![4, 9]);
+        assert_eq!(spec.parent_task_id, Some(12));
+        assert_eq!(
+            spec.wait_ms,
+            Some(crate::acp::chat_authoring::MAX_LIST_WAIT_MS),
+            "a call can never park longer than the documented cap"
+        );
+        let immediate = parse_list_spec(&json!({}));
+        assert_eq!(immediate.wait_ms, None);
+        assert!(immediate.task_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_and_cancel_require_a_non_empty_id_list() {
+        for name in ["start_work_task", "cancel_work_task"] {
+            for args in [json!({}), json!({ "task_ids": [] })] {
+                let line = json!({
+                    "jsonrpc": "2.0", "id": 64, "method": "tools/call",
+                    "params": { "name": name, "arguments": args }
+                })
+                .to_string();
+                let resp = unwrap_respond(dispatch_with_features(TASKBOARD_ONLY, &line).await);
+                let e = resp.error.expect("bad arguments must be rejected");
+                assert_eq!(e.code, -32602);
+                assert!(e.message.contains("task_ids"), "got: {}", e.message);
+            }
+            let line = json!({
+                "jsonrpc": "2.0", "id": 65, "method": "tools/call",
+                "params": { "name": name, "arguments": { "task_ids": [1, 2] } }
+            })
+            .to_string();
+            assert!(matches!(
+                dispatch_with_features(TASKBOARD_ONLY, &line).await,
+                LineAction::Spawn(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn render_work_task_tool_result_reports_tasks_results_and_notes() {
+        let outcome = json!({
+            "ok": true,
+            "tasks": [
+                { "id": 5, "title": "wire the API", "status": "todo", "run_seq": 0,
+                  "parent_id": 2,
+                  "blocked": { "reason": "dependency",
+                               "dependencies": [{ "task_id": 4, "title": "schema", "status": "failed" }] } }
+            ],
+            "results": [
+                { "task_id": 5, "outcome": "refused", "note": "it cannot start yet" }
+            ],
+            "note": "Created 1 subtask."
+        });
+        let rendered = render_work_task_tool_result(&outcome);
+        assert_eq!(rendered["isError"], false);
+        let text = rendered["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("#5 [todo] wire the API"));
+        assert!(text.contains("subtask of #2"));
+        assert!(text.contains("blocked (dependency)"));
+        assert!(text.contains("waiting for #4 (failed)"));
+        assert!(text.contains("#5: refused"));
+        assert!(text.contains("Created 1 subtask."));
+        assert_eq!(rendered["structuredContent"]["ok"], true);
+
+        // A whole-call refusal is readable text, not a tool error.
+        let refused = render_work_task_tool_result(&json!({
+            "ok": false,
+            "note": "Task #9 is not one of this conversation's tasks."
+        }));
+        assert_eq!(refused["isError"], false);
+        assert!(refused["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("not one of this conversation's tasks"));
     }
 
 }
