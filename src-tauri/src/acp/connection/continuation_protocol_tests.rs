@@ -1,8 +1,8 @@
 use super::*;
 use async_trait::async_trait;
 use sea_orm::Database;
-use serde_json::{json, Value};
-use std::{future::Future, str::FromStr, time::Duration};
+use serde_json::Value;
+use std::{future::Future, time::Duration};
 
 use crate::acp::delegation::broker::{DbDepthLookup, DelegationBroker, DelegationConfig};
 use crate::acp::delegation::spawner::{
@@ -39,14 +39,12 @@ fn run_on_large_stack<T: Send + 'static>(future: impl Future<Output = T> + Send 
 fn fixture_agent(mode: &str, log: &Path) -> AcpAgent {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/bounded_continuation_agent.py");
-    let command = json!({
-        "type": "stdio",
-        "name": "bounded-continuation",
-        "command": "python3",
-        "args": [script, mode, log],
-        "env": []
-    });
-    AcpAgent::from_str(&command.to_string()).unwrap()
+    let server = McpServerStdio::new("bounded-continuation", "python3").args(vec![
+        script.to_string_lossy().to_string(),
+        mode.to_string(),
+        log.to_string_lossy().to_string(),
+    ]);
+    AcpAgent::new(McpServer::Stdio(server))
 }
 
 async fn run_driver(
