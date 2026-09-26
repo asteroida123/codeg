@@ -66,14 +66,23 @@
 - **WorkTask ↔ Delegation Session 稳定关联**：审查和返工续接原来的子 Agent 会话（#693 的 `continue_from_task_id`），不再冷会话重派
   - 落点：work_task 执行与 delegation_task 账本之间建立外键级关联，返工轮走续作通道
 
+### 探索线（与第一/二阶段并行）：Jev 类判断模型做任务路由
+
+为「自行委托」（上游 PR #478 / #480，无 @ 自动派发子智能体）提供路由决策。不用父 LLM 烧 token 纠结选谁，也不用硬编码规则：
+
+- **机制**：TypeSafe System One 模型（Jev）的 **Choice** 原语——从第一阶段产出的能力矩阵（agent × model × mode）中选目标，返回概率分布 + 置信度；state 携带任务简述、工作目录上下文、（积累后的）历史表现数据
+- **受控性**：置信度门控——高置信自动路由，低置信回落给父智能体/用户决定（对应 #731「受控自动路由」而非「完全自动路由」，边界不变）
+- **与评测闭环复合**：#724 积累的委托结果数据作为路由 state / 复合评分特征反哺（composite scoring 模式），语义判断（Jev）+ 真实表现（数据）双通道
+- **落点**：broker/spawner 派发路径上一个可插拔的 router 模块（Rust 侧走 TypeSafe HTTP API），`delegate_to_agent` 未显式指定目标时启用
+- 先做 spike 验证路由质量（固定任务集 × 候选矩阵的 Choice 准确率），再谈默认启用
+
 ### 第三阶段：CollaborationSession 完整形态按需吸收（设计文档 D1–D10）
 
 按需拆选，不必全做：close_delegation_session（持久化关闭）、多轮状态面板 / 完整 timeline、Coordinator 统一入口（子会话弹窗与 full-tab 发送都走账本准入）。
 
-### 远期（闭环终点与最末期产品功能）
+### 远期
 
-- **推荐与受控自动路由**（#731 的终点，明确"暂不实现"，等评测数据积累后再启）
-- **编程 PK 场**（最末期；STRATEGY-MEMO：底层委托全有，只缺对比 UI，周末档位）
+- **推荐与全量自动路由**（#731 的终点：Jev 路由线 + 评测数据成熟后的演进形态）
 - 角色化 Agent 团队、v3 远程 Agent（RemoteSpawner）
 
 ## 维护规则
