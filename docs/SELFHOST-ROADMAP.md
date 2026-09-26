@@ -54,16 +54,16 @@
    - 默认 plan 模式且 connect 时 `preferredConfigValues:{mode:"build"}` 不生效（手工父会话无法直接调委托工具；委托产生的 ZCode 子级不受影响，agent_defaults 已给 build）
 3. 可选加固（codeg 侧，非 bug）：对同一 tool_call_id 的重复 pending permission 做合并/去重
 
-### 第一阶段（#731 明确的第一阶段边界：能力发现 + 显式选择 + 可靠执行 + 数据积累）
+### 第一阶段（#731 第一阶段边界）—— ✅ 全部完成（2026-09-26）
 
 1. **能力发现 + 显式选择**（#731 问题 1）—— ✅ 已落地（2026-09-26）：`get_delegation_capabilities` 工具 + `delegate_to_agent` 的 model/mode/reasoning_level 可选参数（偏好语义、三态校验、requested-vs-effective 漂移报告、选择值入账本 resume_binding）
    - 向主 Agent 暴露子 Agent 支持的 Model / Reasoning / Mode 清单（get_session_info 或新工具）
    - 委托时按 call 选 model/mode（与上游 PR #505 / #616 同向，但自用线不受上游节奏限制）
    - ZCode 注意：模型目录在 `~/.zcode/v2/config.json` provider 表，会话快照只带当前模型（协议校准结论）
-2. **审查返工入口**：@Session 找回子会话（#693 未覆盖 + 设计文档 §14.4 一等入口）
+2. **审查返工入口**：@Session 找回子会话 —— ✅ 已落地（2026-09-26）：@ 面板「子智能体会话」优先分组（四桶排序/轮次/状态/分支），后端 list_delegated_child_sessions 受控查询，全局历史默认隐藏不变
    - 父会话 @ 面板「本次对话的子智能体」分组（运行中 / 可续 / 需恢复 / 已关闭）
    - 当前搜索默认排除 delegation children，需要打开受控入口
-3. **数据积累 + 看板**（#731 问题 4 / Issue #724）
+3. **数据积累 + 看板**（#731 问题 4 / Issue #724）—— ✅ 已落地（2026-09-26）：账本 9 列指标提取（agent/error/duration/turn/token/effective model·mode·reasoning，freeze 同事务提取），performance_report 聚合（成功率/时长/token/返工率，按 agent 与 model 维度），设置页 Performance 标签页。遗留：生产 token/turn 数据源未接（管线已通）、verdict 接受标记（扩展点已留）、时间窗过滤
    - 每次 delegation 落库：agent、model、reasoning、token、耗时、验证结果、返工轮数、最终接受与否
    - delegation_task 账本已有骨架，缺 per-turn 指标列与聚合视图
    - 这是评测闭环的数据地基；有了它，后续推荐/路由才有依据
