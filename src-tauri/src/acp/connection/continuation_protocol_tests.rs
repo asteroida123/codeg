@@ -234,6 +234,7 @@ impl ConnectionSpawner for FixtureContinuationSpawner {
                 task: admission.task,
                 requested_working_dir: admission.requested_working_dir,
                 resume_binding,
+                work_task_id: None,
             },
         )
         .await
@@ -523,6 +524,7 @@ fn durable_continuation_reopens_the_source_session_and_admits_one_successor() {
                 task: "first round".into(),
                 requested_working_dir: Some(working_dir.clone()),
                 resume_binding: source_binding,
+                work_task_id: None,
             },
         )
         .await

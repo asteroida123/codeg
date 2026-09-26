@@ -3524,6 +3524,7 @@ mod tests {
             },
             created_at: now,
             updated_at: now,
+            work_task_id: None,
         };
 
         inject_delegation_meta(&mut turns, &[child], &[ledger]);
@@ -3593,6 +3594,7 @@ mod tests {
             },
             created_at: now,
             updated_at: now,
+            work_task_id: None,
         };
 
         inject_delegation_meta(&mut turns, &[], std::slice::from_ref(&ledger));

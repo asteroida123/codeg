@@ -5995,6 +5995,7 @@ mod tests {
                 task: "work".into(),
                 requested_working_dir: None,
                 resume_binding: binding.clone(),
+                work_task_id: None,
             },
         )
         .await
@@ -6131,6 +6132,7 @@ mod tests {
                     preferred_config_values: BTreeMap::new(),
                     config_fingerprint: "cfg".into(),
                 },
+                work_task_id: None,
             },
         )
         .await
@@ -6828,6 +6830,7 @@ mod tests {
                 task: "first round".into(),
                 requested_working_dir: None,
                 resume_binding: binding,
+                work_task_id: None,
             },
         )
         .await

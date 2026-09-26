@@ -296,6 +296,25 @@ pub async fn get_model(conn: &DatabaseConnection, id: i32) -> Result<work_task::
     Ok(row)
 }
 
+/// The live work task whose CURRENT conversation is `conversation_id`, if any.
+///
+/// This is how a delegation admitted while a task was executing is attributed
+/// to that task: the parent conversation of the delegation belongs to exactly
+/// one live task at a time. Soft-deleted tasks are invisible. `None` is the
+/// ordinary case — a plain chat delegation, or a conversation no task owns.
+pub async fn find_live_by_conversation(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<Option<i32>, DbError> {
+    Ok(work_task::Entity::find()
+        .filter(work_task::Column::ConversationId.eq(conversation_id))
+        .filter(work_task::Column::DeletedAt.is_null())
+        .order_by_desc(work_task::Column::Id)
+        .one(conn)
+        .await?
+        .map(|row| row.id))
+}
+
 pub async fn list_events(
     conn: &DatabaseConnection,
     task_id: i32,

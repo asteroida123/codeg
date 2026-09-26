@@ -55,6 +55,12 @@ pub struct AdmissionInput {
     pub task: String,
     pub requested_working_dir: Option<String>,
     pub resume_binding: ResumeBinding,
+    /// The work task whose execution produced this delegation, resolved by the
+    /// runtime from the delegating parent conversation. Stored (not derived at
+    /// read time): a later fresh-session rework repoints
+    /// `work_task.conversation_id`, and this row must keep the task it
+    /// actually ran for.
+    pub work_task_id: Option<i32>,
 }
 
 /// Metadata plus the report visible to the broker. A terminal report is read
@@ -75,6 +81,9 @@ pub struct TaskLedgerEntry {
     pub report: DelegationTaskReport,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Attribution to the executing work task (see
+    /// [`AdmissionInput::work_task_id`]).
+    pub work_task_id: Option<i32>,
 }
 
 /// Result of the atomic source-slot admission.
@@ -243,7 +252,7 @@ async fn admit_on<C: ConnectionTrait>(
         released: Set(false),
         // Resolved by the runtime from the delegating parent conversation
         // (a work task's current conversation) and stored for stability.
-        work_task_id: Set(None),
+        work_task_id: Set(input.work_task_id),
         created_at: Set(now),
         updated_at: Set(now),
         // Known at admission (from the binding), so still-running rows already
@@ -314,6 +323,51 @@ pub async fn list_for_parent(
         }
     }
     Ok(entries)
+}
+
+/// Every delegation admitted while a work task executed, oldest first — the
+/// task detail's "sub-agent runs" ledger.
+///
+/// Read straight from the storing columns rather than through
+/// [`entry_from_model`]: this is a display projection, and one row with an
+/// unreadable `resume_binding`/`terminal_report` (hand-edited DB, a future
+/// schema the reader predates) must not blank the whole list.
+pub async fn list_for_task(
+    conn: &DatabaseConnection,
+    work_task_id: i32,
+) -> Result<Vec<crate::models::WorkTaskDelegationInfo>, DbError> {
+    let rows = delegation_task::Entity::find()
+        .filter(delegation_task::Column::WorkTaskId.eq(work_task_id))
+        .order_by_asc(delegation_task::Column::CreatedAt)
+        .order_by_asc(delegation_task::Column::Id)
+        .all(conn)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| crate::models::WorkTaskDelegationInfo {
+            task_id: row.task_id,
+            source_task_id: row.source_task_id,
+            agent_type: row.agent_type,
+            // Wire-stable projection of the ledger status: `unknown` (frozen
+            // by the boot sweep for a run the process abandoned) reads as
+            // `interrupted` to the UI.
+            status: parse_status(&row.status)
+                .map(project_child_status)
+                .map(str::to_owned)
+                .unwrap_or(row.status),
+            task: row.task,
+            child_conversation_id: row.child_conversation_id,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            duration_ms: row.duration_ms,
+            effective_model: row.effective_model,
+            effective_mode: row.effective_mode,
+            effective_reasoning_level: row.effective_reasoning_level,
+            input_tokens: row.input_tokens,
+            output_tokens: row.output_tokens,
+            error_code: row.error_code,
+        })
+        .collect())
 }
 
 /// One `@Session`-recall row: a delegated child session of a parent
@@ -1067,6 +1121,7 @@ fn entry_from_model(model: delegation_task::Model) -> Result<TaskLedgerEntry, Db
         report,
         created_at: model.created_at,
         updated_at: model.updated_at,
+        work_task_id: model.work_task_id,
     })
 }
 
@@ -1209,6 +1264,7 @@ mod tests {
             task: task.into(),
             requested_working_dir: Some("/workspace/project".into()),
             resume_binding: binding(child),
+            work_task_id: None,
         }
     }
 
@@ -2235,6 +2291,7 @@ mod tests {
                     preferred_config_values: BTreeMap::new(),
                     config_fingerprint: "fingerprint-d".into(),
                 },
+                work_task_id: None,
             },
         )
         .await
@@ -2308,5 +2365,169 @@ mod tests {
         let report = performance_report(&db.conn).await.expect("aggregate");
         assert_eq!(report.totals.task_count, 0);
         assert!(report.by_agent.is_empty());
+    }
+
+    /// Attribution is STORED at admission and read back per task, ordered by
+    /// admission: the task detail's "sub-agent runs" ledger.
+    #[tokio::test]
+    async fn a_work_task_attribution_is_stored_and_listed_for_that_task() {
+        let db = fresh_in_memory_db().await;
+        let (parent, child) = conversations(&db).await;
+
+        let mut first = input("attributed-1", parent, child, None, "first round");
+        first.work_task_id = Some(42);
+        assert!(matches!(
+            admit(&db.conn, first).await.expect("admit 1"),
+            AdmissionResult::New { .. }
+        ));
+
+        let mut second = input("attributed-2", parent, child, None, "second round");
+        second.work_task_id = Some(42);
+        assert!(matches!(
+            admit(&db.conn, second).await.expect("admit 2"),
+            AdmissionResult::New { .. }
+        ));
+
+        // A plain chat delegation stays unattributed.
+        assert!(matches!(
+            admit(
+                &db.conn,
+                input("unattributed", parent, child, None, "chat")
+            )
+            .await
+            .expect("admit 3"),
+            AdmissionResult::New { .. }
+        ));
+
+        let rows = list_for_task(&db.conn, 42).await.expect("list");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].task_id, "attributed-1");
+        assert_eq!(rows[1].task_id, "attributed-2");
+        assert_eq!(rows[0].status, "running");
+        assert_eq!(rows[0].agent_type.as_deref(), Some("codex"));
+        assert_eq!(rows[0].child_conversation_id, child);
+        assert!(list_for_task(&db.conn, 7).await.expect("other").is_empty());
+
+        // The stored link survives the task's own history: a row keeps its
+        // attribution even after a later admission for another task.
+        let mut other = input("attributed-3", parent, child, None, "elsewhere");
+        other.work_task_id = Some(7);
+        admit(&db.conn, other).await.expect("admit 4");
+        let rows = list_for_task(&db.conn, 42).await.expect("list");
+        assert_eq!(rows.len(), 2, "only the 42 rows belong to task 42");
+    }
+
+    /// The wire projection turns the boot sweep's `unknown` into
+    /// `interrupted`, and carries the terminal metrics through.
+    #[tokio::test]
+    async fn list_for_task_projects_interrupted_and_terminal_metrics() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = fresh_disk_db(dir.path()).await;
+        let (parent, child) = conversations(&db).await;
+        let mut input = input("interrupted-run", parent, child, None, "work");
+        input.work_task_id = Some(9);
+        admit(&db.conn, input).await.expect("admit");
+        boot_reconcile_interrupted(&db.conn)
+            .await
+            .expect("boot sweep");
+
+        let rows = list_for_task(&db.conn, 9).await.expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "interrupted");
+        assert_eq!(rows[0].error_code.as_deref(), Some("interrupted"));
+    }
+
+    /// `find_live_by_conversation` is the admission-time resolver: it returns
+    /// only the live task that currently owns the delegating conversation.
+    #[tokio::test]
+    async fn only_the_live_owner_of_a_conversation_is_attributed() {
+        use sea_orm::ActiveModelTrait;
+        use sea_orm::ActiveValue::{NotSet, Set};
+
+        let db = fresh_in_memory_db().await;
+        let (parent, _child) = conversations(&db).await;
+
+        let now = chrono::Utc::now();
+        let insert = |title: &str, conversation_id: Option<i32>, deleted: bool| {
+            crate::db::entities::work_task::ActiveModel {
+                id: NotSet,
+                folder_id: Set(1),
+                title: Set(title.to_string()),
+                config: Set("{}".to_string()),
+                status: Set(crate::db::entities::work_task::WorkTaskStatus::Running),
+                failure_reason: Set(None),
+                last_error: Set(None),
+                run_seq: Set(1),
+                sort_order: Set(0),
+                worktree_folder_id: Set(None),
+                conversation_id: Set(conversation_id),
+                connection_id: Set(None),
+                base_branch: Set(None),
+                base_sha: Set(None),
+                work_branch: Set(None),
+                merge_state: Set(None),
+                pending_merge: Set(None),
+                cleanup_state: Set(None),
+                verdict: Set(None),
+                result_summary: Set(None),
+                files_changed: Set(None),
+                additions: Set(None),
+                deletions: Set(None),
+                merge_commit: Set(None),
+                completion_kind: Set(None),
+                preflight: Set(None),
+                archived_at: Set(None),
+                scheduled_at: Set(None),
+                source_kind: Set(None),
+                source_key: Set(None),
+                source_meta: Set(None),
+                parent_id: Set(None),
+                created_by_conversation_id: Set(None),
+                max_concurrent_children: Set(None),
+                max_runs_per_child: Set(None),
+                token_budget: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                started_at: Set(None),
+                settled_at: Set(None),
+                finished_at: Set(None),
+                deleted_at: Set(deleted.then_some(now)),
+            }
+        };
+
+        let live = insert("owner", Some(parent), false)
+            .insert(&db.conn)
+            .await
+            .expect("live task")
+            .id;
+        assert_eq!(
+            crate::db::service::work_task_service::find_live_by_conversation(&db.conn, parent)
+                .await
+                .expect("resolve"),
+            Some(live)
+        );
+        assert_eq!(
+            crate::db::service::work_task_service::find_live_by_conversation(&db.conn, 999)
+                .await
+                .expect("resolve"),
+            None
+        );
+
+        // A soft-deleted task is invisible; the newest live one wins.
+        insert("gone", Some(parent), true)
+            .insert(&db.conn)
+            .await
+            .expect("deleted task");
+        let newest = insert("newest", Some(parent), false)
+            .insert(&db.conn)
+            .await
+            .expect("newest task")
+            .id;
+        assert_eq!(
+            crate::db::service::work_task_service::find_live_by_conversation(&db.conn, parent)
+                .await
+                .expect("resolve"),
+            Some(newest)
+        );
     }
 }
