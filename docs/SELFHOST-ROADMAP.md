@@ -1,20 +1,35 @@
 # 自用集成线路线图（selfhost/main）
 
-> 状态：Active（2026-09-26 建立）
+> 状态：Active（2026-09-26 建立，同日按 Discussion #731 修订）
 > 性质：个人自用集成分支，先完整验证再拆小 PR 回上游（与 Discussion #731 的边界一致）
 > 基座：`codex/delegation-continuation-local`（PR #693 同会话续作）+ ZCode 内置（PR #768）+ upstream main 0.32.2
 >
-> 规划来源：
-> - `docs/codeg-continuable-delegation-session-design.md` — CollaborationSession 完整设计（终极形态）
-> - `docs/STRATEGY-MEMO.md` — v1→v2→v3 演进与产品功能（PK / 角色团队）
-> - [Discussion #731](https://github.com/xintaofei/codeg/discussions/731) — 委托编排、配置选择与评测闭环提案
+> 规划来源（以 Discussion #731 为主线，其余为支撑）：
+> - [Discussion #731](https://github.com/xintaofei/codeg/discussions/731) — **主线路**：委托编排、配置选择与评测闭环
+> - `docs/codeg-continuable-delegation-session-design.md` — CollaborationSession 完整设计（形态参考）
+> - `docs/STRATEGY-MEMO.md` — 战略备忘（PK/角色团队为最末期产品功能）
 > - Issue #603（续作跟踪）、Issue #724（委托结果持久化 + 子 Agent 看板）、PR #693 范围映射
+
+## 主线（Discussion #731 的闭环）
+
+```text
+发现 Agent 能力
+→ 选择 Agent、Model 和 Reasoning / Mode
+→ 执行 delegation 或 WorkTask
+→ 审查、继续和返工
+→ 记录真实运行结果和验证结果
+→ 形成评测数据
+→ （远期）为 Agent / Model / Reasoning 推荐和受控自动路由提供依据
+```
+
+边界：复用现有 WorkTask Engine、Delegation Broker、ACP 和 Conversation，不新建独立 Runtime；暂不实现完全自动的 Agent/Model 路由。
 
 ## 已就位
 
 - delegation_task 账本：准入、ResumeBinding、冻结终态、每源单后继、同请求幂等
 - 严格恢复：live reuse → resume → load → 明确失败，不静默冷启动；agent/session/cwd 身份硬约束
 - 启动对账：中断任务投影为 unknown/interrupted，不盲发
+- WorkTask 引擎：CAS 状态机、事件流、模板、scheduled_at、worktree/merge 集成；Agent 侧现有 `task_progress` / `task_complete` 上报工具
 - ZCode 内置 agent（adapter 0.1.4，协议已对 zai-org/zcode 校准）
 - upstream 0.32.2：agent-client-protocol 2.2 迁移、ACP Session Notices/Compaction
 
@@ -30,37 +45,36 @@
 | ZCode 子会话续作 | `continue_from_task_id` → 严格 resume 原 session | 中：adapter 的 session/resume 必须满足身份硬约束 |
 | ZCode 作为父 agent 委托他人 | 父会话挂 codeg-mcp → delegate_to_agent | **已知边界**：ZCode 0.16.5 后端 create 不 wire mcpServers（adapter 已前向兼容，等 ZCode 后端修复） |
 
-### 第 1 步：能力发现 + 显式选择（Discussion #731 第一阶段）
+### 第一阶段（#731 明确的第一阶段边界：能力发现 + 显式选择 + 可靠执行 + 数据积累）
 
-- 向主 Agent 暴露子 Agent 支持的 Model / Reasoning / Mode 清单（get_session_info 或新工具）
-- 委托时按 call 选 model/mode（与上游 PR #505 / #616 同向，但自用线不受上游节奏限制）
-- 注意 ZCode：模型目录在 `~/.zcode/v2/config.json` provider 表，会话快照只带当前模型（协议校准结论）
+1. **能力发现 + 显式选择**（#731 问题 1）
+   - 向主 Agent 暴露子 Agent 支持的 Model / Reasoning / Mode 清单（get_session_info 或新工具）
+   - 委托时按 call 选 model/mode（与上游 PR #505 / #616 同向，但自用线不受上游节奏限制）
+   - ZCode 注意：模型目录在 `~/.zcode/v2/config.json` provider 表，会话快照只带当前模型（协议校准结论）
+2. **审查返工入口**：@Session 找回子会话（#693 未覆盖 + 设计文档 §14.4 一等入口）
+   - 父会话 @ 面板「本次对话的子智能体」分组（运行中 / 可续 / 需恢复 / 已关闭）
+   - 当前搜索默认排除 delegation children，需要打开受控入口
+3. **数据积累 + 看板**（#731 问题 4 / Issue #724）
+   - 每次 delegation 落库：agent、model、reasoning、token、耗时、验证结果、返工轮数、最终接受与否
+   - delegation_task 账本已有骨架，缺 per-turn 指标列与聚合视图
+   - 这是评测闭环的数据地基；有了它，后续推荐/路由才有依据
 
-### 第 2 步：@Session 找回子会话（PR #693 未覆盖 + 设计文档一等入口）
+### 第二阶段：WorkTask × Delegation 协同（#731 问题 2 + 3）
 
-- 父会话 @ 面板增加「本次对话的子智能体」分组（运行中 / 可续 / 需恢复 / 已关闭）
-- 当前搜索默认排除 delegation children，需要打开受控入口
-- 设计文档 §14.4 的排序与条目形态直接可用
+- **Agent 创建与拆分 WorkTask**：主 Agent 把大任务拆成多个持久化子任务，用依赖、并发和预算限制编排
+  - 现状缺口：Agent 侧只有 `task_progress` / `task_complete` 上报，没有创建/拆分/编排工具；引擎本身（状态机/事件/模板）已具备
+- **WorkTask ↔ Delegation Session 稳定关联**：审查和返工续接原来的子 Agent 会话（#693 的 `continue_from_task_id`），不再冷会话重派
+  - 落点：work_task 执行与 delegation_task 账本之间建立外键级关联，返工轮走续作通道
 
-### 第 3 步：数据积累 + 看板（Issue #724）
+### 第三阶段：CollaborationSession 完整形态按需吸收（设计文档 D1–D10）
 
-- 每次 delegation 落库：agent、model、reasoning、token、耗时、验证结果、返工轮数、最终接受与否
-- delegation_task 账本已有骨架，缺的是 per-turn 指标列与聚合视图
-- 这是 Discussion #731「评测闭环」的数据地基；后续才谈推荐与受控路由
+按需拆选，不必全做：close_delegation_session（持久化关闭）、多轮状态面板 / 完整 timeline、Coordinator 统一入口（子会话弹窗与 full-tab 发送都走账本准入）。
 
-### 第 4 步：向 CollaborationSession 完整形态靠拢（设计文档 D1-D10）
+### 远期（闭环终点与最末期产品功能）
 
-按需拆选，不必全做：
-
-- close_delegation_session（持久化关闭，现在只有释放确认）
-- 多轮状态面板 / 完整 timeline（子会话弹窗增强）
-- Coordinator 统一入口（子会话弹窗与 full-tab 发送都走账本准入，父智能体可见）
-
-### 远期（STRATEGY-MEMO，未排期）
-
-- 编程 PK 场（周末档位：触发器 + 分屏对比 + 计分板；底层委托全有，只缺 UI）
-- 角色化 Agent 团队（leader/build/review）
-- v3 远程 Agent（RemoteSpawner）
+- **推荐与受控自动路由**（#731 的终点，明确"暂不实现"，等评测数据积累后再启）
+- **编程 PK 场**（最末期；STRATEGY-MEMO：底层委托全有，只缺对比 UI，周末档位）
+- 角色化 Agent 团队、v3 远程 Agent（RemoteSpawner）
 
 ## 维护规则
 
