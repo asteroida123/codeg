@@ -5643,7 +5643,12 @@
     "deliverPrBackDeleteWorktree": "推回後刪除 worktree",
     "deliverPrBackSubmit": "推送",
     "deliverPrBackDone": "已推回 PR",
-    "deliverPrBackDoneMr": "已推回合併請求"
+    "deliverPrBackDoneMr": "已推回合併請求",
+    "blockedTitle": "等待開始",
+    "blockedReasonDependency": "需要先完成 {count} 個前置任務。",
+    "blockedReasonRuns": "此子任務已達到父任務的執行次數上限。",
+    "blockedReasonBudget": "父任務的 token 預算已用完。",
+    "blockedRemoveDependency": "移除此依賴"
   },
   "CustomSkillsSettings": {
     "loading": "正在載入自訂技能…",

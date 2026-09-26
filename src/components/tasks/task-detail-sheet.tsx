@@ -37,6 +37,7 @@ import {
   ListTodo,
   Trash2,
   Undo2,
+  X,
 } from "lucide-react"
 import {
   workTaskArchive,
@@ -44,6 +45,7 @@ import {
   workTaskChangedFiles,
   workTaskCleanup,
   workTaskDelete,
+  workTaskDependencyRemove,
   workTaskDiff,
   workTaskEvents,
   workTaskMergeUnqueue,
@@ -366,6 +368,22 @@ export function TaskDetailSheet({
       setBusy(false)
     }
   }, [])
+
+  /**
+   * Drop one dependency edge. Dependencies are never removed on their own — a
+   * failed or deleted upstream leaves this card blocked until the user decides
+   * — so this ✕ is the escape hatch, and the reload is what makes the card's
+   * derived `blocked` state (and the Start button) react at once.
+   */
+  const removeDependency = useCallback(
+    (dependsOnTaskId: number) =>
+      run(async () => {
+        if (taskId == null) return
+        await workTaskDependencyRemove(taskId, dependsOnTaskId)
+        await reload()
+      }),
+    [run, reload, taskId]
+  )
 
   // The guard's refusal belongs to the box it was raised in, and to the status
   // it was raised for. Closing the box or the task leaving `failed`/`canceled`
@@ -781,6 +799,71 @@ export function TaskDetailSheet({
                     </span>
                   </div>
                 </CollapsibleBlock>
+              ) : null}
+
+              {/* Why this task cannot start yet — derived by the backend, never
+                  stored: an unmet dependency (each with its own ✕, the only way
+                  an edge is ever removed), or the parent's run / budget limit.
+                  Rendered above the brief because it is the answer to "why is
+                  this card not moving?". */}
+              {task.blocked ? (
+                <section className="flex flex-col gap-1.5">
+                  <h3 className="text-[0.6875rem] font-medium uppercase tracking-wide text-muted-foreground">
+                    {t("blockedTitle")}
+                  </h3>
+                  <div className="flex flex-col gap-2 rounded-xl border border-amber-500/30 bg-amber-500/5 p-3 text-xs dark:border-amber-400/25">
+                    <p className="flex items-start gap-1.5 text-amber-700 dark:text-amber-400">
+                      <Clock
+                        className="mt-0.5 size-3.5 shrink-0"
+                        aria-hidden="true"
+                      />
+                      <span className="min-w-0 break-words">
+                        {task.blocked.reason === "dependency"
+                          ? t("blockedReasonDependency", {
+                              count: task.blocked.dependencies?.length ?? 0,
+                            })
+                          : task.blocked.reason === "budget"
+                            ? t("blockedReasonBudget")
+                            : t("blockedReasonRuns")}
+                      </span>
+                    </p>
+                    {task.blocked.dependencies?.length ? (
+                      <ul className="flex flex-col gap-1">
+                        {task.blocked.dependencies.map((dep) => (
+                          <li
+                            key={dep.task_id}
+                            className="flex items-center gap-2 rounded-lg bg-background/60 px-2 py-1"
+                          >
+                            <span className="shrink-0 text-muted-foreground">
+                              #{dep.task_id}
+                            </span>
+                            <span className="min-w-0 flex-1 truncate">
+                              {dep.title}
+                            </span>
+                            <span className="shrink-0 text-[0.6875rem] text-muted-foreground">
+                              {t(statusLabelKey(dep.status))}
+                            </span>
+                            <Button
+                              variant="ghost"
+                              size="icon-xs"
+                              disabled={busy}
+                              aria-label={t("blockedRemoveDependency")}
+                              title={t("blockedRemoveDependency")}
+                              onClick={() => removeDependency(dep.task_id)}
+                            >
+                              <X className="size-3" aria-hidden="true" />
+                            </Button>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                    {task.blocked.detail ? (
+                      <p className="text-muted-foreground">
+                        {task.blocked.detail}
+                      </p>
+                    ) : null}
+                  </div>
+                </section>
               ) : null}
 
               {/* The original task brief — always above the agent's result. */}

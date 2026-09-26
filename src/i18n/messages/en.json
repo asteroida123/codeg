@@ -5643,7 +5643,12 @@
     "deliverPrBackDeleteWorktree": "Delete the worktree after pushing",
     "deliverPrBackSubmit": "Push",
     "deliverPrBackDone": "Pushed to the pull request",
-    "deliverPrBackDoneMr": "Pushed to the merge request"
+    "deliverPrBackDoneMr": "Pushed to the merge request",
+    "blockedTitle": "Waiting to start",
+    "blockedReasonDependency": "Waiting for {count} earlier task(s) to finish first.",
+    "blockedReasonRuns": "This subtask has reached the parent task's run limit.",
+    "blockedReasonBudget": "The parent task's token budget is used up.",
+    "blockedRemoveDependency": "Remove this dependency"
   },
   "CustomSkillsSettings": {
     "loading": "Loading custom skills…",

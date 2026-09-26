@@ -5643,7 +5643,12 @@
     "deliverPrBackDeleteWorktree": "حذف worktree بعد الدفع",
     "deliverPrBackSubmit": "ادفع",
     "deliverPrBackDone": "تم الدفع إلى طلب السحب",
-    "deliverPrBackDoneMr": "تم الدفع إلى طلب الدمج"
+    "deliverPrBackDoneMr": "تم الدفع إلى طلب الدمج",
+    "blockedTitle": "في انتظار البدء",
+    "blockedReasonDependency": "يجب إنهاء {count} مهمة سابقة أولاً.",
+    "blockedReasonRuns": "وصلت هذه المهمة الفرعية إلى حد مرات التشغيل للمهمة الأصلية.",
+    "blockedReasonBudget": "تم استهلاك ميزانية الرموز للمهمة الأصلية.",
+    "blockedRemoveDependency": "إزالة هذا الاعتماد"
   },
   "CustomSkillsSettings": {
     "loading": "جارٍ تحميل المهارات المخصّصة…",

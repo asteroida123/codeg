@@ -5643,7 +5643,12 @@
     "deliverPrBackDeleteWorktree": "Supprimer le worktree après le push",
     "deliverPrBackSubmit": "Pousser",
     "deliverPrBackDone": "Poussé vers la pull request",
-    "deliverPrBackDoneMr": "Poussé vers la merge request"
+    "deliverPrBackDoneMr": "Poussé vers la merge request",
+    "blockedTitle": "En attente de démarrage",
+    "blockedReasonDependency": "{count} tâche(s) précédente(s) doivent d'abord se terminer.",
+    "blockedReasonRuns": "Cette sous-tâche a atteint la limite d'exécutions de la tâche parente.",
+    "blockedReasonBudget": "Le budget de jetons de la tâche parente est épuisé.",
+    "blockedRemoveDependency": "Supprimer cette dépendance"
   },
   "CustomSkillsSettings": {
     "loading": "Chargement des compétences personnalisées…",

@@ -5643,7 +5643,12 @@
     "deliverPrBackDeleteWorktree": "Worktree nach dem Push löschen",
     "deliverPrBackSubmit": "Pushen",
     "deliverPrBackDone": "In den Pull Request gepusht",
-    "deliverPrBackDoneMr": "In den Merge Request gepusht"
+    "deliverPrBackDoneMr": "In den Merge Request gepusht",
+    "blockedTitle": "Wartet auf den Start",
+    "blockedReasonDependency": "Zuerst müssen {count} vorherige Aufgabe(n) fertig werden.",
+    "blockedReasonRuns": "Diese Unteraufgabe hat das Ausführungslimit der Hauptaufgabe erreicht.",
+    "blockedReasonBudget": "Das Token-Budget der Hauptaufgabe ist aufgebraucht.",
+    "blockedRemoveDependency": "Diese Abhängigkeit entfernen"
   },
   "CustomSkillsSettings": {
     "loading": "Benutzerdefinierte Skills werden geladen…",

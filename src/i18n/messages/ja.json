@@ -5643,7 +5643,12 @@
     "deliverPrBackDeleteWorktree": "プッシュ後に worktree を削除",
     "deliverPrBackSubmit": "push",
     "deliverPrBackDone": "プルリクエストに push しました",
-    "deliverPrBackDoneMr": "マージリクエストに push しました"
+    "deliverPrBackDoneMr": "マージリクエストに push しました",
+    "blockedTitle": "開始待ち",
+    "blockedReasonDependency": "先に {count} 件の前提タスクの完了が必要です。",
+    "blockedReasonRuns": "このサブタスクは親タスクの実行回数上限に達しています。",
+    "blockedReasonBudget": "親タスクのトークン予算を使い切りました。",
+    "blockedRemoveDependency": "この依存関係を削除"
   },
   "CustomSkillsSettings": {
     "loading": "カスタムスキルを読み込み中…",

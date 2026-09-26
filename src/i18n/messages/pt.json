@@ -5643,7 +5643,12 @@
     "deliverPrBackDeleteWorktree": "Excluir o worktree após enviar",
     "deliverPrBackSubmit": "Enviar",
     "deliverPrBackDone": "Enviado ao pull request",
-    "deliverPrBackDoneMr": "Enviado ao merge request"
+    "deliverPrBackDoneMr": "Enviado ao merge request",
+    "blockedTitle": "Aguardando início",
+    "blockedReasonDependency": "{count} tarefa(s) anterior(es) precisam terminar primeiro.",
+    "blockedReasonRuns": "Esta subtarefa atingiu o limite de execuções da tarefa pai.",
+    "blockedReasonBudget": "O orçamento de tokens da tarefa pai acabou.",
+    "blockedRemoveDependency": "Remover esta dependência"
   },
   "CustomSkillsSettings": {
     "loading": "Carregando habilidades personalizadas…",

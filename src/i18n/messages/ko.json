@@ -5643,7 +5643,12 @@
     "deliverPrBackDeleteWorktree": "푸시 후 worktree 삭제",
     "deliverPrBackSubmit": "푸시",
     "deliverPrBackDone": "풀 리퀘스트에 푸시했습니다",
-    "deliverPrBackDoneMr": "병합 요청에 푸시했습니다"
+    "deliverPrBackDoneMr": "병합 요청에 푸시했습니다",
+    "blockedTitle": "시작 대기 중",
+    "blockedReasonDependency": "먼저 {count}개의 선행 작업이 완료되어야 합니다.",
+    "blockedReasonRuns": "이 하위 작업은 상위 작업의 실행 횟수 한도에 도달했습니다.",
+    "blockedReasonBudget": "상위 작업의 토큰 예산이 모두 사용되었습니다.",
+    "blockedRemoveDependency": "이 의존성 제거"
   },
   "CustomSkillsSettings": {
     "loading": "사용자 지정 스킬 불러오는 중…",
