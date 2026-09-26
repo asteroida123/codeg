@@ -56,7 +56,7 @@
 
 ### 第一阶段（#731 明确的第一阶段边界：能力发现 + 显式选择 + 可靠执行 + 数据积累）
 
-1. **能力发现 + 显式选择**（#731 问题 1）
+1. **能力发现 + 显式选择**（#731 问题 1）—— ✅ 已落地（2026-09-26）：`get_delegation_capabilities` 工具 + `delegate_to_agent` 的 model/mode/reasoning_level 可选参数（偏好语义、三态校验、requested-vs-effective 漂移报告、选择值入账本 resume_binding）
    - 向主 Agent 暴露子 Agent 支持的 Model / Reasoning / Mode 清单（get_session_info 或新工具）
    - 委托时按 call 选 model/mode（与上游 PR #505 / #616 同向，但自用线不受上游节奏限制）
    - ZCode 注意：模型目录在 `~/.zcode/v2/config.json` provider 表，会话快照只带当前模型（协议校准结论）
