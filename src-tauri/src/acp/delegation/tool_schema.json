@@ -305,6 +305,157 @@
     }
   },
   {
+    "name": "split_work_task",
+    "description": "Split a task you queued in this conversation into independent subtasks on codeg's to-dos, usually because the user asked for it ('split this into…', 'do the API first, then the UI', 'make these separate tasks'). Each subtask becomes its own to-do card with its own branch/worktree and its own agent run, so every prompt must be self-contained. The parent stays a normal task and can still be started on its own; pass parent_depends_on_children to make it wait for all the pieces, so starting it means 'integrate the pieces'. Subtasks are created as to-dos — nothing starts by itself. The tool returns the created ids and titles.",
+    "inputSchema": {
+      "type": "object",
+      "required": [
+        "parent_task_id",
+        "subtasks"
+      ],
+      "properties": {
+        "parent_task_id": {
+          "type": "integer",
+          "description": "Id of the TOP-LEVEL task to split. It must be one this conversation created (create_work_task / split_work_task), or a task whose parent this conversation created."
+        },
+        "subtasks": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "description": "The pieces, in the order they should appear on the board.",
+          "items": {
+            "type": "object",
+            "required": [
+              "title",
+              "prompt"
+            ],
+            "properties": {
+              "title": {
+                "type": "string",
+                "description": "Short card title for this piece."
+              },
+              "prompt": {
+                "type": "string",
+                "description": "The self-contained instruction this piece's agent receives: goal, files/paths, constraints, and what done looks like."
+              },
+              "agent_type": {
+                "type": "string",
+                "description": "Which agent runs this piece (e.g. 'claude_code', 'codex'). Omit to inherit the board's configured default."
+              },
+              "depends_on_index": {
+                "type": "array",
+                "items": {
+                  "type": "integer"
+                },
+                "description": "0-based positions in THIS subtasks array that must finish before this piece can start. Use it to chain pieces the user wants done in order; leave it out for pieces that can run in parallel."
+              }
+            }
+          }
+        },
+        "depends_on_task_ids": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          },
+          "description": "Existing tasks in the SAME project that EVERY new subtask waits for. Use it when the whole split depends on work already on the board."
+        },
+        "limits": {
+          "type": "object",
+          "description": "Optional caps the whole split must live within. Omit a field for no limit; a limit that is reached leaves the waiting subtask in To do with the reason visible on its card (nothing fails by itself).",
+          "properties": {
+            "max_concurrent_children": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "How many of these subtasks may be running at the same time."
+            },
+            "max_runs_per_child": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "How many runs one subtask may have before it needs the user again."
+            },
+            "token_budget": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Token ceiling across the parent's own session plus all of its subtasks' sessions."
+            }
+          }
+        },
+        "parent_depends_on_children": {
+          "type": "boolean",
+          "description": "Makes the parent wait until every subtask is done, so starting the parent means 'integrate the pieces'. Default false — the parent stays startable at any time."
+        }
+      }
+    }
+  },
+  {
+    "name": "list_work_tasks",
+    "description": "Read the board tasks this conversation created (plus the children of one task when parent_task_id is given). Reports status, run number, the agent's latest progress milestone, verdict, failure reason, diff stats, and for a to-do that cannot start yet, WHY it is blocked (an unmet dependency, the parent's run/concurrency limit, or the token budget). Changes nothing. wait_ms optionally parks the call until any listed task's status changes, which is cheaper than polling in a loop when you are waiting for subtasks.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "task_ids": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          },
+          "description": "List exactly these tasks. Omit to list everything this conversation created."
+        },
+        "parent_task_id": {
+          "type": "integer",
+          "description": "Also list this task's subtasks (and the task itself)."
+        },
+        "wait_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60000,
+          "description": "Optional long-poll in milliseconds (max 60000): returns as soon as any listed task's status changes, or when the wait runs out. Omit for an immediate snapshot."
+        }
+      }
+    }
+  },
+  {
+    "name": "start_work_task",
+    "description": "Start to-do tasks this conversation created — exactly what the board's Start button does (the to-do moves to the queue; the project's concurrency limit still decides when it actually runs). Use it when the user asks you to get pieces running. A task whose dependency has not finished, or whose parent's limits are reached, is refused with the reason instead of being forced through. Returns one outcome per id.",
+    "inputSchema": {
+      "type": "object",
+      "required": [
+        "task_ids"
+      ],
+      "properties": {
+        "task_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 50,
+          "items": {
+            "type": "integer"
+          },
+          "description": "Ids of the to-do tasks to start."
+        }
+      }
+    }
+  },
+  {
+    "name": "cancel_work_task",
+    "description": "Stop tasks this conversation created. Any task that is not already finished can be stopped, except one whose merge is in flight — a terminal task (done / failed / canceled) and a merging task come back as refusals with the reason, never as tool errors. A canceled task can be requeued later by the user. Returns one outcome per id.",
+    "inputSchema": {
+      "type": "object",
+      "required": [
+        "task_ids"
+      ],
+      "properties": {
+        "task_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 50,
+          "items": {
+            "type": "integer"
+          },
+          "description": "Ids of the tasks to stop."
+        }
+      }
+    }
+  },
+  {
     "name": "task_progress",
     "description": "Report a short progress milestone for the work task you are executing. It shows up on the task's board card and timeline in real time, so the user can follow along without opening the session. Call it at meaningful checkpoints — finished exploring, tests passing, starting the refactor — not for every small step. Fire-and-forget: it never blocks your work and returns immediately.",
     "inputSchema": {

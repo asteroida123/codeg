@@ -16,7 +16,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
 use crate::acp::capability_catalog::{CapabilitiesReport, CapabilityCatalogAccess};
-use crate::acp::chat_authoring::{AuthoringContext, AuthoringOutcome, ChatAuthoringAccess};
+use crate::acp::chat_authoring::{
+    AuthoringContext, AuthoringOutcome, ChatAuthoringAccess, WorkTaskToolOutcome,
+};
 use crate::acp::delegation::broker::{DelegationBroker, StatusWait};
 use crate::acp::browser_tools::{
     BrowserActOutcome, BrowserCaptureOutcome, BrowserConsoleOutcome, BrowserEvalOutcome,
@@ -31,7 +33,7 @@ use crate::acp::delegation::transport::{
     BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerMessage, BrokerRequest,
     BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest, BrokerResponse,
     BrokerResumeTaskRequest, BrokerSessionRequest, BrokerStatusRequest,
-    BrokerTaskCompleteRequest, BrokerTaskProgressRequest,
+    BrokerTaskCompleteRequest, BrokerTaskProgressRequest, BrokerWorkTaskToolRequest,
 };
 use crate::acp::delegation::types::{
     DelegationRequest, DelegationTaskReport, ResumeDelegationRequest, SelectorPreferences,
@@ -565,6 +567,14 @@ impl DelegationListener {
             BrokerMessage::CreateWorkTask(req) => {
                 authoring_response(self.process_create_work_task(req).await)?
             }
+            BrokerMessage::WorkTaskTool(req) => {
+                // Like the authoring arms, with ONE exception: `list_work_tasks`
+                // may long-poll for a status change. That wait is bounded by
+                // `MAX_LIST_WAIT_MS` inside the access impl (60s), so it stays a
+                // bounded round trip rather than a parking spot — no peer-close
+                // race is needed for something that cannot outlive its own cap.
+                work_task_tool_response(self.process_work_task_tool(req).await)?
+            }
             BrokerMessage::BrowserTabs(req) => {
                 // A registry read. No peer-close race for the same reason as
                 // SessionInfo: it cannot block on anything.
@@ -1046,6 +1056,20 @@ impl DelegationListener {
         self.authoring.create_work_task(ctx, req.spec).await
     }
 
+    /// Validate the token and hand an orchestration call to the authoring impl,
+    /// which re-checks the switch and authorizes every id against the caller's
+    /// conversation. An invalid token is the same soft refusal every authoring
+    /// arm gives — never a tool error.
+    async fn process_work_task_tool(
+        &self,
+        req: BrokerWorkTaskToolRequest,
+    ) -> WorkTaskToolOutcome {
+        let Some(ctx) = self.authoring_context(&req.token).await else {
+            return WorkTaskToolOutcome::refused("invalid token");
+        };
+        self.authoring.work_task_tool(ctx, req.call).await
+    }
+
     async fn process(&self, req: BrokerRequest) -> DelegationTaskReport {
         // 1. Token + parent_connection_id consistency check. Treat both as
         //    "canceled" since the LLM can't usefully react to either —
@@ -1331,6 +1355,16 @@ fn task_ack_response(ack: TaskReportAck) -> std::io::Result<BrokerResponse> {
 /// `CreateAutomation` / `CreateWorkTask` arms — the companion renders it into
 /// the tool result.
 fn authoring_response(outcome: AuthoringOutcome) -> std::io::Result<BrokerResponse> {
+    Ok(BrokerResponse {
+        outcome: serde_json::to_value(&outcome).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+        })?,
+    })
+}
+
+/// Serialize an orchestration tool's [`WorkTaskToolOutcome`] into the broker
+/// envelope the companion renders.
+fn work_task_tool_response(outcome: WorkTaskToolOutcome) -> std::io::Result<BrokerResponse> {
     Ok(BrokerResponse {
         outcome: serde_json::to_value(&outcome).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
@@ -1801,7 +1835,9 @@ mod tests {
         }
     }
 
-    use crate::acp::chat_authoring::{NewAutomationSpec, NewWorkTaskSpec};
+    use crate::acp::chat_authoring::{
+        NewAutomationSpec, NewWorkTaskSpec, WorkTaskToolCall, WorkTaskToolOutcome,
+    };
 
     /// Records what the listener handed down and returns a canned outcome, so
     /// authoring tests can assert the token → context resolution without a DB.
@@ -1809,6 +1845,7 @@ mod tests {
     struct StubAuthoring {
         automations: tokio::sync::Mutex<Vec<(AuthoringContext, NewAutomationSpec)>>,
         work_tasks: tokio::sync::Mutex<Vec<(AuthoringContext, NewWorkTaskSpec)>>,
+        work_task_calls: tokio::sync::Mutex<Vec<(AuthoringContext, WorkTaskToolCall)>>,
     }
     #[async_trait]
     impl ChatAuthoringAccess for StubAuthoring {
@@ -1835,6 +1872,17 @@ mod tests {
                 created: true,
                 kind: "work_task".into(),
                 id: Some(9),
+                ..Default::default()
+            }
+        }
+        async fn work_task_tool(
+            &self,
+            ctx: AuthoringContext,
+            call: WorkTaskToolCall,
+        ) -> WorkTaskToolOutcome {
+            self.work_task_calls.lock().await.push((ctx, call));
+            WorkTaskToolOutcome {
+                ok: true,
                 ..Default::default()
             }
         }

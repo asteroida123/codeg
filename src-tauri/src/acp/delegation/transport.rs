@@ -59,7 +59,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::acp::chat_authoring::{NewAutomationSpec, NewWorkTaskSpec};
+use crate::acp::chat_authoring::{NewAutomationSpec, NewWorkTaskSpec, WorkTaskToolCall};
 use crate::acp::question::QuestionSpec;
 
 /// One delegation call's worth of input forwarded from the companion to the
@@ -244,6 +244,18 @@ pub struct BrokerCreateWorkTaskRequest {
     pub spec: NewWorkTaskSpec,
 }
 
+/// Manage the board's tasks from the chat the caller is in. Backs the four
+/// orchestration tools (`split_work_task` / `list_work_tasks` /
+/// `start_work_task` / `cancel_work_task`) — one variant for the four, the way
+/// one `BrowserTabOp` backs open / navigate / close: they share a gate (the
+/// `taskboard` feature group), an authorization rule and an answer shape.
+/// Same token scoping as the other authoring arms.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerWorkTaskToolRequest {
+    pub token: String,
+    pub call: WorkTaskToolCall,
+}
+
 /// List the built-in browser's tabs as an agent may see them. Backs the
 /// `browser_list_tabs` MCP tool. Authenticated by the per-launch `token`, and
 /// — like [`BrokerSessionRequest`] and for the same single-tenant reason — not
@@ -369,6 +381,7 @@ pub enum BrokerMessage {
     TaskComplete(BrokerTaskCompleteRequest),
     CreateAutomation(BrokerCreateAutomationRequest),
     CreateWorkTask(BrokerCreateWorkTaskRequest),
+    WorkTaskTool(BrokerWorkTaskToolRequest),
     BrowserTabs(BrokerBrowserTabsRequest),
     Capabilities(BrokerCapabilitiesRequest),
     BrowserSnapshot(BrokerBrowserSnapshotRequest),
@@ -576,6 +589,16 @@ pub async fn client_create_work_task_round_trip(
     req: &BrokerCreateWorkTaskRequest,
 ) -> io::Result<BrokerResponse> {
     message_round_trip(socket_path, &BrokerMessage::CreateWorkTask(req.clone())).await
+}
+
+/// Dispatch an orchestration call (`split_work_task` / `list_work_tasks` /
+/// `start_work_task` / `cancel_work_task`) and read back the serialized
+/// [`crate::acp::chat_authoring::WorkTaskToolOutcome`].
+pub async fn client_work_task_tool_round_trip(
+    socket_path: &str,
+    req: &BrokerWorkTaskToolRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(socket_path, &BrokerMessage::WorkTaskTool(req.clone())).await
 }
 
 /// Dispatch a `browser_list_tabs` request and read back the serialized

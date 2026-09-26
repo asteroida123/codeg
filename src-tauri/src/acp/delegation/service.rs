@@ -365,6 +365,13 @@ mod tests {
         ) -> crate::acp::chat_authoring::AuthoringOutcome {
             crate::acp::chat_authoring::AuthoringOutcome::default()
         }
+        async fn work_task_tool(
+            &self,
+            _ctx: crate::acp::chat_authoring::AuthoringContext,
+            _call: crate::acp::chat_authoring::WorkTaskToolCall,
+        ) -> crate::acp::chat_authoring::WorkTaskToolOutcome {
+            crate::acp::chat_authoring::WorkTaskToolOutcome::refused("stub")
+        }
     }
 
     #[async_trait]

@@ -24,19 +24,27 @@ use serde::{Deserialize, Serialize};
 
 use crate::acp::chat_authoring::{
     local_timezone, AuthoringContext, AuthoringOutcome, ChatAuthoringAccess, ChatAuthoringConfig,
-    ChatAuthoringRuntimeConfig, NewAutomationSpec, NewWorkTaskSpec,
+    ChatAuthoringRuntimeConfig, ListWorkTasksSpec, NewAutomationSpec, NewWorkTaskSpec,
+    SplitWorkTaskSpec, WorkTaskIdsSpec, WorkTaskToolCall, WorkTaskToolOutcome, WorkTaskToolResult,
+    WorkTaskToolTask, LIST_WAIT_POLL_INTERVAL_MS, MAX_LIST_WAIT_MS, MAX_TOOL_TASK_IDS,
 };
 use crate::acp::types::PromptInputBlock;
 use crate::app_error::AppCommandError;
 use crate::db::entities::automation::{IsolationMode, TriggerKind};
 use crate::db::entities::folder::FolderKind;
-use crate::db::service::{app_metadata_service, conversation_service, folder_service};
+use crate::db::entities::work_task::WorkTaskStatus;
+use crate::db::service::{
+    app_metadata_service, conversation_service, folder_service, work_task_service,
+};
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
 use crate::models::{
-    AutomationConfig, AutomationDraft, FolderDetail, WorkTaskConfig, WorkTaskDraft,
+    AutomationConfig, AutomationDraft, FolderDetail, WorkTaskConfig, WorkTaskDraft, WorkTaskInfo,
 };
-use crate::web::event_bridge::{emit_event, EventEmitter, CHAT_AUTHORING_SETTINGS_CHANGED_EVENT};
+use crate::web::event_bridge::{
+    emit_event, EventEmitter, WorkTaskChange, CHAT_AUTHORING_SETTINGS_CHANGED_EVENT,
+    WORK_TASK_CHANGED_EVENT,
+};
 
 const KIND_AUTOMATION: &str = "automation";
 const KIND_WORK_TASK: &str = "work_task";
@@ -347,8 +355,16 @@ impl ChatAuthoringAccess for DbChatAuthoring {
             title: spec.title.clone(),
             config,
         };
-        match crate::commands::work_task::work_task_create_core(&self.emitter, &self.db, draft)
-            .await
+        // The authoring path is the ONE create that stamps the caller's
+        // conversation: that stamp is what later authorizes `start_work_task` /
+        // `cancel_work_task` / `split_work_task` on this task.
+        match crate::commands::work_task::work_task_create_authored_core(
+            &self.emitter,
+            &self.db,
+            draft,
+            ctx.conversation_id,
+        )
+        .await
         {
             Ok(info) => AuthoringOutcome {
                 created: true,
@@ -367,6 +383,522 @@ impl ChatAuthoringAccess for DbChatAuthoring {
             },
             Err(e) => AuthoringOutcome::rejected(KIND_WORK_TASK, e.to_string()),
         }
+    }
+
+    /// The four orchestration tools, behind one entry point (see the trait
+    /// docs). The switch is re-checked HERE, not only at MCP injection time:
+    /// these tools WRITE board state and start agents, and "off" has to mean off
+    /// for a session that was launched while it was on.
+    async fn work_task_tool(
+        &self,
+        ctx: AuthoringContext,
+        call: WorkTaskToolCall,
+    ) -> WorkTaskToolOutcome {
+        if !self.config.work_tasks_enabled().await {
+            return WorkTaskToolOutcome::refused(refusal_feature_off());
+        }
+        // Identity is the whole authorization model of these tools: a task is
+        // the caller's if this conversation created it, or created its parent.
+        // Without a conversation there is nothing to match against — a
+        // conversation-less caller owns nothing.
+        let Some(conversation_id) = ctx.conversation_id else {
+            return WorkTaskToolOutcome::refused(
+                "This chat has no codeg session yet, so it has no board tasks to manage.",
+            );
+        };
+        match call {
+            WorkTaskToolCall::Split(spec) => self.split_work_task(conversation_id, spec).await,
+            WorkTaskToolCall::List(spec) => self.list_work_tasks(conversation_id, spec).await,
+            WorkTaskToolCall::Start(spec) => self.start_work_tasks(conversation_id, spec).await,
+            WorkTaskToolCall::Cancel(spec) => self.cancel_work_tasks(conversation_id, spec).await,
+        }
+    }
+}
+
+/// The refusal shown when the `taskboard` switch is off. Same wording the
+/// create tool uses, so the two always tell the user the same thing.
+fn refusal_feature_off() -> String {
+    "Managing board tasks from chat is turned off in codeg's settings \
+     (Settings → General → Create from chat). Ask the user to enable it."
+        .to_string()
+}
+
+impl DbChatAuthoring {
+    /// The task, only if this conversation owns it. `None` covers "no such
+    /// task", "deleted", and "someone else's" alike — callers answer with
+    /// [`WorkTaskToolOutcome::not_yours`], which cannot confirm existence.
+    async fn owned_task(
+        &self,
+        task_id: i32,
+        conversation_id: i32,
+    ) -> Option<crate::db::entities::work_task::Model> {
+        let task = work_task_service::get_model(&self.db.conn, task_id)
+            .await
+            .ok()?;
+        work_task_service::is_owned_by_conversation(
+            &self.db.conn,
+            &task,
+            Some(conversation_id),
+        )
+        .await
+        .ok()
+        .filter(|owned| *owned)
+        .map(|_| task)
+    }
+
+    /// `split_work_task`: create the subtasks under an owned parent, wire the
+    /// intra-call / extra dependencies, write the limits, and (optionally) make
+    /// the parent wait for its children.
+    async fn split_work_task(
+        &self,
+        conversation_id: i32,
+        spec: SplitWorkTaskSpec,
+    ) -> WorkTaskToolOutcome {
+        if spec.subtasks.is_empty() {
+            return WorkTaskToolOutcome::refused("A split needs at least one subtask.");
+        }
+        let Some(parent) = self.owned_task(spec.parent_task_id, conversation_id).await else {
+            return WorkTaskToolOutcome::not_yours(spec.parent_task_id);
+        };
+        if parent.parent_id.is_some() {
+            return WorkTaskToolOutcome::refused(format!(
+                "Task #{} is already a subtask; the hierarchy stops at two levels. Split the \
+                 top-level task instead.",
+                parent.id
+            ));
+        }
+
+        let mut children = Vec::with_capacity(spec.subtasks.len());
+        for (idx, sub) in spec.subtasks.iter().enumerate() {
+            let agent = match parse_agent_slug(sub.agent_type.as_deref()) {
+                Ok(a) => a,
+                Err(note) => {
+                    return WorkTaskToolOutcome::refused(format!("subtasks[{idx}]: {note}"))
+                }
+            };
+            let prompt_blocks = match text_prompt_blocks(&sub.prompt) {
+                Ok(b) => b,
+                Err(note) => {
+                    return WorkTaskToolOutcome::refused(format!("subtasks[{idx}]: {note}"))
+                }
+            };
+            let config = WorkTaskConfig {
+                prompt_blocks,
+                display_text: sub.prompt.clone(),
+                agent_type: agent.map(|a| a.as_wire().into_owned()),
+                mode_id: None,
+                config_values: BTreeMap::new(),
+                label_snapshot: None,
+                deliverable: None,
+                base_branch: None,
+            };
+            let config = match serde_json::to_value(&config) {
+                Ok(v) => v,
+                Err(e) => {
+                    return WorkTaskToolOutcome::refused(format!(
+                        "could not encode subtask {idx} config: {e}"
+                    ))
+                }
+            };
+            children.push(work_task_service::WorkTaskChildDraft {
+                title: sub.title.clone(),
+                config,
+                depends_on_index: sub.depends_on_index.clone(),
+            });
+        }
+
+        let request = work_task_service::SplitTaskRequest {
+            parent_id: parent.id,
+            children,
+            depends_on_task_ids: spec.depends_on_task_ids.clone(),
+            max_concurrent_children: spec.limits.max_concurrent_children,
+            max_runs_per_child: spec.limits.max_runs_per_child,
+            token_budget: spec.limits.token_budget,
+            parent_depends_on_children: spec.parent_depends_on_children,
+            created_by_conversation_id: Some(conversation_id),
+        };
+        let outcome = match work_task_service::split_task(&self.db.conn, request).await {
+            Ok(o) => o,
+            // Semantic refusals (cycle, cross-folder dependency, bad limit) and
+            // DB errors both come back as a note the LLM can act on.
+            Err(e) => return WorkTaskToolOutcome::refused(e.to_string()),
+        };
+        for child in &outcome.children {
+            emit_event(
+                &self.emitter,
+                WORK_TASK_CHANGED_EVENT,
+                WorkTaskChange::Upsert { id: child.id },
+            );
+        }
+        // The board (and an auto_process folder) should see the new to-dos now.
+        crate::commands::work_task::nudge_pump(parent.folder_id);
+
+        // The children's own derived state is part of the answer: a subtask that
+        // waits on a sibling is `blocked`, and the caller asked for the split —
+        // it should be told which pieces are queued behind which.
+        let mut infos = outcome.children;
+        if let Err(e) = work_task_service::annotate_blocked(&self.db.conn, &mut infos).await {
+            tracing::warn!("[chat_authoring] could not annotate split children: {e}");
+        }
+        let mut note = format!(
+            "Created {} subtask(s) as to-dos; nothing starts until they are started (or the \
+             project auto-processes them).",
+            infos.len()
+        );
+        if spec.parent_depends_on_children {
+            note.push_str(
+                " The parent now waits for all of them, so starting it means integrating the \
+                 pieces.",
+            );
+        }
+        WorkTaskToolOutcome {
+            ok: true,
+            tasks: infos.iter().map(to_tool_task).collect(),
+            results: Vec::new(),
+            note: Some(note),
+        }
+    }
+
+    /// Resolve the window `list_work_tasks` reports on, and annotate it with
+    /// the derived `blocked` state. The window's IDS are fixed by the request,
+    /// but its membership can change while a long-poll waits (a subtask created
+    /// by another call, a task deleted) — recomputed on every poll, which is
+    /// exactly what makes the wait wake on that too.
+    async fn work_task_window(
+        &self,
+        conversation_id: i32,
+        spec: &ListWorkTasksSpec,
+    ) -> Result<(Vec<WorkTaskInfo>, Option<String>), String> {
+        let (mut infos, note) = if !spec.task_ids.is_empty() {
+            let mut ids = Vec::with_capacity(spec.task_ids.len());
+            let mut foreign = 0usize;
+            for id in &spec.task_ids {
+                if self.owned_task(*id, conversation_id).await.is_some() {
+                    ids.push(*id);
+                } else {
+                    foreign += 1;
+                }
+            }
+            let note = (foreign > 0).then(|| {
+                format!(
+                    "{foreign} requested task id(s) are not this conversation's and were left out."
+                )
+            });
+            (
+                work_task_service::list_by_ids(&self.db.conn, &ids)
+                    .await
+                    .map_err(|e| e.to_string())?,
+                note,
+            )
+        } else if let Some(parent_id) = spec.parent_task_id {
+            if self.owned_task(parent_id, conversation_id).await.is_none() {
+                return Err(format!(
+                    "Task #{parent_id} is not one of this conversation's tasks, so it cannot be \
+                     read from here."
+                ));
+            }
+            let mut infos = work_task_service::list_by_ids(&self.db.conn, &[parent_id])
+                .await
+                .map_err(|e| e.to_string())?;
+            infos.extend(
+                work_task_service::children_of(&self.db.conn, parent_id)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            );
+            (infos, None)
+        } else {
+            (
+                work_task_service::list_created_by_conversation(&self.db.conn, conversation_id)
+                    .await
+                    .map_err(|e| e.to_string())?,
+                None,
+            )
+        };
+        work_task_service::annotate_blocked(&self.db.conn, &mut infos)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok((infos, note))
+    }
+
+    /// `list_work_tasks`: the caller's tasks (or one parent's children), with an
+    /// optional bounded long-poll.
+    async fn list_work_tasks(
+        &self,
+        conversation_id: i32,
+        spec: ListWorkTasksSpec,
+    ) -> WorkTaskToolOutcome {
+        if spec.task_ids.len() > MAX_TOOL_TASK_IDS {
+            return WorkTaskToolOutcome::refused(format!(
+                "list_work_tasks names at most {MAX_TOOL_TASK_IDS} tasks at once."
+            ));
+        }
+        let (mut infos, note) = match self.work_task_window(conversation_id, &spec).await {
+            Ok(v) => v,
+            Err(note) => return WorkTaskToolOutcome::refused(note),
+        };
+        let wait_ms = spec.wait_ms.unwrap_or(0).min(MAX_LIST_WAIT_MS);
+        // Only wait when something could still change: a window that is empty
+        // or entirely terminal has no next status to wake on.
+        let can_change = infos.iter().any(|t| !is_terminal(t.status));
+        if wait_ms > 0 && can_change {
+            infos = self
+                .await_status_change(conversation_id, &spec, infos, wait_ms)
+                .await;
+        }
+        WorkTaskToolOutcome {
+            ok: true,
+            tasks: infos.iter().map(to_tool_task).collect(),
+            results: Vec::new(),
+            note,
+        }
+    }
+
+    /// The polling half of the `list_work_tasks` long-poll: sleep ~1s at a time
+    /// until any listed task's status differs from the snapshot we are about to
+    /// return, or the cap runs out. Returns the freshest window either way.
+    async fn await_status_change(
+        &self,
+        conversation_id: i32,
+        spec: &ListWorkTasksSpec,
+        mut infos: Vec<WorkTaskInfo>,
+        wait_ms: u64,
+    ) -> Vec<WorkTaskInfo> {
+        let baseline = status_signature(&infos);
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return infos;
+            }
+            tokio::time::sleep(
+                remaining.min(std::time::Duration::from_millis(LIST_WAIT_POLL_INTERVAL_MS)),
+            )
+            .await;
+            match self.work_task_window(conversation_id, spec).await {
+                Ok((latest, _)) => {
+                    let changed = status_signature(&latest) != baseline;
+                    infos = latest;
+                    if changed {
+                        return infos;
+                    }
+                }
+                // A read that fails mid-wait returns what we already have; the
+                // caller can ask again.
+                Err(e) => {
+                    tracing::warn!("[chat_authoring] list wait poll failed: {e}");
+                    return infos;
+                }
+            }
+        }
+    }
+
+    /// `start_work_task`: `todo → queued` through the engine's claim path, so
+    /// every gate (dependencies, the parent's limits, the folder's concurrency,
+    /// the folder's preflight) applies exactly as it does for the Start button.
+    async fn start_work_tasks(
+        &self,
+        conversation_id: i32,
+        spec: WorkTaskIdsSpec,
+    ) -> WorkTaskToolOutcome {
+        if spec.task_ids.len() > MAX_TOOL_TASK_IDS {
+            return WorkTaskToolOutcome::refused(format!(
+                "start_work_task names at most {MAX_TOOL_TASK_IDS} tasks at once."
+            ));
+        }
+        let mut results = Vec::with_capacity(spec.task_ids.len());
+        for task_id in &spec.task_ids {
+            let Some(task) = self.owned_task(*task_id, conversation_id).await else {
+                results.push(refused_result(*task_id, "not one of this conversation's tasks"));
+                continue;
+            };
+            if task.status != WorkTaskStatus::Todo {
+                results.push(refused_result(
+                    *task_id,
+                    &format!(
+                        "it is {} — only a to-do can be started",
+                        work_task_service::status_str(task.status)
+                    ),
+                ));
+                continue;
+            }
+            // Report the gate rather than letting the claim lose silently.
+            match work_task_service::blocked_for(&self.db.conn, &task).await {
+                Ok(Some(blocked)) => {
+                    results.push(refused_result(
+                        *task_id,
+                        &format!(
+                            "it cannot start yet: {}",
+                            work_task_service::blocked_message(&blocked)
+                        ),
+                    ));
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    results.push(refused_result(*task_id, &e.to_string()));
+                    continue;
+                }
+            }
+            match self.claim_start(*task_id, task.folder_id).await {
+                Ok(()) => results.push(WorkTaskToolResult {
+                    task_id: *task_id,
+                    outcome: "ok".to_string(),
+                    status: Some("queued".to_string()),
+                    note: None,
+                }),
+                Err(note) => results.push(refused_result(*task_id, &note)),
+            }
+        }
+        WorkTaskToolOutcome {
+            ok: true,
+            tasks: Vec::new(),
+            results,
+            note: None,
+        }
+    }
+
+    /// One start, through the engine when this process owns one (preflight +
+    /// pump + broadcast), else through the plain claim (the process that owns
+    /// the engine picks the row up from its tick).
+    async fn claim_start(&self, task_id: i32, folder_id: i32) -> Result<(), String> {
+        if let Some(engine) = crate::work_task::engine() {
+            return engine.start(task_id).await;
+        }
+        match work_task_service::claim_for_run(&self.db.conn, task_id, WorkTaskStatus::Todo, "agent")
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            Some(_) => {
+                emit_event(
+                    &self.emitter,
+                    WORK_TASK_CHANGED_EVENT,
+                    WorkTaskChange::Upsert { id: task_id },
+                );
+                crate::commands::work_task::nudge_pump(folder_id);
+                Ok(())
+            }
+            None => Err("the task could not be claimed (it changed state first)".to_string()),
+        }
+    }
+
+    /// `cancel_work_task`: stop an owned task. Terminal tasks and a merge in
+    /// flight are refusals, never tool errors — the caller reads them and tells
+    /// the user.
+    async fn cancel_work_tasks(
+        &self,
+        conversation_id: i32,
+        spec: WorkTaskIdsSpec,
+    ) -> WorkTaskToolOutcome {
+        if spec.task_ids.len() > MAX_TOOL_TASK_IDS {
+            return WorkTaskToolOutcome::refused(format!(
+                "cancel_work_task names at most {MAX_TOOL_TASK_IDS} tasks at once."
+            ));
+        }
+        let mut results = Vec::with_capacity(spec.task_ids.len());
+        for task_id in &spec.task_ids {
+            let Some(task) = self.owned_task(*task_id, conversation_id).await else {
+                results.push(refused_result(*task_id, "not one of this conversation's tasks"));
+                continue;
+            };
+            if is_terminal(task.status) {
+                results.push(refused_result(
+                    *task_id,
+                    &format!(
+                        "it already finished ({}) — requeue the card from the board to run it \
+                         again",
+                        work_task_service::status_str(task.status)
+                    ),
+                ));
+                continue;
+            }
+            if task.status == WorkTaskStatus::Merging {
+                results.push(refused_result(
+                    *task_id,
+                    "its merge is in flight — a merge cannot be stopped once it starts",
+                ));
+                continue;
+            }
+            match self.claim_cancel(*task_id, task.folder_id).await {
+                Ok(()) => results.push(WorkTaskToolResult {
+                    task_id: *task_id,
+                    outcome: "ok".to_string(),
+                    status: Some("canceled".to_string()),
+                    note: None,
+                }),
+                Err(note) => results.push(refused_result(*task_id, &note)),
+            }
+        }
+        WorkTaskToolOutcome {
+            ok: true,
+            tasks: Vec::new(),
+            results,
+            note: None,
+        }
+    }
+
+    /// One cancel: the engine's path sheds the live connection and pumps the
+    /// folder; without an engine the plain service cancel is all there is.
+    async fn claim_cancel(&self, task_id: i32, folder_id: i32) -> Result<(), String> {
+        if let Some(engine) = crate::work_task::engine() {
+            return engine.cancel(task_id, None).await;
+        }
+        let canceled = work_task_service::cancel(&self.db.conn, task_id, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        if canceled {
+            emit_event(
+                &self.emitter,
+                WORK_TASK_CHANGED_EVENT,
+                WorkTaskChange::Upsert { id: task_id },
+            );
+            crate::commands::work_task::nudge_pump(folder_id);
+            Ok(())
+        } else {
+            Err("the task could not be canceled in its current state".to_string())
+        }
+    }
+}
+
+fn refused_result(task_id: i32, note: &str) -> WorkTaskToolResult {
+    WorkTaskToolResult {
+        task_id,
+        outcome: "refused".to_string(),
+        status: None,
+        note: Some(note.to_string()),
+    }
+}
+
+/// `done` / `failed` / `canceled` — no claim or cancel left to make.
+fn is_terminal(status: WorkTaskStatus) -> bool {
+    matches!(
+        status,
+        WorkTaskStatus::Done | WorkTaskStatus::Failed | WorkTaskStatus::Canceled
+    )
+}
+
+/// The `(id, status)` pairs a long-poll compares between passes.
+fn status_signature(infos: &[WorkTaskInfo]) -> Vec<(i32, WorkTaskStatus)> {
+    let mut out: Vec<(i32, WorkTaskStatus)> = infos.iter().map(|t| (t.id, t.status)).collect();
+    out.sort_unstable_by_key(|(id, _)| *id);
+    out
+}
+
+/// Trim a row to the view the orchestration tools answer with.
+fn to_tool_task(info: &WorkTaskInfo) -> WorkTaskToolTask {
+    WorkTaskToolTask {
+        id: info.id,
+        title: info.title.clone(),
+        status: work_task_service::status_str(info.status).to_string(),
+        run_seq: info.run_seq,
+        parent_id: info.parent_id,
+        latest_progress: info.latest_progress.clone(),
+        verdict: info.verdict.clone(),
+        failure_reason: info.failure_reason.clone(),
+        blocked: info.blocked.clone(),
+        files_changed: info.files_changed,
+        additions: info.additions,
+        deletions: info.deletions,
     }
 }
 
