@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
+use crate::acp::capability_catalog::{CapabilitiesReport, CapabilityCatalogAccess};
 use crate::acp::chat_authoring::{AuthoringContext, AuthoringOutcome, ChatAuthoringAccess};
 use crate::acp::delegation::broker::{DelegationBroker, StatusWait};
 use crate::acp::browser_tools::{
@@ -26,7 +27,7 @@ use crate::acp::delegation::transport::{
     read_frame, write_frame, BrokerAskRequest, BrokerBrowserActRequest,
     BrokerBrowserCaptureRequest, BrokerBrowserConsoleRequest, BrokerBrowserEvalRequest,
     BrokerBrowserSnapshotRequest, BrokerBrowserTabOpRequest, BrokerBrowserTabsRequest,
-    BrokerCancelRequest, BrokerCancelTaskRequest,
+    BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCapabilitiesRequest,
     BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerMessage, BrokerRequest,
     BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest, BrokerResponse,
     BrokerResumeTaskRequest, BrokerSessionRequest, BrokerStatusRequest,
@@ -160,6 +161,11 @@ pub struct DelegationListener {
     /// exists only in the desktop build, because a browser tab is a native
     /// webview — server mode gets `NoBrowserTabs`.
     pub browser: Arc<dyn BrowserToolAccess>,
+    /// Resolves the delegable agents' capability matrix (models / modes /
+    /// reasoning levels) for the `get_delegation_capabilities` tool. Read-only:
+    /// static on-disk catalogs plus the advertisement cache of live
+    /// connections — answering never launches an agent process.
+    pub capabilities: Arc<dyn CapabilityCatalogAccess>,
 }
 
 impl DelegationListener {
@@ -174,6 +180,7 @@ impl DelegationListener {
         tasks: Arc<dyn WorkTaskToolAccess>,
         authoring: Arc<dyn ChatAuthoringAccess>,
         browser: Arc<dyn BrowserToolAccess>,
+        capabilities: Arc<dyn CapabilityCatalogAccess>,
     ) -> Arc<Self> {
         Arc::new(Self {
             broker,
@@ -185,6 +192,7 @@ impl DelegationListener {
             tasks,
             authoring,
             browser,
+            capabilities,
         })
     }
 
@@ -561,6 +569,13 @@ impl DelegationListener {
                 // SessionInfo: it cannot block on anything.
                 browser_tabs_response(self.process_browser_tabs(req).await)?
             }
+            BrokerMessage::Capabilities(req) => {
+                // Bounded catalog reads (on-disk files + a state lock), like
+                // SessionInfo: never long-polls, nothing to tear down on
+                // cancel, so no peer-close race — a caller that walks away
+                // simply gets no answer.
+                capabilities_response(self.process_capabilities(req).await)?
+            }
             BrokerMessage::BrowserSnapshot(req) => {
                 // This one CAN take a moment — it evaluates in the page's
                 // isolated world and waits for the answer — but it is bounded
@@ -844,6 +859,22 @@ impl DelegationListener {
             return BrowserTabsOutcome::default();
         }
         self.browser.list_tabs().await
+    }
+
+    /// Validate the token and resolve the capability catalog for the
+    /// `get_delegation_capabilities` tool.
+    ///
+    /// An invalid token gets an empty report — the same answer a runtime
+    /// whose catalog sources all came up empty would give, so a caller that
+    /// cannot prove it is a companion learns nothing, not even which agents
+    /// are installed. Like `get_session_info` this is not parent-scoped: the
+    /// catalog describes agents, not the caller's own tasks (see
+    /// [`BrokerCapabilitiesRequest`]).
+    async fn process_capabilities(&self, req: BrokerCapabilitiesRequest) -> CapabilitiesReport {
+        if self.tokens.lookup(&req.token).await.is_none() {
+            return CapabilitiesReport::default();
+        }
+        self.capabilities.resolve(req.agent_type.as_deref()).await
     }
 
     /// Validate the token and read one shared page.
@@ -1164,6 +1195,17 @@ fn session_response(info: SessionInfo) -> std::io::Result<BrokerResponse> {
 fn browser_tabs_response(outcome: BrowserTabsOutcome) -> std::io::Result<BrokerResponse> {
     Ok(BrokerResponse {
         outcome: serde_json::to_value(&outcome).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+        })?,
+    })
+}
+
+/// Serialize a [`CapabilitiesReport`] into a [`BrokerResponse`] for the
+/// `Capabilities` arm — the companion renders it into the
+/// `get_delegation_capabilities` tool result.
+fn capabilities_response(report: CapabilitiesReport) -> std::io::Result<BrokerResponse> {
+    Ok(BrokerResponse {
+        outcome: serde_json::to_value(&report).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
         })?,
     })
@@ -1563,6 +1605,30 @@ mod tests {
         }
     }
 
+    /// A capability catalog with one canned entry, recording every filter it
+    /// was asked for so tests can prove the token gate and the filter
+    /// passthrough separately.
+    #[derive(Default)]
+    struct StubCapabilities {
+        calls: tokio::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl CapabilityCatalogAccess for StubCapabilities {
+        async fn resolve(&self, agent_type: Option<&str>) -> CapabilitiesReport {
+            self.calls
+                .lock()
+                .await
+                .push(agent_type.map(str::to_string));
+            CapabilitiesReport {
+                agents: vec![crate::acp::capability_catalog::AgentCapabilities::unknown(
+                    "codex", "Codex",
+                )],
+                note: None,
+            }
+        }
+    }
+
     /// A browser with one shared tab and one that nobody shared, recording
     /// every call so a test can prove the token gate never reached it.
     #[derive(Default)]
@@ -1756,6 +1822,7 @@ mod tests {
             Arc::new(StubTaskTools),
             Arc::new(StubAuthoring::default()),
             Arc::new(NoBrowserTabs),
+            Arc::new(StubCapabilities::default()),
         )
     }
 
@@ -1779,6 +1846,7 @@ mod tests {
             Arc::new(StubTaskTools),
             Arc::new(StubAuthoring::default()),
             Arc::new(NoBrowserTabs),
+            Arc::new(StubCapabilities::default()),
         )
     }
 
@@ -1803,6 +1871,7 @@ mod tests {
             Arc::new(StubTaskTools),
             Arc::new(StubAuthoring::default()),
             Arc::new(NoBrowserTabs),
+            Arc::new(StubCapabilities::default()),
         )
     }
 
@@ -1826,6 +1895,32 @@ mod tests {
             Arc::new(StubTaskTools),
             Arc::new(StubAuthoring::default()),
             Arc::new(NoBrowserTabs),
+            Arc::new(StubCapabilities::default()),
+        )
+    }
+
+    /// Build a listener whose capability access is the given stub, so
+    /// `get_delegation_capabilities` tests can assert the filter passthrough
+    /// and the token gate.
+    fn make_capabilities_listener(
+        tokens: Arc<TokenRegistry>,
+        capabilities: Arc<StubCapabilities>,
+    ) -> Arc<DelegationListener> {
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+        ));
+        DelegationListener::new(
+            broker,
+            tokens,
+            Arc::new(StaticParentLookup(Some(1))),
+            Arc::new(StubFeedback::default()),
+            Arc::new(StubQuestion::default()),
+            Arc::new(StubSessionInfo::default()),
+            Arc::new(StubTaskTools),
+            Arc::new(StubAuthoring::default()),
+            Arc::new(NoBrowserTabs),
+            capabilities,
         )
     }
 
@@ -1851,6 +1946,7 @@ mod tests {
             Arc::new(StubTaskTools),
             authoring,
             Arc::new(NoBrowserTabs),
+            Arc::new(StubCapabilities::default()),
         )
     }
 
@@ -1875,6 +1971,7 @@ mod tests {
             Arc::new(StubTaskTools),
             Arc::new(StubAuthoring::default()),
             browser,
+            Arc::new(StubCapabilities::default()),
         )
     }
 
@@ -2879,6 +2976,79 @@ mod tests {
         assert_eq!(resp.outcome["session_id"], 42);
         // The resolver was never consulted for an unauthenticated caller.
         assert!(session_info.calls.lock().await.is_empty());
+    }
+
+    /// A valid `get_delegation_capabilities` call forwards the agent_type
+    /// filter verbatim (including `None` for "all agents") and returns the
+    /// resolved report envelope.
+    #[tokio::test]
+    async fn capabilities_valid_token_forwards_the_filter() {
+        for (filter, expected) in [(Some("codex"), Some("codex")), (None, None)] {
+            let capabilities = Arc::new(StubCapabilities::default());
+            let tokens = Arc::new(TokenRegistry::default());
+            tokens
+                .register(
+                    "tok".into(),
+                    TokenEntry {
+                        parent_connection_id: "parent-conn".into(),
+                        working_dir: PathBuf::from("/tmp"),
+                    },
+                )
+                .await;
+            let listener = make_capabilities_listener(tokens, capabilities.clone());
+
+            let (mut client, mut server) = duplex(8 * 1024);
+            let server_task = tokio::spawn(async move {
+                listener.serve_one(&mut server).await.unwrap();
+            });
+            let msg = BrokerMessage::Capabilities(BrokerCapabilitiesRequest {
+                token: "tok".into(),
+                agent_type: filter.map(str::to_string),
+            });
+            write_frame(&mut client, &msg).await.unwrap();
+            let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
+            server_task.await.unwrap();
+
+            let agents = resp.outcome["agents"].as_array().unwrap();
+            assert_eq!(agents.len(), 1);
+            assert_eq!(agents[0]["agent_type"], "codex");
+            assert_eq!(agents[0]["source"], "unknown");
+            // The access impl saw the filter exactly as the tool sent it.
+            assert_eq!(
+                capabilities.calls.lock().await.as_slice(),
+                &[expected.map(str::to_string)],
+                "filter {filter:?}"
+            );
+        }
+    }
+
+    /// An invalid token gets an empty report WITHOUT consulting the catalog —
+    /// no leak of which agents exist, matching the other read-only arms.
+    #[tokio::test]
+    async fn capabilities_invalid_token_gets_empty_report_without_resolving() {
+        let capabilities = Arc::new(StubCapabilities::default());
+        // No token registered.
+        let tokens = Arc::new(TokenRegistry::default());
+        let listener = make_capabilities_listener(tokens, capabilities.clone());
+
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+        let msg = BrokerMessage::Capabilities(BrokerCapabilitiesRequest {
+            token: "bogus".into(),
+            agent_type: None,
+        });
+        write_frame(&mut client, &msg).await.unwrap();
+        let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap();
+
+        assert_eq!(
+            resp.outcome["agents"].as_array().map(Vec::len),
+            Some(0),
+            "unauthenticated callers learn nothing"
+        );
+        assert!(capabilities.calls.lock().await.is_empty());
     }
 
     /// A valid token resolves the caller's conversation + working dir and hands
