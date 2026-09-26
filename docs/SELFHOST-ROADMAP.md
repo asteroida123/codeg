@@ -1,6 +1,6 @@
 # 自用集成线路线图（selfhost/main）
 
-> 状态：Active（2026-09-26 建立，同日按 Discussion #731 修订）
+> 状态：Active（2026-09-26 建立，同日按 Discussion #731 修订；2026-09-27 第二阶段完成）
 > 性质：个人自用集成分支，先完整验证再拆小 PR 回上游（与 Discussion #731 的边界一致）
 > 基座：`codex/delegation-continuation-local`（PR #693 同会话续作）+ ZCode 内置（PR #768）+ upstream main 0.32.2
 >
@@ -29,8 +29,8 @@
 - delegation_task 账本：准入、ResumeBinding、冻结终态、每源单后继、同请求幂等
 - 严格恢复：live reuse → resume → load → 明确失败，不静默冷启动；agent/session/cwd 身份硬约束
 - 启动对账：中断任务投影为 unknown/interrupted，不盲发
-- WorkTask 引擎：CAS 状态机、事件流、模板、scheduled_at、worktree/merge 集成；Agent 侧现有 `task_progress` / `task_complete` 上报工具
-- ZCode 内置 agent（adapter 0.1.4，协议已对 zai-org/zcode 校准）
+- WorkTask 引擎：CAS 状态机、事件流、模板、scheduled_at、worktree/merge 集成；Agent 侧 `task_progress` / `task_complete` 上报工具 + 第二阶段的 `create/split/list/start/cancel` 编排工具；运行账本 `work_task_run` 与严格续作（`SessionRecoveryPolicy::Strict`）
+- ZCode 内置 agent（adapter 0.1.5，协议已对 zai-org/zcode 校准）
 - upstream 0.32.2：agent-client-protocol 2.2 迁移、ACP Session Notices/Compaction
 
 ## 推进顺序
@@ -68,12 +68,20 @@
    - delegation_task 账本已有骨架，缺 per-turn 指标列与聚合视图
    - 这是评测闭环的数据地基；有了它，后续推荐/路由才有依据
 
-### 第二阶段：WorkTask × Delegation 协同（#731 问题 2 + 3）
+### 第二阶段：WorkTask × Delegation 协同（#731 问题 2 + 3）—— ✅ 全部完成（2026-09-27）
 
-- **Agent 创建与拆分 WorkTask**：主 Agent 把大任务拆成多个持久化子任务，用依赖、并发和预算限制编排
-  - 现状缺口：Agent 侧只有 `task_progress` / `task_complete` 上报，没有创建/拆分/编排工具；引擎本身（状态机/事件/模板）已具备
-- **WorkTask ↔ Delegation Session 稳定关联**：审查和返工续接原来的子 Agent 会话（#693 的 `continue_from_task_id`），不再冷会话重派
-  - 落点：work_task 执行与 delegation_task 账本之间建立外键级关联，返工轮走续作通道
+1. **Agent 创建与拆分 WorkTask** —— ✅ 已落地（2026-09-27）：`split_work_task` / `list_work_tasks` / `start_work_task` / `cancel_work_task` 四工具（taskboard 组，沿用 `chat_authoring.work_tasks_enabled`）
+   - 层级 ≤ 2：只能给顶层任务拆子任务；父任务仍是普通可执行任务，用 `parent_depends_on_children` 表达「先拆后合」
+   - 依赖是硬门控：上游必须存活且 `done`；上游失败/取消/删除只让子任务停在 todo 并派生 blocked 原因（`dependency`/`budget`/`runs`），**不自动 fail**；建边校验同文件夹/自环/环/重复
+   - 限额在 claim 事务内执行：父级 `max_concurrent_children` / `max_runs_per_child` / `token_budget`（token 按 token_usage 事实表 best-effort 累计，claim 前检查、不中途杀）；`auto_claim_next` 跳过被卡候选而非堵队列；done 落库时唤醒依赖方文件夹
+   - 授权：仅本会话创建的任务及其子任务；越权与不存在返回同一软拒绝文案；用户逃生口 = `work_task_dependency_remove`（命令 + 详情页依赖 chips）
+2. **WorkTask ↔ Delegation Session 稳定关联** —— ✅ 已落地（2026-09-27）：新表 `work_task_run`（每代一行：kind/status/resume_outcome/会话绑定/时长/token/verdict）+ 引擎 Retry/Return 严格续作 + `delegation_task.work_task_id` 归属
+   - 严格续作：anchor = 最近一条「记录的会话仍被其会话行持有」的运行；anchor 存在则用 `SessionRecoveryPolicy::Strict`（绝不 `session/new`），拒绝即记 `resume_failed` 事件 + 关行 `strict_failed` + 任务失败，**不建会话、不冷启动**；无 anchor（从未有过会话）记 `fresh_no_session`（不是冷重派）；用户显式「新会话重跑」记 `fresh_requested`
+   - Merge 生成保持 best-effort（机械操作、prompt 自含），但记录 `resume_outcome`（`resumed`/`fallback_cold`/`fresh_no_session`）
+   - 详情页「运行轮次」+「子智能体运行」两个区块；`resume_failed` 有专门横幅与「以新会话重跑」动作
+   - **相对原落点的刻意偏差**：任务运行**不**写进 `delegation_task` 账本，而是任务侧独立运行表 + `delegation_task.work_task_id` 归属 FK。原因：连接的 `delegation_task_id` 字段深度绑定委托生命周期（turn-complete 路由 broker、连接释放驱动账本 `mark_released`），任务运行借用它会污染路由与释放语义；账本的 NOT NULL parent 语义也与「引擎发起的任务运行」不匹配。一套账本一套指标的目标留到评测看板做 union 面时再收口
+
+验收证据：`/tmp/codeg-accept-phase2/`（`ACCEPTANCE.md` + 各场景 JSON；配方 `harness.sh` / `accept.sh`）—— 门控四项、严格续作与拒绝、真实 agent 拆分、依赖排序与解阻、子委托归属全部 PASS。门禁：Rust 五连（lib 4615 + 集成全绿）、`pnpm lint src` / `pnpm test`(7805) / `pnpm build`。
 
 ### 探索线（与第一/二阶段并行）：Jev 类判断模型做任务路由
 
