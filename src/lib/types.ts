@@ -1669,7 +1669,7 @@ export interface WorkTask {
   // Serialized from an opaque JSON column; guard against a null parse fallback.
   config: WorkTaskConfig | null
   status: WorkTaskStatus
-  /** agent_error | setup_error | verdict_blocked | interrupted */
+  /** agent_error | setup_error | verdict_blocked | interrupted | resume_failed */
   failure_reason: string | null
   last_error: string | null
   run_seq: number
@@ -1721,6 +1721,17 @@ export interface WorkTask {
   source_key?: string | null
   /** Source snapshot (url, title, numbers …); shape mirrors ForgeSourceMeta. */
   source_meta?: ForgeSourceMeta | null
+  /** Split parent (absent/null = top level). A split parent is itself a
+   *  top-level task: the hierarchy is capped at two levels. */
+  parent_id?: number | null
+  /** Per-parent orchestration limits (absent/null = no limit). Meaningful on
+   *  the parent row; informational on its children. */
+  max_concurrent_children?: number | null
+  max_runs_per_child?: number | null
+  token_budget?: number | null
+  /** Why this to-do cannot be claimed yet, derived at read time (present only
+   *  when actually blocked). */
+  blocked?: WorkTaskBlocked | null
   /** Latest agent_progress milestone OF THIS GENERATION — present on live
    *  (preparing/running/awaiting/merging) rows only. Scoped by run_seq, so a
    *  merge in flight never narrates the work round it is landing. */
@@ -1734,6 +1745,79 @@ export interface WorkTask {
   started_at: string | null
   settled_at: string | null
   finished_at: string | null
+}
+
+/** Why a to-do task cannot be claimed yet — derived at read time (never
+ *  stored); the engine re-derives the same conditions inside its claim
+ *  transaction. */
+export interface WorkTaskBlocked {
+  /** "dependency" | "budget" | "runs" */
+  reason: "dependency" | "budget" | "runs"
+  /** The unmet dependencies (the gate), in board order. */
+  dependencies?: WorkTaskDependencyRef[]
+  /** Human-readable detail (e.g. "3/3 runs used"), for the card tooltip. */
+  detail?: string | null
+}
+
+/** One dependency edge as the board renders it. A dependency is satisfied only
+ *  by a live `done` task. */
+export interface WorkTaskDependencyRef {
+  task_id: number
+  title: string
+  status: WorkTaskStatus
+}
+
+/** One execution generation of a work task (mirrors Rust WorkTaskRunInfo) —
+ *  the "rounds" list of the task detail. */
+export interface WorkTaskRun {
+  id: number
+  task_id: number
+  run_seq: number
+  /** fresh | retry | return | merge */
+  kind: string
+  /** running | settled | failed | canceled */
+  status: string
+  /** resumed | fresh_no_session | fresh_requested | fallback_cold | strict_failed */
+  resume_outcome?: string | null
+  resumed_from_run_seq?: number | null
+  agent_type?: string | null
+  conversation_id?: number | null
+  /** The agent-assigned session this run was bound to — the anchor a strict
+   *  continuation resumes. */
+  external_session_id?: string | null
+  working_dir?: string | null
+  effective_mode?: string | null
+  effective_model?: string | null
+  effective_reasoning_level?: string | null
+  started_at: string
+  finished_at?: string | null
+  duration_ms?: number | null
+  input_tokens?: number | null
+  output_tokens?: number | null
+  verdict?: string | null
+  /** agent_error | setup_error | verdict_blocked | interrupted | resume_failed */
+  error_code?: string | null
+}
+
+/** One delegation the task's agent made while executing (mirrors Rust
+ *  WorkTaskDelegationInfo; ledger rows linked by work_task_id). */
+export interface WorkTaskDelegation {
+  task_id: string
+  source_task_id?: string | null
+  agent_type?: string | null
+  /** running | completed | failed | canceled | interrupted */
+  status: string
+  task: string
+  child_conversation_id: number
+  created_at: string
+  updated_at: string
+  duration_ms?: number | null
+  effective_model?: string | null
+  effective_mode?: string | null
+  effective_reasoning_level?: string | null
+  input_tokens?: number | null
+  output_tokens?: number | null
+  error_code?: string | null
 }
 
 /** Provenance snapshot of a forge-triggered task (mirrors Rust ForgeSourceMeta). */

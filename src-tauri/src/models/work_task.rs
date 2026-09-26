@@ -76,6 +76,22 @@ pub struct WorkTaskInfo {
     /// Source snapshot (URL, title, account id …), parsed from the row's JSON.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_meta: Option<serde_json::Value>,
+    /// Split parent (`None` = top level). A split parent is itself a
+    /// top-level task: the service caps the hierarchy at two levels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<i32>,
+    /// Per-parent orchestration limits (`None` = no limit). Meaningful on the
+    /// parent row; informational on its children.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_children: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_runs_per_child: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<i64>,
+    /// Why this to-do cannot be claimed yet, DERIVED at read time by the
+    /// list/get commands (the row stores no block state). `None` = not blocked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<WorkTaskBlocked>,
     /// Latest `agent_progress` milestone OF THIS GENERATION (filled by `list`
     /// for live tasks only — the card's realtime progress line). Scoped by
     /// `run_seq`: a retry, a follow-up and a merge each start a new one, and
@@ -93,6 +109,113 @@ pub struct WorkTaskInfo {
     pub started_at: Option<DateTime<Utc>>,
     pub settled_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// Why a to-do task cannot be claimed yet — DERIVED at read time (never
+/// stored): the engine re-derives the same conditions inside its claim
+/// transaction, and the board renders this so a blocked card explains itself
+/// instead of looking stuck.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkTaskBlocked {
+    /// dependency | budget | runs
+    pub reason: String,
+    /// The unmet dependencies (the gate), in board order. Empty for the
+    /// budget / runs reasons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<WorkTaskDependencyRef>,
+    /// Human-readable detail (e.g. "3/3 runs used"), for the card's tooltip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// One dependency edge as the board renders it: the upstream task's id, title
+/// and current status. A dependency is satisfied only by a live `done` row.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkTaskDependencyRef {
+    pub task_id: i32,
+    pub title: String,
+    pub status: WorkTaskStatus,
+}
+
+/// One execution generation of a work task (wire mirror of the
+/// `work_task_run` row) — the task detail's "rounds" list.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkTaskRunInfo {
+    pub id: i32,
+    pub task_id: i32,
+    pub run_seq: i32,
+    /// fresh | retry | return | merge
+    pub kind: String,
+    /// running | settled | failed | canceled
+    pub status: String,
+    /// How the previous session was (or was not) continued: resumed |
+    /// fresh_no_session | fresh_requested | fallback_cold | strict_failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resumed_from_run_seq: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<i32>,
+    /// The agent-assigned session this run was bound to — the anchor a strict
+    /// continuation resumes. Shown so "same session across reworks" is
+    /// visible, not merely asserted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_reasoning_level: Option<String>,
+    pub started_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
+    /// agent_error | setup_error | verdict_blocked | interrupted | resume_failed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+/// One delegation the task's agent made while executing (ledger row linked by
+/// `delegation_task.work_task_id`), as the task detail renders it.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkTaskDelegationInfo {
+    pub task_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    /// running | completed | failed | canceled | interrupted
+    pub status: String,
+    pub task: String,
+    pub child_conversation_id: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_reasoning_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 /// One timeline entry of a task (append-only; see `work_task_event`).

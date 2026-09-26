@@ -241,6 +241,9 @@ async fn admit_on<C: ConnectionTrait>(
         terminal_report: Set(None),
         resume_binding: Set(binding_json),
         released: Set(false),
+        // Resolved by the runtime from the delegating parent conversation
+        // (a work task's current conversation) and stored for stability.
+        work_task_id: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
         // Known at admission (from the binding), so still-running rows already

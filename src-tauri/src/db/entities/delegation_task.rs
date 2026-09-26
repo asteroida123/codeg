@@ -24,6 +24,13 @@ pub struct Model {
     /// JSON [`ResumeBinding`](crate::db::service::delegation_task_service::ResumeBinding).
     pub resume_binding: String,
     pub released: bool,
+    /// The work task whose execution produced this delegation, when the
+    /// delegating parent conversation was running a work task. Resolved once
+    /// at admission and stored, so the link survives later session changes on
+    /// the task (a fresh-session rework repoints `work_task.conversation_id`).
+    /// `None` for ordinary chat delegations. Soft reference — `work_task`
+    /// soft-deletes and the ledger keeps its history either way.
+    pub work_task_id: Option<i32>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
     // ── Performance dashboard projections (upstream #724) ─────────────────

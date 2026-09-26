@@ -47,6 +47,9 @@ mod m20260831_000001_canvas_node_group_grid;
 mod m20260907_000001_canvas_node_path;
 mod m20260908_000001_delegation_task_ledger;
 mod m20260926_000001_delegation_metrics;
+mod m20260926_000002_work_task_orchestration;
+mod m20260926_000003_work_task_run;
+mod m20260926_000004_delegation_work_task_link;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -100,6 +103,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260907_000001_canvas_node_path::Migration),
             Box::new(m20260908_000001_delegation_task_ledger::Migration),
             Box::new(m20260926_000001_delegation_metrics::Migration),
+            Box::new(m20260926_000002_work_task_orchestration::Migration),
+            Box::new(m20260926_000003_work_task_run::Migration),
+            Box::new(m20260926_000004_delegation_work_task_link::Migration),
         ]
     }
 }

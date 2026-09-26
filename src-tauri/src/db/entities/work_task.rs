@@ -128,6 +128,24 @@ pub struct Model {
     /// Same discipline as `config`: replayed/displayed, never queried.
     #[sea_orm(column_type = "Text")]
     pub source_meta: Option<String>,
+    /// Split parent (`None` = top level). A split parent is itself a top-level
+    /// task — the service caps the hierarchy at two levels — so this never
+    /// chains into a tree. Soft reference; deleted parents leave the link in
+    /// place for history.
+    pub parent_id: Option<i32>,
+    /// The conversation whose agent created this row through an agent-facing
+    /// authoring tool. Scopes every later agent operation on the task
+    /// (split / start / cancel / list) to the conversation that owns it.
+    /// `None` = human-created, or created before the column existed.
+    pub created_by_conversation_id: Option<i32>,
+    /// Per-parent orchestration limits, read off the parent row only; `None`
+    /// = no limit. Concurrency counts the parent's active children, the run
+    /// ceiling bounds each child's generations, and the token budget is
+    /// checked against the token-usage facts of the parent and its children —
+    /// all enforced in the claim transaction, never mid-run.
+    pub max_concurrent_children: Option<i32>,
+    pub max_runs_per_child: Option<i32>,
+    pub token_budget: Option<i64>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
     pub started_at: Option<DateTimeUtc>,

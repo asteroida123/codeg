@@ -95,6 +95,11 @@ fn to_info(m: work_task::Model) -> WorkTaskInfo {
             .source_meta
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok()),
+        parent_id: m.parent_id,
+        max_concurrent_children: m.max_concurrent_children,
+        max_runs_per_child: m.max_runs_per_child,
+        token_budget: m.token_budget,
+        blocked: None, // stamped by the list/get commands (needs the edges + live statuses)
         latest_progress: None,
         compacting: false,
         created_at: m.created_at,
@@ -709,6 +714,11 @@ async fn insert_todo_row<C: ConnectionTrait>(
         source_kind: Set(source.map(|s| s.kind.clone())),
         source_key: Set(source.map(|s| s.key.clone())),
         source_meta: Set(source_meta),
+        parent_id: Set(None),
+        created_by_conversation_id: Set(None),
+        max_concurrent_children: Set(None),
+        max_runs_per_child: Set(None),
+        token_budget: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
         started_at: Set(None),

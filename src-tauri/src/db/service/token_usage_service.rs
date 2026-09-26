@@ -203,6 +203,34 @@ pub async fn fetch_facts(
     Ok(rows)
 }
 
+/// Total tokens recorded for the given conversations — the work-task
+/// budget / per-run cost read.
+///
+/// A conversation with no fact rows (yet) contributes 0: the token pipeline is
+/// best-effort and lags behind a live run, and inventing history to make a
+/// budget look tighter would be just as wrong as ignoring real spend.
+pub async fn total_tokens_for_conversations(
+    conn: &DatabaseConnection,
+    conversation_ids: &[i32],
+) -> Result<i64, DbError> {
+    if conversation_ids.is_empty() {
+        return Ok(0);
+    }
+    let total = token_usage_turn::Entity::find()
+        .select_only()
+        .column_as(
+            sea_orm::sea_query::Expr::col(token_usage_turn::Column::TotalTokens).sum(),
+            "total",
+        )
+        .filter(token_usage_turn::Column::ConversationId.is_in(conversation_ids.to_vec()))
+        .into_tuple::<Option<i64>>()
+        .one(conn)
+        .await?
+        .flatten()
+        .unwrap_or(0);
+    Ok(total)
+}
+
 /// Count the sessions the workspace list would show for this window — the
 /// number the status bar's session counter also reports when the window is
 /// unbounded.
@@ -763,6 +791,53 @@ mod tests {
             cache_read_tokens: 0,
             duration_ms: 100,
         }
+    }
+
+    #[tokio::test]
+    async fn total_tokens_sums_only_the_requested_conversations() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/tu-sum").await;
+        let a = seed_conversation(&db, folder, AgentType::ClaudeCode).await;
+        let b = seed_conversation(&db, folder, AgentType::Codex).await;
+        let c = seed_conversation(&db, folder, AgentType::Codex).await;
+
+        replace_conversation_facts(
+            &db.conn,
+            a,
+            at("2026-08-01T12:00:00Z"),
+            &[fact("t1", "2026-08-01T10:00:00Z", 100, 20)],
+        )
+        .await
+        .expect("a facts");
+        replace_conversation_facts(
+            &db.conn,
+            b,
+            at("2026-08-01T12:00:00Z"),
+            &[fact("t1", "2026-08-01T10:00:00Z", 30, 5)],
+        )
+        .await
+        .expect("b facts");
+
+        assert_eq!(
+            total_tokens_for_conversations(&db.conn, &[a])
+                .await
+                .expect("a only"),
+            120
+        );
+        // The factless conversation contributes nothing, and an empty
+        // selection short-circuits to 0 without a query.
+        assert_eq!(
+            total_tokens_for_conversations(&db.conn, &[a, b, c])
+                .await
+                .expect("all three"),
+            155
+        );
+        assert_eq!(
+            total_tokens_for_conversations(&db.conn, &[])
+                .await
+                .expect("empty"),
+            0
+        );
     }
 
     #[tokio::test]
