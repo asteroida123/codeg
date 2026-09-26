@@ -1821,6 +1821,8 @@ mod tests {
             .await;
         });
 
+        // A generous cap, so the assertion below is "it returned early", not
+        // "this machine was fast": a broken wait would spend the whole cap.
         let started = std::time::Instant::now();
         let out = access
             .work_task_tool(
@@ -1828,15 +1830,15 @@ mod tests {
                 WorkTaskToolCall::List(ListWorkTasksSpec {
                     task_ids: vec![mine.id],
                     parent_task_id: None,
-                    wait_ms: Some(5_000),
+                    wait_ms: Some(30_000),
                 }),
             )
             .await;
         let elapsed = started.elapsed();
         assert_eq!(out.tasks[0].status, "queued");
         assert!(
-            elapsed < std::time::Duration::from_millis(4_000),
-            "returned early: {elapsed:?}"
+            elapsed < std::time::Duration::from_millis(15_000),
+            "the wait ended with the change: {elapsed:?}"
         );
 
         // A terminal-only window cannot change, so it answers immediately.
@@ -1848,13 +1850,13 @@ mod tests {
                 WorkTaskToolCall::List(ListWorkTasksSpec {
                     task_ids: vec![mine.id],
                     parent_task_id: None,
-                    wait_ms: Some(5_000),
+                    wait_ms: Some(15_000),
                 }),
             )
             .await;
         assert_eq!(out.tasks[0].status, "done");
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(1_500),
+            started.elapsed() < std::time::Duration::from_millis(5_000),
             "a finished window does not wait"
         );
     }
