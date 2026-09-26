@@ -24,7 +24,8 @@ import {
   type DelegationPerformanceReport,
 } from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
-import { getAgentLabel, type AgentType } from "@/lib/custom-agents"
+import { getAgentLabel } from "@/lib/custom-agents"
+import type { AgentType } from "@/lib/types"
 
 function percent(rate: number): string {
   return `${Math.round(rate * 1000) / 10}%`
