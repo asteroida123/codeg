@@ -35,15 +35,24 @@
 
 ## 推进顺序
 
-### 第 0 步：ZCode × 委托链路实测（先于一切功能开发）
+### 第 0 步：ZCode × 委托链路实测 —— ✅ 已完成（2026-09-26，可进入第一阶段）
 
-合并 ≠ 可用。ZCode 进入委托线后需要实测三条链路：
+实测结论（server 模式 + HTTP API 驱动，证据存 `/tmp/codeg-accept-zcode-evidence/`）：
 
-| 链路 | 预期 | 风险 |
+| 链路 | 结果 | 要点 |
 | --- | --- | --- |
-| ZCode 作为子 agent 被委托 | `delegate_to_agent` → 首轮 TurnComplete → 账本落库 | 低（不依赖 ZCode 的 MCP） |
-| ZCode 子会话续作 | `continue_from_task_id` → 严格 resume 原 session | 中：adapter 的 session/resume 必须满足身份硬约束 |
-| ZCode 作为父 agent 委托他人 | 父会话挂 codeg-mcp → delegate_to_agent | **已知边界**：ZCode 0.16.5 后端 create 不 wire mcpServers（adapter 已前向兼容，等 ZCode 后端修复） |
+| ZCode 作为子 agent 被委托 | **PASS** | claude 父级 → delegate_to_agent → ZCode 子进程 35s 完成并正确作答，delegation_task 账本落库（含 resume_binding + config_fingerprint） |
+| continue_from_task_id 严格续作 | **PASS** | 同一 ZCode session 严格 resume（3 条历史 replay 去重）、新 task id、原任务终态不变；跨父续作被正确拒绝（not found for this parent），无幻影行、无静默新会话；父级误用旧 resume_delegation 被拒并自纠——协议引导按设计工作 |
+| ZCode 作为父 agent 委托他人 | **PASS（推翻旧边界）** | ~~0.16.5 不 wire mcpServers~~ 已不成立：ZCode 工具表挂上完整 codeg-mcp 工具集，ZCode→codex 委托端到端 15.5s 完成 |
+
+遗留前置项：
+
+1. **验收/构建配方修正**：`cargo build --no-default-features --bin codeg-server --bin codeg-mcp` —— companion 按"当前 exe 同目录"定位，只建 server 会静默用陈旧 companion（旧工具 schema，无 continue_from_task_id），这是链路 2 唯一踩过的坑
+2. **ZCode-as-parent 的真实阻断在 adapter 侧**（zcode-codeg-adapter 待修三项）：
+   - 权限请求风暴：一条 MCP 工具调用的 request_permission 未应答期间，adapter 每 2-10s 重发新 request_id 的重复请求（可排队 12-21 条），~185s 后后端以 E_FRAME 拒绝
+   - E_FRAME 后会话永久砖化：后续所有 prompt 5ms 内被同样拒绝，只能弃会话
+   - 默认 plan 模式且 connect 时 `preferredConfigValues:{mode:"build"}` 不生效（手工父会话无法直接调委托工具；委托产生的 ZCode 子级不受影响，agent_defaults 已给 build）
+3. 可选加固（codeg 侧，非 bug）：对同一 tool_call_id 的重复 pending permission 做合并/去重
 
 ### 第一阶段（#731 明确的第一阶段边界：能力发现 + 显式选择 + 可靠执行 + 数据积累）
 
