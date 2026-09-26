@@ -190,7 +190,9 @@ describe("task drawer blocked panel", () => {
       })
     )
     const chips = await screen.findAllByRole("listitem")
-    const labels = chips.map((chip) => within(chip).getByText(/#\d+/).textContent)
+    const labels = chips.map(
+      (chip) => within(chip).getByText(/#\d+/).textContent
+    )
     expect(labels).toEqual(["#11", "#12"])
   })
 })
