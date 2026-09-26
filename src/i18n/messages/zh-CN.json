@@ -52,6 +52,8 @@
       "science": "科学研究",
       "office_tools": "办公工具",
       "skill_packs": "技能包",
+      "collaboration": "协作",
+      "browser": "浏览器",
       "quick_messages": "快捷消息",
       "logs": "运行日志"
     }
@@ -239,6 +241,8 @@
     "enableProxy": "启用系统代理",
     "proxyAddress": "代理地址",
     "proxyHint": "支持 http(s)/socks5，示例：{example}。仅在启用系统代理时生效。",
+    "proxyBypass": "不走代理的地址",
+    "proxyBypassHint": "多个地址用英文逗号 <code>,</code> 分隔，不加空格，例如 <code>{example}</code>。<code>example.com</code> 匹配该域名，<code>.example.com</code> 匹配它的所有子域名，也可以填写 IP 地址。本机地址 <code>localhost,127.0.0.1,::1</code> 始终直连，无需填写。该列表作为环境变量 NO_PROXY 生效。",
     "save": "保存",
     "saving": "保存中...",
     "proxyRequired": "启用代理时必须填写代理地址",
@@ -298,6 +302,8 @@
     "rollbackSuccess": "已回滚到上一个版本，正在重新加载……",
     "rollbackFailed": "回滚失败，请检查服务器日志。",
     "updateErrors": {
+      "permissionDenied": "无法写入 {path}，因此无法就地安装更新。请以管理员权限手动更新，或检查安装目录权限。",
+      "targetWriteFailed": "无法写入 {path}，因此无法就地安装更新：{reason}",
       "sourceUnavailable": "无法连接更新源，请检查网络或代理设置后重试。",
       "network": "网络连接异常，请检查网络或代理设置后重试。",
       "downloadFailed": "下载更新包失败，请稍后重试。",
@@ -862,7 +868,11 @@
       "authNotInstalled": "cursor-agent 未安装",
       "authLoggedIn": "已登录",
       "authNotLoggedIn": "未登录",
+      "authUnverified": "已登录（凭据未通过校验）",
+      "authUnverifiedHint": "cursor-agent 里仍存有登录凭据，但刚才无法用它访问 Cursor——通常是登录已过期。在重新登录之前，会话都会报 “Authentication required”；该 CLI 无法自动刷新浏览器登录。",
+      "authUnverifiedHintApiKey": "cursor-agent 里存了 API Key，但 Cursor 刚刚拒绝了它——通常是密钥已吊销、已过期或填错。在下方保存一个可用的密钥之前，会话都会以「Authentication required」失败。",
       "loginHint": "在终端运行以下命令登录 Cursor 账号（会打开浏览器），完成后点刷新：",
+      "loginHintRemote": "请在安装了 cursor-agent 的 codeg 主机上运行，而不是本机，完成后点刷新。该主机通常没有可打开的浏览器，所以要带上 NO_OPEN_BROWSER=1 运行——它会改为打印一个登录链接，你在自己的浏览器里打开即可。无人值守的服务器请把上方的方式改为 API Key。",
       "apiKeyLabel": "Cursor API 密钥",
       "apiKeyPlaceholder": "在 cursor.com/dashboard 获取",
       "apiKeyHint": "CURSOR_API_KEY —— Cursor Dashboard 的账号密钥，在无头/服务器环境下替代浏览器登录。不是第三方或 OpenAI 密钥。",
@@ -1706,9 +1716,9 @@
   "GeneralSettings": {
     "loading": "加载中...",
     "sectionTitle": "常规",
-    "sectionDescription": "集中管理默认终端、渲染加速、通知与提示音以及多智能体协同等通用偏好。",
+    "sectionDescription": "集中管理默认终端、渲染加速、关闭行为、通知与提示音等通用偏好。",
     "terminalTitle": "默认终端",
-    "terminalDescription": "选择从终端栏或文件树打开新终端标签页时使用的 Shell。智能体请求 codeg 代为执行整条命令行时也会使用它。",
+    "terminalDescription": "选择 codeg 打开新终端标签页、以及代智能体执行整条命令行时使用的 Shell。自带 Shell 的智能体（如 Codex、Claude Code）在自己进程内执行命令，不受此设置影响。",
     "terminalSystemDefault": "系统默认",
     "terminalPowerShell7": "PowerShell 7 (pwsh)",
     "terminalWindowsPowerShell": "Windows PowerShell",
@@ -1731,6 +1741,10 @@
     "restartNow": "立即重启",
     "restartFailed": "重启失败：{message}",
     "loadFailed": "加载失败：{message}"
+  },
+  "CollaborationSettings": {
+    "sectionTitle": "协作",
+    "sectionDescription": "智能体之间如何协同，以及它们能在会话中动用 codeg 的哪些工具。"
   },
   "LoginPage": {
     "documentTitle": "登录 - codeg",
@@ -2804,6 +2818,11 @@
       "linkedFolder": "关联的文件夹",
       "moreActions": "更多操作",
       "copyPath": "复制路径",
+      "copy": "复制",
+      "copyRelativePath": "相对路径",
+      "copyAbsolutePath": "绝对路径",
+      "copyFileItself": "文件本身",
+      "copyDirectoryItself": "文件夹本身",
       "upload": "上传文件/目录",
       "download": "下载文件",
       "downloadAsZip": "下载为 ZIP",
@@ -2841,7 +2860,9 @@
         "downloadFailed": "下载 {name} 失败",
         "downloadSaved": "已下载 {name}",
         "pathCopied": "已复制路径",
-        "copyPathFailed": "复制路径失败"
+        "copyPathFailed": "复制路径失败",
+        "fileCopied": "已复制 {name}",
+        "copyFileFailed": "复制 {name} 失败"
       },
       "createDialog": {
         "newFile": "新建文件",
@@ -2989,8 +3010,6 @@
           "openAgentsSettings": "打开 Agents 管理",
           "retry": "重试"
         },
-        "agentsSetupHint": "点击前往设置 > Agents 管理安装。",
-        "withSetupHint": "{message}\n提示：{hint}",
         "blocked": {
           "missingConfig": "无法读取当前 Agent 配置。",
           "disabled": "{agent} 已在 Agents 管理中禁用，请先启用后再连接。",
@@ -3013,16 +3032,20 @@
           "turnFailedMaxTurnRequests": "{agent} 已达到本轮回复允许的最大请求次数。",
           "turnFailedUnknown": "{agent} 以未知的停止原因结束了本轮回复。",
           "turnFailedAuthRequired": "{agent} 需要你重新登录后才能执行本轮回复。请在设置中登录，然后重新发送这条消息。",
+          "agentAuthRequired": "{agent} 无法建立会话：没有可用的登录凭据。请在 设置 → 智能体 → {agent} 中重新登录，然后重新打开该会话。",
           "grokModelSwitchIncompatibleAgent": "{agent} 无法在已有对话中切换到该模型，请新建会话以使用它。",
+          "setModeFailed": "{agent} 切换模式失败。",
+          "setConfigOptionFailed": "{agent} 未能应用该设置。",
+          "goalControlFailed": "{agent} 未能更新目标。",
+          "imageDropped": "{agent} 没有收到一张附带的图片。",
+          "sessionLoadFallback": "{agent} 无法恢复之前的会话，已改为开始新会话，之前的上下文不再可用。",
           "turnFailedEmpty": "{agent} 本轮没有产生任何回复就结束了。",
           "turnFailedEmptyProtocol": "{agent} 本轮的输出 codeg 无法解析，可能是代理版本与协议不匹配。",
-          "turnFailedEmptyMetadata": "{agent} 本轮只收到状态更新（计划 / 模式 / 用量），没有收到任何回复。",
-          "detailsInAlerts": "在状态栏的「告警」中展开详情，可查看代理输出。"
+          "turnFailedEmptyMetadata": "{agent} 本轮只收到状态更新（计划 / 模式 / 用量），没有收到任何回复。"
         },
         "unableReadAgentConfig": "无法读取 Agent 配置：{message}",
         "connectFailedTitle": "{agent} 连接失败",
         "toolFallbackTitle": "工具",
-        "eventErrorTitle": "Agent 错误",
         "notificationTurnComplete": "{agent} 已完成响应",
         "notificationError": "{agent} 错误：{message}",
         "notificationQuestion": "{agent} 正在等你回答",
@@ -3039,7 +3062,8 @@
           "lineNoErrorWithDelay": "{retry}，{delay}",
           "httpStatus": "（HTTP {status}）"
         },
-        "configOptionAdjusted": "{agent} 把{option}设成了 {actual}，而不是 {requested}"
+        "configOptionAdjusted": "{agent} 把{option}设成了 {actual}，而不是 {requested}",
+        "noticeTitle": "{agent}：{title}"
       },
       "connectionLifecycle": {
         "tasks": {
@@ -3495,6 +3519,7 @@
             "child_empty": "子代理无响应",
             "child_auth_required": "子智能体需登录",
             "interrupted": "已中断，结果未知",
+            "child_rejected": "子代理拒绝该请求",
             "child_unknown": "子代理未知错误",
             "unknown": "未知任务"
           }
@@ -3765,7 +3790,6 @@
         "reconnecting": "正在重连…",
         "reconnectDisabledDuringTurn": "当前回合结束后可重连",
         "dismiss": "忽略",
-        "reconnectFailed": "重连会话失败",
         "applied": "新配置已应用"
       },
       "piProjectTrust": {
@@ -3819,6 +3843,7 @@
         "compacted": "上下文已压缩",
         "compactedTokens": "上下文已压缩 · {before} → {after} tokens",
         "failed": "上下文压缩失败",
+        "summary": "摘要",
         "triggerManual": "手动触发",
         "triggerAutomatic": "自动触发"
       },
@@ -4221,7 +4246,7 @@
     "agentTypeRequired": "请选择智能体类型。",
     "agentTypeImmutableHint": "智能体类型创建后不可修改。",
     "model": "模型",
-    "modelPlaceholderCodex": "gpt-5.6-sol / gpt-5.5",
+    "modelPlaceholderCodex": "gpt-6-sol / gpt-6-luna",
     "modelPlaceholderGemini": "gemini-3-pro-preview",
     "claudeMainModel": "主模型",
     "claudeReasoningModel": "推理模型（思考）",
@@ -4950,8 +4975,8 @@
     },
     "browserEval": {
       "label": "在内置浏览器中执行代码",
-      "short": "在你共享的页面上运行它自己写的代码，每一段都要你批准。",
-      "hint": "允许智能体在你共享的页面上运行它自己写的 JavaScript。默认关闭，并且需要先打开上面那个开关。每一段代码都会先拿给你看、由你逐次批准——没有办法让它自动通过。"
+      "short": "在你共享的页面上运行它自己写的代码，默认不询问。",
+      "hint": "允许智能体在你共享的页面上运行它自己写的 JavaScript。默认关闭，并且需要先打开上面那个开关。打开它就意味着代码不经询问直接运行，所以决定权就在这个开关上；如果想逐段过目，可在「设置 → 内置浏览器」里改成每次都问你。"
     },
     "automations": {
       "label": "创建自动化",
@@ -5025,6 +5050,7 @@
   "BrowserSettings": {
     "title": "内置浏览器",
     "description": "从会话、工具结果和终端打开的网页可以作为标签页显示在文件旁边，而不必离开应用。",
+    "descriptionWeb": "在浏览器会话里，网页都在你正在用的浏览器中打开；例外是跑在 codeg 主机上的服务器，它会被转发成这里的一个标签页。以下是仍然生效的设置。",
     "defaultTargetTitle": "链接在哪里打开",
     "defaultTargetHint": "按来源分别设置。按住 ⌘/Ctrl 点击链接可临时使用另一种方式。",
     "sourceTranscript": "会话消息",
@@ -5064,6 +5090,7 @@
     "downloadsHint": "网页下载的文件保存在 {dir}。不会自动打开，也不会覆盖已有文件。",
     "rulesTitle": "站点规则",
     "rulesHint": "按站点设定：始终用内置浏览器、始终用系统浏览器，或阻止。模式可以是主机名、*.example.com 或 *，可选加 :端口；最具体的匹配生效。",
+    "rulesHintWeb": "按站点设定：阻止。在浏览器会话里，网页在哪里打开没有可选项。模式可以是主机名、*.example.com 或 *，可选加 :端口；最具体的匹配生效。",
     "serviceOpenTitle": "本机服务",
     "serviceOpenHint": "终端里启动的服务打印出地址时，在浏览器标签页中打开它。只认本机地址，且必须确认那个端口上真的有程序在监听。",
     "serviceOpenOff": "什么都不做",
@@ -5085,6 +5112,10 @@
     "agentGrantRead": "读取权限",
     "agentGrantControl": "读取并操作权限",
     "agentGrantNone": "不共享",
+    "evalApprovalTitle": "在页面上运行代码",
+    "evalApprovalHint": "智能体要在共享为「读取并操作权限」的页面上运行它自己写的 JavaScript 时怎么办。默认直接运行，不再询问——决定权在「在内置浏览器中执行代码」那个开关（默认关闭，要你亲手打开）和页面的共享权限上；每一次运行都记在那个标签页的智能体活动里。选「每次都问我」则会把每一段代码原样摆在你面前，等你回答。",
+    "evalApprovalAsk": "每次都问我",
+    "evalApprovalSilent": "静默执行",
     "terminalMenuTitle": "终端链接菜单",
     "terminalMenuHint": "点击终端里的链接时先弹出一个小菜单（内置浏览器、系统浏览器、复制链接），而不是直接打开。⌘/Ctrl 点击仍会直接打开。",
     "htmlPreviewTitle": "HTML 文件预览",
@@ -6240,6 +6271,7 @@
       "ownedWindow": "该页面显示在独立窗口中。",
       "ownedWindowShow": "显示窗口",
       "remoteBanner": "经由 {host} 打开",
+      "remoteBannerDown": "与 {host} 的连接已断开，下一次请求时会重新连接。",
       "navigationBlocked": "已阻止跳转：{host}",
       "navigationBlockedRule": "被站点规则阻止",
       "navigationBlockedScheme": "此类地址不能在这里打开",
@@ -6253,7 +6285,17 @@
       "agentGrantLost": "共享已结束：页面离开了 {origin}",
       "agentGrantLostShare": "也共享 {origin}",
       "agentGrantReplaced": "共享已结束：现在是另一个程序在 {origin} 上提供服务",
-      "agentGrantReplacedShare": "仍然共享"
+      "agentGrantReplacedShare": "仍然共享",
+      "errorRemoteRefused": "远端主机上没有程序在监听这个地址",
+      "errorRemoteRefusedHint": "{host} 拒绝了连接。请确认这个地址背后的服务在那台机器上正在运行。",
+      "errorRemoteUnreachable": "远端主机无法访问这个地址",
+      "errorRemoteUnreachableHint": "从 {host} 看，这个名字无法解析，或者没有到达它的路由。",
+      "errorRemoteNotAllowed": "远端服务器不允许浏览器访问这个地址",
+      "errorRemoteNotAllowedHint": "{host} 上的 codeg-server 只允许浏览器隧道访问私网地址（CODEG_BROWSER_TUNNEL=private）。",
+      "errorRemoteTimeout": "远端主机连接超时",
+      "errorRemoteTimeoutHint": "{host} 没有在限定时间内得到这个地址的响应。那边的服务可能很忙，或被防火墙挡住了。",
+      "errorTunnelDown": "与远端主机的连接已断开",
+      "errorTunnelDownHint": "通往 {host} 的隧道目前无法传输。等它恢复可达后再重试。"
     },
     "tab": {
       "untitled": "新标签页"
@@ -6273,7 +6315,22 @@
       "copied": "已复制地址",
       "unreachableTitle": "无法访问端口桥",
       "unreachableHint": "codeg 服务器把这个页面放在 {origin}，但你的浏览器访问不到它。请开放该端口（见 CODEG_BRIDGE_PORTS）或设置 CODEG_BRIDGE_PUBLIC_HOST；如果 codeg 通过 HTTPS 提供服务，端口桥也需要 HTTPS。",
+      "unreachableHostHint": "codeg 服务端把这个页面放在了 {origin}，但你的浏览器访问不到。这个主机名需要解析到 codeg 服务端，并且能穿过前面的反向代理——也就是一条泛域名 DNS 记录加一个泛域名虚拟主机（见 CODEG_BRIDGE_HOST_PATTERN）。",
       "errorTitle": "无法在这里显示此页面"
+    },
+    "remote": {
+      "title": "该地址在 {host} 上",
+      "titleUnnamed": "该地址在远端主机上",
+      "description": "它指向这个工作区所在的机器，而不是这台电脑。",
+      "copyAddress": "复制地址",
+      "copied": "已复制地址",
+      "tryHost": "尝试 {host}",
+      "tryHostHint": "在这台电脑的标签页中打开 {address}。前提是那边的页面监听了所有网络接口，并且这台电脑能访问该端口。",
+      "openHere": "在这台电脑上打开",
+      "openHereHint": "在这台电脑的标签页中打开该地址。前提是这台电脑也在同一个网络里。",
+      "retry": "重试",
+      "connecting": "正在经由 {host} 连接…",
+      "connectingUnnamed": "正在经由远端主机连接…"
     },
     "download": {
       "started": "正在下载…",
@@ -6330,6 +6387,7 @@
       "shareControl": "读取并操作权限",
       "levelDefault": "默认",
       "notShareable": "此页面没有可共享给智能体的网址",
+      "remoteWindow": "远程工作区的智能体运行在它的主机上，无法使用这台电脑的浏览器",
       "shared": "已共享",
       "sharedControl": "已共享 · 可操作",
       "sharedWith": "智能体可读取 {origin}",
@@ -6412,7 +6470,7 @@
         "description": "有智能体想在这个页面上运行 JavaScript。你在 {site} 上能读取和改动的一切，它都能。",
         "descriptionWithTitle": "有智能体想在「{title}」上运行 JavaScript。你在 {site} 上能读取和改动的一切，它都能。",
         "codeLabel": "它要运行的代码",
-        "everyTime": "每一段代码都会再问你一次——批准这一段不等于批准下一段。",
+        "everyTime": "每一段代码都会再问你一次——批准这一段不等于批准下一段。问不问由「设置 → 内置浏览器」决定。",
         "allow": "运行这一次",
         "deny": "不要运行"
       }
@@ -6423,6 +6481,7 @@
       "noConversation": "先打开一个对话，才能把页面发过去",
       "pickElement": "选择一个元素…",
       "screenshot": "发送一张截图",
+      "markUp": "标注一张截图…",
       "consoleErrors": "发送控制台报错",
       "consoleClean": "这个页面没有出错",
       "picking": "选择中…",
@@ -6433,9 +6492,20 @@
       "noConsoleErrors": "这个页面没有打印过报错",
       "chipElement": "页面元素",
       "chipScreenshot": "页面截图",
+      "chipMarkedScreenshot": "带标注的截图",
       "chipConsole": "{count, plural, other {# 条控制台报错}}",
       "gone": "那个对话已经关掉了",
-      "consoleErrorsCount": "{count, plural, other {发送 # 条控制台报错}}"
+      "consoleErrorsCount": "{count, plural, other {发送 # 条控制台报错}}",
+      "markupTitle": "标注截图",
+      "markupTools": "绘制工具",
+      "markupBox": "方框",
+      "markupArrow": "箭头",
+      "markupUndo": "撤销",
+      "markupClear": "清除",
+      "markupHint": "在图上拖动来画。每个标注都带编号，消息里可以直接用编号指代。",
+      "markupCount": "{count, plural, other {# 个标注}}",
+      "markupCancel": "取消",
+      "markupSend": "加入对话"
     }
   },
   "browser": {
@@ -6447,6 +6517,16 @@
     "inspector": {
       "error": {
         "switchedOff": "这个标签页是在网页检查器关闭时打开的。请在浏览器设置里打开它，然后重新打开该页面。"
+      }
+    },
+    "remote": {
+      "error": {
+        "unavailable": "在内置浏览器中打开远端主机的地址需要 macOS 14 或更高版本。",
+        "unsupported": "远端的 codeg-server 版本过旧，无法转发浏览器流量。更新它之后才能在这里打开它的地址。",
+        "disabled": "远端的 codeg-server 关闭了浏览器隧道（CODEG_BROWSER_TUNNEL）。",
+        "unreachable": "无法连接远端 codeg-server 的浏览器隧道（{reason}）。",
+        "bypassed": "这台电脑的浏览器引擎会让部分地址绕过隧道，为避免从这台电脑加载，远端主机的页面不会打开。",
+        "probeFailed": "内置浏览器无法确认它能通过隧道访问远端主机。请稍后重试。"
       }
     }
   }

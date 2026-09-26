@@ -6,6 +6,9 @@ const mocks = vi.hoisted(() => ({
   browserClearData: vi.fn(),
   browserRemoveProfile: vi.fn(),
   browserCapabilitiesNow: vi.fn(),
+  /** Which runtime the page thinks it is in; a box so the mock reads it at
+   *  call time rather than closing over the value it had when hoisted. */
+  desktop: { value: true },
   toast: { success: vi.fn(), error: vi.fn() },
 }))
 
@@ -14,32 +17,36 @@ vi.mock("@/lib/browser/browser-api", () => ({
   browserRemoveProfile: mocks.browserRemoveProfile,
   browserCapabilitiesNow: mocks.browserCapabilitiesNow,
 }))
-vi.mock("@/lib/platform", () => ({ isDesktop: () => true }))
+vi.mock("@/lib/platform", () => ({ isDesktop: () => mocks.desktop.value }))
 vi.mock("sonner", () => ({ toast: mocks.toast }))
 
-import { BrowserSettingsSection } from "./browser-settings"
+import { BrowserSettings } from "./browser-settings"
 import enMessages from "@/i18n/messages/en.json"
 import {
   getBrowserPrefs,
   resetBrowserPrefsForTests,
   setBrowserDefaultAgentGrant,
+  setBrowserEvalApproval,
+  setBrowserHostRules,
   setBrowserNewTabProfile,
   setBrowserProfiles,
   setBrowserServiceAutoOpen,
   setDefaultLinkTarget,
 } from "@/lib/browser/browser-prefs"
 
-function renderSection() {
-  return render(
-    <NextIntlClientProvider locale="en" messages={enMessages}>
-      <BrowserSettingsSection />
-    </NextIntlClientProvider>
-  )
-}
-
-/** The section arrives folded; every knob lives under the heading. */
-function expandSection() {
-  fireEvent.click(screen.getByRole("button", { name: "Built-in browser" }))
+/** Awaited, because the page asks for the browser capabilities on mount: a
+ *  synchronous render would land that answer's state update after the test
+ *  body had already finished, outside `act`. */
+async function renderSection() {
+  let result!: ReturnType<typeof render>
+  await act(async () => {
+    result = render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <BrowserSettings />
+      </NextIntlClientProvider>
+    )
+  })
+  return result
 }
 
 function capabilitiesWith(proxy: {
@@ -60,6 +67,7 @@ function capabilitiesWith(proxy: {
     profiles: true,
     signInUserAgent: true,
     ownedWindowControls: false,
+    remoteEgress: false,
     policy: { enabled: true, managedRules: [], managedSource: null },
   }
 }
@@ -72,11 +80,13 @@ function capabilitiesWithoutProfiles() {
     profiles: false,
     signInUserAgent: false,
     ownedWindowControls: false,
+    remoteEgress: false,
   }
 }
 
 beforeEach(() => {
   resetBrowserPrefsForTests()
+  mocks.desktop.value = true
   mocks.browserClearData.mockReset()
   mocks.browserRemoveProfile.mockReset()
   mocks.browserCapabilitiesNow.mockReset()
@@ -87,14 +97,9 @@ beforeEach(() => {
   mocks.toast.error.mockReset()
 })
 
-describe("BrowserSettingsSection", () => {
-  it("arrives folded and shows one picker per link source once open", () => {
-    renderSection()
-    expect(
-      screen.queryByRole("combobox", { name: "Conversation messages" })
-    ).not.toBeInTheDocument()
-
-    expandSection()
+describe("BrowserSettings", () => {
+  it("shows one picker per link source", async () => {
+    await renderSection()
     for (const source of [
       "Conversation messages",
       "Tool results",
@@ -115,9 +120,8 @@ describe("BrowserSettingsSection", () => {
     ).toHaveTextContent("Automatic")
   })
 
-  it("adds, validates and removes site rules, writing the preference at once", () => {
-    renderSection()
-    expandSection()
+  it("adds, validates and removes site rules, writing the preference at once", async () => {
+    await renderSection()
     expect(screen.getByText("No rules yet.")).toBeInTheDocument()
 
     const pattern = screen.getByRole("textbox", { name: "Site pattern" })
@@ -166,8 +170,7 @@ describe("BrowserSettingsSection", () => {
         managedSource: "/etc/codeg/policy.json",
       },
     })
-    renderSection()
-    expandSection()
+    await renderSection()
     expect(await screen.findByText("*.internal.example")).toBeInTheDocument()
     expect(
       screen.getByText(/turned off by your administrator/)
@@ -185,9 +188,8 @@ describe("BrowserSettingsSection", () => {
   // on its own: a tab opening by itself should be something a person turned
   // on. The trigger shows the LISTED item for the current value, so a mode
   // that reads back is a mode the picker offers.
-  it("offers all three answers for a local server, notifying by default", () => {
-    renderSection()
-    expandSection()
+  it("offers all three answers for a local server, notifying by default", async () => {
+    await renderSection()
     const mode = () => screen.getByRole("combobox", { name: "Local servers" })
     expect(mode()).toHaveTextContent("Notify me")
     act(() => setBrowserServiceAutoOpen("open"))
@@ -202,9 +204,8 @@ describe("BrowserSettingsSection", () => {
   // until the page's own control is used. The trigger renders the text of the
   // LISTED item for the current value, so a level that reads back is a level
   // the picker offers.
-  it("offers all three sharing defaults, including handing nothing over", () => {
-    renderSection()
-    expandSection()
+  it("offers all three sharing defaults, including handing nothing over", async () => {
+    await renderSection()
     const level = () =>
       screen.getByRole("combobox", { name: "Default sharing level" })
     expect(level()).toHaveTextContent("Read and act")
@@ -215,9 +216,25 @@ describe("BrowserSettingsSection", () => {
     expect(getBrowserPrefs().defaultAgentGrant).toBe("none")
   })
 
-  it("persists the background-unload switch, which is off by default", () => {
-    renderSection()
-    expandSection()
+  // Running without asking is what an installation does until someone says
+  // otherwise, and this row is where they find that out: a person who never
+  // opens it should still have read the truth in the hint beside it, so the
+  // trigger has to show the default as the default.
+  it("runs code without asking until the dialog is asked for", async () => {
+    await renderSection()
+    const policy = () =>
+      screen.getByRole("combobox", { name: "Running code on a page" })
+    expect(policy()).toHaveTextContent("Run without asking")
+    act(() => setBrowserEvalApproval("ask"))
+    expect(policy()).toHaveTextContent("Ask me every time")
+    expect(getBrowserPrefs().evalApproval).toBe("ask")
+    act(() => setBrowserEvalApproval("silent"))
+    expect(policy()).toHaveTextContent("Run without asking")
+    expect(getBrowserPrefs().evalApproval).toBe("silent")
+  })
+
+  it("persists the background-unload switch, which is off by default", async () => {
+    await renderSection()
     const toggle = screen.getByLabelText("Unload background tabs")
     expect(toggle).not.toBeChecked()
 
@@ -229,9 +246,8 @@ describe("BrowserSettingsSection", () => {
     expect(getBrowserPrefs().suspendBackgroundTabs).toBe(false)
   })
 
-  it("persists the terminal link-menu switch, which is off by default", () => {
-    renderSection()
-    expandSection()
+  it("persists the terminal link-menu switch, which is off by default", async () => {
+    await renderSection()
     const toggle = screen.getByLabelText("Terminal link menu")
     expect(toggle).not.toBeChecked()
 
@@ -244,8 +260,7 @@ describe("BrowserSettingsSection", () => {
   })
 
   it("persists the HTML preview engine switch, on by default", async () => {
-    renderSection()
-    expandSection()
+    await renderSection()
     const toggle = screen.getByLabelText("HTML file previews")
     expect(toggle).toBeChecked()
     await waitFor(() => expect(toggle).not.toBeDisabled())
@@ -265,17 +280,16 @@ describe("BrowserSettingsSection", () => {
       profiles: false,
       signInUserAgent: false,
       ownedWindowControls: false,
+      remoteEgress: false,
     })
-    renderSection()
-    expandSection()
+    await renderSection()
     await waitFor(() =>
       expect(screen.getByLabelText("HTML file previews")).toBeDisabled()
     )
   })
 
-  it("persists the inspector switch and follows a change made elsewhere", () => {
-    renderSection()
-    expandSection()
+  it("persists the inspector switch and follows a change made elsewhere", async () => {
+    await renderSection()
 
     // It starts on, so the press turns it off — and that is the state worth
     // persisting: it is the one that differs from the default.
@@ -301,8 +315,7 @@ describe("BrowserSettingsSection", () => {
       capabilitiesWithoutProfiles()
     )
     mocks.browserClearData.mockResolvedValue(undefined)
-    renderSection()
-    expandSection()
+    await renderSection()
 
     fireEvent.click(await screen.findByRole("button", { name: "Clear…" }))
     expect(mocks.browserClearData).not.toHaveBeenCalled()
@@ -320,8 +333,7 @@ describe("BrowserSettingsSection", () => {
 
   it("lists the profiles with the default first and adds one by name", async () => {
     setBrowserProfiles([{ id: "p-work", name: "Work" }])
-    renderSection()
-    expandSection()
+    await renderSection()
     // The list appears once the backend says profiles exist here.
     expect(
       await screen.findByRole("button", { name: "Clear browsing data of Work" })
@@ -368,8 +380,7 @@ describe("BrowserSettingsSection", () => {
   it("clears one profile's data from its row", async () => {
     setBrowserProfiles([{ id: "p-work", name: "Work" }])
     mocks.browserClearData.mockResolvedValue(undefined)
-    renderSection()
-    expandSection()
+    await renderSection()
     fireEvent.click(
       await screen.findByRole("button", { name: "Clear browsing data of Work" })
     )
@@ -386,8 +397,7 @@ describe("BrowserSettingsSection", () => {
     setBrowserProfiles([{ id: "p-work", name: "Work" }])
     setBrowserNewTabProfile("p-work")
     mocks.browserRemoveProfile.mockResolvedValue(undefined)
-    renderSection()
-    expandSection()
+    await renderSection()
     fireEvent.click(
       await screen.findByRole("button", { name: "Delete profile Work" })
     )
@@ -409,8 +419,7 @@ describe("BrowserSettingsSection", () => {
 
   it("closes a delete dialog whose profile vanished meanwhile", async () => {
     setBrowserProfiles([{ id: "p-work", name: "Work" }])
-    renderSection()
-    expandSection()
+    await renderSection()
     fireEvent.click(
       await screen.findByRole("button", { name: "Delete profile Work" })
     )
@@ -430,8 +439,7 @@ describe("BrowserSettingsSection", () => {
   it("keeps a profile the backend could not delete", async () => {
     setBrowserProfiles([{ id: "p-work", name: "Work" }])
     mocks.browserRemoveProfile.mockRejectedValue(new Error("store in use"))
-    renderSection()
-    expandSection()
+    await renderSection()
     fireEvent.click(
       await screen.findByRole("button", { name: "Delete profile Work" })
     )
@@ -449,8 +457,7 @@ describe("BrowserSettingsSection", () => {
   })
 
   it("persists the sign-in user-agent switch, on by default, where supported", async () => {
-    renderSection()
-    expandSection()
+    await renderSection()
     const toggle = await screen.findByLabelText("Google sign-in compatibility")
     expect(toggle).toBeChecked()
     fireEvent.click(toggle)
@@ -464,8 +471,7 @@ describe("BrowserSettingsSection", () => {
     mocks.browserCapabilitiesNow.mockResolvedValue(
       capabilitiesWithoutProfiles()
     )
-    renderSection()
-    expandSection()
+    await renderSection()
     expect(
       await screen.findByRole("button", { name: "Clear…" })
     ).toBeInTheDocument()
@@ -477,7 +483,7 @@ describe("BrowserSettingsSection", () => {
     ).not.toBeInTheDocument()
   })
 
-  it("shows the proxy browser tabs use, fetched when the section opens", async () => {
+  it("shows the proxy browser tabs use, fetched when the page opens", async () => {
     mocks.browserCapabilitiesNow.mockResolvedValue(
       capabilitiesWith({
         url: "http://127.0.0.1:7890",
@@ -485,9 +491,11 @@ describe("BrowserSettingsSection", () => {
         reason: null,
       })
     )
-    renderSection()
-    expect(mocks.browserCapabilitiesNow).not.toHaveBeenCalled()
-    expandSection()
+    await renderSection()
+    // Read on every visit rather than once per app run: the proxy it reports
+    // is set on another settings page, so a cached answer would go stale the
+    // moment the user changed it and came back.
+    expect(mocks.browserCapabilitiesNow).toHaveBeenCalled()
     expect(
       await screen.findByText("Using http://127.0.0.1:7890")
     ).toBeInTheDocument()
@@ -502,8 +510,7 @@ describe("BrowserSettingsSection", () => {
         reason: "restart codeg for browser tabs to use the new proxy",
       })
     )
-    const { unmount } = renderSection()
-    expandSection()
+    const { unmount } = await renderSection()
     expect(
       await screen.findByText("Using socks5://10.0.0.1:1080")
     ).toBeInTheDocument()
@@ -517,8 +524,7 @@ describe("BrowserSettingsSection", () => {
         reason: "the built-in browser cannot use a https:// proxy",
       })
     )
-    renderSection()
-    expandSection()
+    await renderSection()
     expect(
       await screen.findByText(/not one browser tabs can use/)
     ).toBeInTheDocument()
@@ -529,8 +535,7 @@ describe("BrowserSettingsSection", () => {
       capabilitiesWithoutProfiles()
     )
     mocks.browserClearData.mockRejectedValue(new Error("WebKit said no"))
-    renderSection()
-    expandSection()
+    await renderSection()
 
     fireEvent.click(await screen.findByRole("button", { name: "Clear…" }))
     fireEvent.click(screen.getByRole("button", { name: "Clear" }))
@@ -542,5 +547,88 @@ describe("BrowserSettingsSection", () => {
     expect(
       screen.getByRole("heading", { name: "Clear browsing data?" })
     ).toBeInTheDocument()
+  })
+})
+
+/**
+ * The workbench in a browser has no browser engine to embed, so almost all of
+ * this page is the desktop's. Three settings are not: they decide something
+ * there too and this page is the only place they can be set — which is why it
+ * renders in both runtimes instead of being dropped in one.
+ */
+describe("BrowserSettings in a browser session", () => {
+  beforeEach(() => {
+    mocks.desktop.value = false
+  })
+
+  it("keeps the three settings that still decide something there", async () => {
+    await renderSection()
+    // A server started in a terminal still announces itself, and this picker
+    // is the only way to stop it: the notice was unturnoffable while the page
+    // was dropped.
+    expect(
+      screen.getByRole("combobox", { name: "Local servers" })
+    ).toHaveTextContent("Notify me")
+    expect(screen.getByLabelText("Terminal link menu")).toBeInTheDocument()
+    expect(
+      screen.getByRole("textbox", { name: "Site pattern" })
+    ).toBeInTheDocument()
+  })
+
+  it("drops every row that describes a browser engine, and asks for no capabilities", async () => {
+    await renderSection()
+    for (const source of ["Conversation messages", "Terminal"]) {
+      expect(screen.queryByRole("combobox", { name: source })).toBeNull()
+    }
+    expect(screen.queryByLabelText("Web inspector")).toBeNull()
+    expect(screen.queryByRole("combobox", { name: "Tab surface" })).toBeNull()
+    expect(screen.queryByLabelText("Unload background tabs")).toBeNull()
+    expect(screen.queryByLabelText("HTML file previews")).toBeNull()
+    expect(
+      screen.queryByRole("combobox", { name: "Default sharing level" })
+    ).toBeNull()
+    expect(
+      screen.queryByRole("combobox", { name: "Running code on a page" })
+    ).toBeNull()
+    // Nothing on the page needs the answer, and the backend behind a browser
+    // session has no browser to describe.
+    expect(mocks.browserCapabilitiesNow).not.toHaveBeenCalled()
+  })
+
+  it("still writes the local-server preference", async () => {
+    await renderSection()
+    act(() => setBrowserServiceAutoOpen("off"))
+    expect(
+      screen.getByRole("combobox", { name: "Local servers" })
+    ).toHaveTextContent("Do nothing")
+    expect(getBrowserPrefs().serviceAutoOpen).toBe("off")
+  })
+
+  it("offers blocking and nothing else, because nothing else would be carried out", async () => {
+    await renderSection()
+    // The picker beside the new-rule field, and so the action a rule added
+    // here is written with.
+    expect(screen.getByRole("combobox", { name: "Action" })).toHaveTextContent(
+      "Block"
+    )
+    fireEvent.change(screen.getByRole("textbox", { name: "Site pattern" }), {
+      target: { value: "ads.example" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Add" }))
+    expect(getBrowserPrefs().hostRules).toEqual([
+      { pattern: "ads.example", action: "block" },
+    ])
+  })
+
+  it("shows a rule's own answer even when this runtime does not offer it", async () => {
+    act(() =>
+      setBrowserHostRules([{ pattern: "docs.example", action: "system" }])
+    )
+    await renderSection()
+    // Hand-written, or written by a build that offered it: the row says what
+    // the rule says rather than rendering an empty picker.
+    expect(
+      screen.getByRole("combobox", { name: "Action for docs.example" })
+    ).toHaveTextContent("System browser")
   })
 })

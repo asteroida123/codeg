@@ -101,6 +101,8 @@ function ErrorLabel({ code }: { code?: string }) {
       return <>{t("child_empty")}</>
     case "child_auth_required":
       return <>{t("child_auth_required")}</>
+    case "child_rejected":
+      return <>{t("child_rejected")}</>
     case "interrupted":
       return <>{t("interrupted")}</>
     case "child_unknown":

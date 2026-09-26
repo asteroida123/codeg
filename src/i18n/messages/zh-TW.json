@@ -52,6 +52,8 @@
       "science": "科學研究",
       "office_tools": "辦公工具",
       "skill_packs": "技能包",
+      "collaboration": "協作",
+      "browser": "瀏覽器",
       "quick_messages": "快捷訊息",
       "logs": "執行日誌"
     }
@@ -239,6 +241,8 @@
     "enableProxy": "啟用系統代理",
     "proxyAddress": "代理位址",
     "proxyHint": "支援 http(s)/socks5，範例：{example}。僅在啟用系統代理時生效。",
+    "proxyBypass": "不經過代理的位址",
+    "proxyBypassHint": "多個位址以英文逗號 <code>,</code> 分隔，不加空格，例如 <code>{example}</code>。<code>example.com</code> 符合該網域，<code>.example.com</code> 符合其所有子網域，也可以填寫 IP 位址。本機位址 <code>localhost,127.0.0.1,::1</code> 一律直連，無須填寫。此清單會以環境變數 NO_PROXY 生效。",
     "save": "儲存",
     "saving": "儲存中...",
     "proxyRequired": "啟用代理時必須填寫代理位址",
@@ -298,6 +302,8 @@
     "rollbackSuccess": "已復原到上一個版本，正在重新載入……",
     "rollbackFailed": "復原失敗，請檢查伺服器日誌。",
     "updateErrors": {
+      "permissionDenied": "無法寫入 {path}，因此無法就地安裝更新。請以管理員權限手動更新，或檢查安裝目錄權限。",
+      "targetWriteFailed": "無法寫入 {path}，因此無法就地安裝更新：{reason}",
       "sourceUnavailable": "無法連線更新來源，請檢查網路或代理設定後重試。",
       "network": "網路連線異常，請檢查網路或代理設定後重試。",
       "downloadFailed": "下載更新包失敗，請稍後再試。",
@@ -862,7 +868,11 @@
       "authNotInstalled": "cursor-agent 未安裝",
       "authLoggedIn": "已登入",
       "authNotLoggedIn": "未登入",
+      "authUnverified": "已登入（憑證未通過驗證）",
+      "authUnverifiedHint": "cursor-agent 仍存有登入憑證，但剛才無法用它存取 Cursor——通常是登入已過期。在重新登入之前，工作階段都會顯示「Authentication required」；此 CLI 無法自行更新瀏覽器登入。",
+      "authUnverifiedHintApiKey": "cursor-agent 裡存了 API Key，但 Cursor 剛剛拒絕了它——通常是金鑰已撤銷、已過期或填錯。在下方儲存一個可用的金鑰之前，工作階段都會以「Authentication required」失敗。",
       "loginHint": "在終端機執行以下指令登入 Cursor 帳號（會開啟瀏覽器），完成後點重新整理：",
+      "loginHintRemote": "請在安裝了 cursor-agent 的 codeg 主機上執行，而不是本機，完成後點重新整理。該主機通常沒有可開啟的瀏覽器，所以要帶上 NO_OPEN_BROWSER=1 執行——它會改為印出一個登入連結，你在自己的瀏覽器開啟即可。無人值守的伺服器請把上方的方式改為 API Key。",
       "apiKeyLabel": "Cursor API 金鑰",
       "apiKeyPlaceholder": "在 cursor.com/dashboard 取得",
       "apiKeyHint": "CURSOR_API_KEY —— Cursor Dashboard 的帳號金鑰，在無頭/伺服器環境下取代瀏覽器登入。不是第三方或 OpenAI 金鑰。",
@@ -1706,9 +1716,9 @@
   "GeneralSettings": {
     "loading": "載入中...",
     "sectionTitle": "一般",
-    "sectionDescription": "集中管理預設終端機、渲染加速、通知與提示音以及多智能體協同等通用偏好。",
+    "sectionDescription": "集中管理預設終端機、渲染加速、關閉行為、通知與提示音等通用偏好。",
     "terminalTitle": "預設終端",
-    "terminalDescription": "選擇從終端列或檔案樹開啟新終端分頁時使用的 Shell。智慧代理請求 codeg 代為執行整條命令列時也會使用它。",
+    "terminalDescription": "選擇 codeg 開啟新終端分頁、以及代智慧代理執行整條命令列時使用的 Shell。自帶 Shell 的智慧代理（如 Codex、Claude Code）會在自己的行程內執行命令，不受此設定影響。",
     "terminalSystemDefault": "系統預設",
     "terminalPowerShell7": "PowerShell 7 (pwsh)",
     "terminalWindowsPowerShell": "Windows PowerShell",
@@ -1731,6 +1741,10 @@
     "restartNow": "立即重新啟動",
     "restartFailed": "重新啟動失敗：{message}",
     "loadFailed": "載入失敗：{message}"
+  },
+  "CollaborationSettings": {
+    "sectionTitle": "協作",
+    "sectionDescription": "智能體之間如何協同，以及它們能在對話中動用 codeg 的哪些工具。"
   },
   "LoginPage": {
     "documentTitle": "登入 - codeg",
@@ -2804,6 +2818,11 @@
       "linkedFolder": "已連結的資料夾",
       "moreActions": "更多操作",
       "copyPath": "複製路徑",
+      "copy": "複製",
+      "copyRelativePath": "相對路徑",
+      "copyAbsolutePath": "絕對路徑",
+      "copyFileItself": "檔案本身",
+      "copyDirectoryItself": "資料夾本身",
       "upload": "上傳檔案/目錄",
       "download": "下載檔案",
       "downloadAsZip": "下載為 ZIP",
@@ -2841,7 +2860,9 @@
         "downloadFailed": "下載 {name} 失敗",
         "downloadSaved": "已下載 {name}",
         "pathCopied": "已複製路徑",
-        "copyPathFailed": "複製路徑失敗"
+        "copyPathFailed": "複製路徑失敗",
+        "fileCopied": "已複製 {name}",
+        "copyFileFailed": "複製 {name} 失敗"
       },
       "createDialog": {
         "newFile": "新建檔案",
@@ -2989,8 +3010,6 @@
           "openAgentsSettings": "打開 Agents 管理",
           "retry": "重試"
         },
-        "agentsSetupHint": "點擊前往設定 > Agents 管理安裝。",
-        "withSetupHint": "{message}\n提示：{hint}",
         "blocked": {
           "missingConfig": "無法讀取目前 Agent 設定。",
           "disabled": "{agent} 已在 Agents 管理中停用，請先啟用後再連線。",
@@ -3013,16 +3032,20 @@
           "turnFailedMaxTurnRequests": "{agent} 已達到此輪回覆允許的最大請求次數。",
           "turnFailedUnknown": "{agent} 以未知的停止原因結束了此輪回覆。",
           "turnFailedAuthRequired": "{agent} 需要你重新登入後才能執行本輪回覆。請在設定中登入，然後重新傳送這則訊息。",
+          "agentAuthRequired": "{agent} 無法建立工作階段：沒有可用的登入憑證。請在 設定 → 智能體 → {agent} 中重新登入，然後重新開啟此對話。",
           "grokModelSwitchIncompatibleAgent": "{agent} 無法在既有對話中切換到該模型，請新建工作階段以使用它。",
+          "setModeFailed": "{agent} 切換模式失敗。",
+          "setConfigOptionFailed": "{agent} 未能套用該設定。",
+          "goalControlFailed": "{agent} 未能更新目標。",
+          "imageDropped": "{agent} 沒有收到一張附加的圖片。",
+          "sessionLoadFallback": "{agent} 無法還原先前的會話，已改為開始新會話，先前的上下文不再可用。",
           "turnFailedEmpty": "{agent} 此輪沒有產生任何回覆就結束了。",
           "turnFailedEmptyProtocol": "{agent} 此輪的輸出 codeg 無法解析，可能是代理版本與協定不相符。",
-          "turnFailedEmptyMetadata": "{agent} 此輪只收到狀態更新（計畫 / 模式 / 用量），沒有收到任何回覆。",
-          "detailsInAlerts": "在狀態列的「警示」中展開詳情，即可查看代理輸出。"
+          "turnFailedEmptyMetadata": "{agent} 此輪只收到狀態更新（計畫 / 模式 / 用量），沒有收到任何回覆。"
         },
         "unableReadAgentConfig": "無法讀取 Agent 設定：{message}",
         "connectFailedTitle": "{agent} 連線失敗",
         "toolFallbackTitle": "工具",
-        "eventErrorTitle": "Agent 錯誤",
         "notificationTurnComplete": "{agent} 已完成回應",
         "notificationError": "{agent} 錯誤：{message}",
         "notificationQuestion": "{agent} 正在等你回答",
@@ -3039,7 +3062,8 @@
           "lineNoErrorWithDelay": "{retry}，{delay}",
           "httpStatus": "（HTTP {status}）"
         },
-        "configOptionAdjusted": "{agent} 把{option}設成了 {actual}，而不是 {requested}"
+        "configOptionAdjusted": "{agent} 把{option}設成了 {actual}，而不是 {requested}",
+        "noticeTitle": "{agent}：{title}"
       },
       "connectionLifecycle": {
         "tasks": {
@@ -3495,6 +3519,7 @@
             "child_empty": "子代理無回應",
             "child_auth_required": "子智慧體需登入",
             "interrupted": "已中斷，結果未知",
+            "child_rejected": "子代理拒絕該請求",
             "child_unknown": "子代理未知錯誤",
             "unknown": "未知任務"
           }
@@ -3765,7 +3790,6 @@
         "reconnecting": "正在重新連線…",
         "reconnectDisabledDuringTurn": "目前回合結束後可重新連線",
         "dismiss": "忽略",
-        "reconnectFailed": "重新連線工作階段失敗",
         "applied": "已套用新設定"
       },
       "piProjectTrust": {
@@ -3819,6 +3843,7 @@
         "compacted": "上下文已壓縮",
         "compactedTokens": "上下文已壓縮 · {before} → {after} tokens",
         "failed": "上下文壓縮失敗",
+        "summary": "摘要",
         "triggerManual": "手動觸發",
         "triggerAutomatic": "自動觸發"
       },
@@ -4202,7 +4227,7 @@
     "agentTypeRequired": "請選擇智能體類型。",
     "agentTypeImmutableHint": "智能體類型建立後不可修改。",
     "model": "模型",
-    "modelPlaceholderCodex": "gpt-5.6-sol / gpt-5.5",
+    "modelPlaceholderCodex": "gpt-6-sol / gpt-6-luna",
     "modelPlaceholderGemini": "gemini-3-pro-preview",
     "claudeMainModel": "主要模型",
     "claudeReasoningModel": "推理模型（思考）",
@@ -4950,8 +4975,8 @@
     },
     "browserEval": {
       "label": "在內建瀏覽器中執行程式碼",
-      "short": "在你共享的頁面上執行它自己寫的程式碼，每一段都要你核准。",
-      "hint": "允許智慧代理在你分享的頁面上執行它自己寫的 JavaScript。預設關閉，而且需要先開啟上面那個開關。每一段程式碼都會先拿給你看、由你逐次核准——沒有辦法讓它自動通過。"
+      "short": "在你共享的頁面上執行它自己寫的程式碼，預設不詢問。",
+      "hint": "允許智慧代理在你分享的頁面上執行它自己寫的 JavaScript。預設關閉，而且需要先開啟上面那個開關。開啟它就意味著程式碼不經詢問直接執行，所以決定權就在這個開關上；如果想逐段過目，可在「設定 → 內建瀏覽器」裡改成每次都問你。"
     },
     "automations": {
       "label": "建立自動化",
@@ -5025,6 +5050,7 @@
   "BrowserSettings": {
     "title": "內建瀏覽器",
     "description": "從對話、工具結果和終端機開啟的網頁可以作為分頁顯示在檔案旁邊，而不必離開應用程式。",
+    "descriptionWeb": "在瀏覽器會話裡，網頁都在你正在使用的瀏覽器中開啟；例外是跑在 codeg 主機上的伺服器，它會被轉發成這裡的一個分頁。以下是仍然生效的設定。",
     "defaultTargetTitle": "連結在哪裡開啟",
     "defaultTargetHint": "依來源分別設定。按住 ⌘/Ctrl 點擊連結可暫時改用另一種方式。",
     "sourceTranscript": "對話訊息",
@@ -5064,6 +5090,7 @@
     "downloadsHint": "網頁下載的檔案儲存於 {dir}。不會自動開啟，也不會覆蓋既有檔案。",
     "rulesTitle": "站點規則",
     "rulesHint": "按站點設定：一律用內建瀏覽器、一律用系統瀏覽器，或阻止。模式可以是主機名稱、*.example.com 或 *，可選加 :連接埠；最具體的符合項生效。",
+    "rulesHintWeb": "按站點設定：阻止。在瀏覽器會話裡，網頁在哪裡開啟沒有可選項。模式可以是主機名稱、*.example.com 或 *，可選加 :連接埠；最具體的符合項生效。",
     "serviceOpenTitle": "本機服務",
     "serviceOpenHint": "終端機裡啟動的服務印出位址時，在瀏覽器分頁中開啟它。只接受本機位址，且必須確認那個連接埠上真的有程式在監聽。",
     "serviceOpenOff": "什麼都不做",
@@ -5085,6 +5112,10 @@
     "agentGrantRead": "讀取權限",
     "agentGrantControl": "讀取並操作權限",
     "agentGrantNone": "不共享",
+    "evalApprovalTitle": "在頁面上執行程式碼",
+    "evalApprovalHint": "智慧代理要在共享為「讀取並操作權限」的頁面上執行它自己寫的 JavaScript 時怎麼辦。預設直接執行，不再詢問——決定權在「在內建瀏覽器中執行程式碼」那個開關（預設關閉，要你親手開啟）和頁面的共享權限上；每一次執行都記在那個分頁的智慧代理活動裡。選「每次都問我」則會把每一段程式碼原樣擺在你面前，等你回答。",
+    "evalApprovalAsk": "每次都問我",
+    "evalApprovalSilent": "靜默執行",
     "terminalMenuTitle": "終端機連結選單",
     "terminalMenuHint": "點擊終端機中的連結時先顯示一個小選單（內建瀏覽器、系統瀏覽器、複製連結），而不是直接開啟。⌘/Ctrl 點擊仍會直接開啟。",
     "htmlPreviewTitle": "HTML 檔案預覽",
@@ -6240,6 +6271,7 @@
       "ownedWindow": "此頁面顯示在獨立視窗中。",
       "ownedWindowShow": "顯示視窗",
       "remoteBanner": "經由 {host} 開啟",
+      "remoteBannerDown": "與 {host} 的連線已中斷，下一次請求時會重新連線。",
       "navigationBlocked": "已阻止跳轉：{host}",
       "navigationBlockedRule": "被站點規則阻止",
       "navigationBlockedScheme": "此類位址不能在這裡開啟",
@@ -6253,7 +6285,17 @@
       "agentGrantLost": "分享已結束：頁面離開了 {origin}",
       "agentGrantLostShare": "也分享 {origin}",
       "agentGrantReplaced": "分享已結束：現在是另一個程式在 {origin} 上提供服務",
-      "agentGrantReplacedShare": "仍然分享"
+      "agentGrantReplacedShare": "仍然分享",
+      "errorRemoteRefused": "遠端主機上沒有程式在監聽這個位址",
+      "errorRemoteRefusedHint": "{host} 拒絕了連線。請確認這個位址背後的服務在那台機器上正在執行。",
+      "errorRemoteUnreachable": "遠端主機無法連到這個位址",
+      "errorRemoteUnreachableHint": "從 {host} 看，這個名稱無法解析，或者沒有到達它的路由。",
+      "errorRemoteNotAllowed": "遠端伺服器不允許瀏覽器連到這個位址",
+      "errorRemoteNotAllowedHint": "{host} 上的 codeg-server 只允許瀏覽器通道連到私人網路位址（CODEG_BROWSER_TUNNEL=private）。",
+      "errorRemoteTimeout": "遠端主機連線逾時",
+      "errorRemoteTimeoutHint": "{host} 沒有在時限內得到這個位址的回應。那邊的服務可能很忙，或被防火牆擋住了。",
+      "errorTunnelDown": "與遠端主機的連線已中斷",
+      "errorTunnelDownHint": "通往 {host} 的通道目前無法傳輸。等它恢復可連線後再重試。"
     },
     "tab": {
       "untitled": "新分頁"
@@ -6273,7 +6315,22 @@
       "copied": "已複製網址",
       "unreachableTitle": "無法連上連接埠橋接",
       "unreachableHint": "codeg 伺服器把這個頁面放在 {origin}，但你的瀏覽器連不上它。請開放該連接埠（見 CODEG_BRIDGE_PORTS）或設定 CODEG_BRIDGE_PUBLIC_HOST；若 codeg 以 HTTPS 提供服務，橋接連接埠也需要 HTTPS。",
+      "unreachableHostHint": "codeg 伺服器把這個頁面放在了 {origin}，但你的瀏覽器連不到。這個主機名稱必須解析到 codeg 伺服器，並且能穿過前方的反向代理——也就是一筆萬用字元 DNS 記錄加一個萬用字元虛擬主機（見 CODEG_BRIDGE_HOST_PATTERN）。",
       "errorTitle": "無法在這裡顯示此頁面"
+    },
+    "remote": {
+      "title": "此網址在 {host} 上",
+      "titleUnnamed": "此網址在遠端主機上",
+      "description": "它指向這個工作區所在的機器，而不是這台電腦。",
+      "copyAddress": "複製網址",
+      "copied": "已複製網址",
+      "tryHost": "嘗試 {host}",
+      "tryHostHint": "在這台電腦的分頁中開啟 {address}。前提是那邊的頁面監聽了所有網路介面，且這台電腦能連到該連接埠。",
+      "openHere": "在這台電腦上開啟",
+      "openHereHint": "在這台電腦的分頁中開啟此網址。前提是這台電腦也在同一個網路中。",
+      "retry": "重試",
+      "connecting": "正在經由 {host} 連線…",
+      "connectingUnnamed": "正在經由遠端主機連線…"
     },
     "download": {
       "started": "正在下載…",
@@ -6330,6 +6387,7 @@
       "shareControl": "讀取並操作權限",
       "levelDefault": "預設",
       "notShareable": "此頁面沒有可分享給智慧代理的網址",
+      "remoteWindow": "遠端工作區的智慧代理在它的主機上執行，無法使用這台電腦的瀏覽器",
       "shared": "已分享",
       "sharedControl": "已共享 · 可操作",
       "sharedWith": "智慧代理可讀取 {origin}",
@@ -6412,7 +6470,7 @@
         "description": "有智慧代理想在這個頁面上執行 JavaScript。你在 {site} 上能讀取和變更的一切，它都能。",
         "descriptionWithTitle": "有智慧代理想在「{title}」上執行 JavaScript。你在 {site} 上能讀取和變更的一切，它都能。",
         "codeLabel": "它要執行的程式碼",
-        "everyTime": "每一段程式碼都會再問你一次——核准這一段不等於核准下一段。",
+        "everyTime": "每一段程式碼都會再問你一次——核准這一段不等於核准下一段。問不問由「設定 → 內建瀏覽器」決定。",
         "allow": "執行這一次",
         "deny": "不要執行"
       }
@@ -6423,6 +6481,7 @@
       "noConversation": "先開啟一個對話，才能把頁面傳過去",
       "pickElement": "選擇一個元素…",
       "screenshot": "傳送一張截圖",
+      "markUp": "標註一張截圖…",
       "consoleErrors": "傳送主控台錯誤",
       "consoleClean": "這個頁面沒有出錯",
       "picking": "選擇中…",
@@ -6433,9 +6492,20 @@
       "noConsoleErrors": "這個頁面沒有印出過錯誤",
       "chipElement": "頁面元素",
       "chipScreenshot": "頁面截圖",
+      "chipMarkedScreenshot": "含標註的截圖",
       "chipConsole": "{count, plural, other {# 條主控台錯誤}}",
       "gone": "那個對話已經關掉了",
-      "consoleErrorsCount": "{count, plural, other {傳送 # 條主控台錯誤}}"
+      "consoleErrorsCount": "{count, plural, other {傳送 # 條主控台錯誤}}",
+      "markupTitle": "標註截圖",
+      "markupTools": "繪製工具",
+      "markupBox": "方框",
+      "markupArrow": "箭頭",
+      "markupUndo": "復原",
+      "markupClear": "清除",
+      "markupHint": "在圖上拖曳來畫。每個標註都有編號，訊息裡可以直接用編號指稱。",
+      "markupCount": "{count, plural, other {# 個標註}}",
+      "markupCancel": "取消",
+      "markupSend": "加入對話"
     }
   },
   "browser": {
@@ -6447,6 +6517,16 @@
     "inspector": {
       "error": {
         "switchedOff": "這個分頁是在網頁檢查器關閉時開啟的。請到瀏覽器設定中開啟它，然後重新開啟該頁面。"
+      }
+    },
+    "remote": {
+      "error": {
+        "unavailable": "在內建瀏覽器中開啟遠端主機的位址需要 macOS 14 或更新版本。",
+        "unsupported": "遠端的 codeg-server 版本過舊，無法轉送瀏覽器流量。更新它之後才能在這裡開啟它的位址。",
+        "disabled": "遠端的 codeg-server 關閉了瀏覽器通道（CODEG_BROWSER_TUNNEL）。",
+        "unreachable": "無法連線到遠端 codeg-server 的瀏覽器通道（{reason}）。",
+        "bypassed": "這台電腦的瀏覽器引擎會讓部分位址繞過通道，為避免從這台電腦載入，遠端主機的頁面不會開啟。",
+        "probeFailed": "內建瀏覽器無法確認它能透過通道連到遠端主機。請稍後再試。"
       }
     }
   }

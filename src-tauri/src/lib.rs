@@ -86,6 +86,7 @@ mod tauri_app {
         browser as browser_commands,
         canvas as canvas_commands,
         chat_authoring as chat_authoring_commands, chat_channel as chat_channel_commands,
+        clipboard as clipboard_commands,
         config_sync,
         conversations,
         custom_skills as custom_skills_commands,
@@ -534,6 +535,7 @@ mod tauri_app {
             ))
             .manage(ConnectionManager::new())
             .manage(crate::browser::BrowserRegistry::default())
+            .manage(crate::browser::egress::EgressRegistry::default())
             .manage(crate::browser::BrowserDownloads::default())
             .manage(crate::browser::DocGuests::default())
             .manage(crate::browser::confirm::EvalConsent::new())
@@ -1495,6 +1497,7 @@ mod tauri_app {
                 browser_commands::browser_clear_downloads,
                 browser_commands::browser_set_host_rules,
                 browser_commands::browser_set_sign_in_user_agent,
+                browser_commands::browser_set_blank_page_theme,
                 browser_commands::browser_remove_profile,
                 browser_commands::browser_doc_open,
                 browser_commands::browser_doc_set_mode,
@@ -1968,6 +1971,7 @@ mod tauri_app {
                 notification::open_system_notification_settings,
                 file_io::save_binary_file,
                 file_io::save_text_file,
+                clipboard_commands::copy_files_to_clipboard,
                 config_sync::config_sync_export_file,
                 config_sync::config_sync_peek_file,
                 config_sync::config_sync_import_file,

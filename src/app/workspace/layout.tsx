@@ -2,6 +2,7 @@
 
 import { BrowserEvalConfirm } from "@/components/browser/browser-eval-confirm"
 import { BrowserEventsBridge } from "@/components/browser/browser-events-bridge"
+import { BrowserScreenshotMarkupHost } from "@/components/browser/browser-screenshot-markup"
 import { BrowserServiceBridge } from "@/components/browser/browser-service-bridge"
 import { BrowserTabsPersistence } from "@/components/browser/browser-tabs-persistence"
 import { BrowserTabsSuspender } from "@/components/browser/browser-tabs-suspender"
@@ -1097,13 +1098,25 @@ function FolderWorkspaceShell({ children }: { children: React.ReactNode }) {
                 <WorkspaceContent>{children}</WorkspaceContent>
               </ResizablePanel>
 
+              {/* Closed, the handle gives up its BOX, not just its paint — and
+                  the override has to carry the same
+                  `data-[panel-group-direction=vertical]` prefix the base size
+                  does. A bare `h-0` is (0,1,0) against that rule's (0,2,0)
+                  attribute selector and tailwind-merge keeps both (different
+                  modifier sets), so it loses in silence: the closed terminal
+                  kept a 1px invisible strip of the app background between the
+                  workspace and the status bar, which reads as a gap under a
+                  browser page or an HTML preview (the only panes that paint to
+                  their own edge). The horizontal handles' `w-0` needs no
+                  prefix — their base `w-px` is unprefixed, so twMerge drops
+                  it. */}
               <ResizableHandle
                 withHandle
                 disabled={!terminalOpen}
                 className={
                   terminalOpen
                     ? ""
-                    : "pointer-events-none h-0 opacity-0 after:h-0"
+                    : "pointer-events-none opacity-0 data-[panel-group-direction=vertical]:h-0 data-[panel-group-direction=vertical]:after:h-0"
                 }
               />
 
@@ -1294,6 +1307,10 @@ function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
                           an agent asks to run code on is usually not the one
                           the person is looking at. */}
                       <BrowserEvalConfirm />
+                      {/* Here and not in the browser tab it is opened from:
+                          only the tab on screen is mounted, and a tab opening
+                          on its own would take the marks with it. */}
+                      <BrowserScreenshotMarkupHost />
                       <BrowserTabsPersistence />
                       <BrowserTabsSuspender />
                       <HeavyPluginsWarmup />

@@ -189,7 +189,6 @@ describe("ConversationDetailPanel new conversation layout", () => {
       '"overflow-hidden rounded-xl transition-colors"'
     )
     expect(messageInputSource).not.toContain("bg-muted/60")
-    expect(messageInputSource).toContain(': "contents"')
     // The rounded border lives in the always-on base (so the active-session flow
     // gradient can overlay a real 1px border without a layout shift); the
     // attached folder-branch-picker treatment still adds a solid surface
@@ -238,9 +237,14 @@ describe("ConversationDetailPanel new conversation layout", () => {
     expect(chatInputSource).toContain(
       'cn("pt-0", flush ? "pb-1" : "px-4 pb-1")'
     )
-    expect(chatInputSource).toContain(
-      'cn(tall ? "min-h-30" : "min-h-24", "max-h-60")'
-    )
+    // The composer's ceiling is still the caller's, but its FLOOR travels
+    // through `tall` rather than a `min-h-*` smuggled in via `className`: the
+    // box's floor and the editable area's are two halves of one number, and
+    // only MessageInput knows the action row between them (composer-sizing.ts,
+    // #746). A `min-h-*` set from out here would re-open that split.
+    expect(chatInputSource).toContain("tall={tall}")
+    expect(chatInputSource).toContain('className="max-h-60"')
+    expect(chatInputSource).not.toMatch(/className=.*min-h-/)
     expect(chatInputSource).not.toContain("containerClassName")
     expect(source).not.toContain("containerClassName")
     expect(conversationShellSource).not.toContain("containerClassName")

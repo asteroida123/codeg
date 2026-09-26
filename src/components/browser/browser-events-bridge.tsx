@@ -16,6 +16,7 @@ import {
   applyDefaultAgentGrant,
   forgetDefaultAgentGrant,
 } from "@/lib/browser/browser-agent-grant"
+import { watchBlankPageTheme } from "@/lib/browser/blank-page-theme"
 import {
   getBrowserPrefs,
   subscribeBrowserPrefs,
@@ -24,8 +25,10 @@ import {
   hydrateBrowserDownloads,
   setBrowserDownload,
 } from "@/lib/browser/browser-downloads-store"
+import { setBrowserEgressStatus } from "@/lib/browser/browser-egress-store"
 import {
   browserWorkspaceTabId,
+  getBrowserTabState,
   recordBrowserAgentActivity,
   removeBrowserTabState,
   requestBrowserFind,
@@ -44,6 +47,7 @@ import {
   BROWSER_DEVTOOLS_CLOSED_EVENT,
   BROWSER_DOC_STATE_EVENT,
   BROWSER_DOWNLOAD_EVENT,
+  BROWSER_EGRESS_EVENT,
   BROWSER_NAVIGATION_BLOCKED_EVENT,
   BROWSER_OPEN_REQUEST_EVENT,
   BROWSER_POPUP_EVENT,
@@ -55,6 +59,7 @@ import {
   type BrowserConsoleErrorsPayload,
   type BrowserDevtoolsClosedPayload,
   type BrowserDownload,
+  type BrowserEgressPayload,
   type BrowserNavigationBlockedPayload,
   type BrowserOpenRequestPayload,
   type BrowserPopupPayload,
@@ -62,7 +67,7 @@ import {
   type BrowserTabState,
   type DocGuestState,
 } from "@/lib/browser/types"
-import { getTransport, isDesktop } from "@/lib/transport"
+import { getShellTransport, isDesktop } from "@/lib/transport"
 import { bridgeStatus } from "@/lib/browser/browser-bridge"
 import { getCurrentWindowLabel } from "@/lib/browser/window-label"
 import { browserTabBackendId } from "@/lib/file-tab-id"
@@ -92,6 +97,8 @@ import { browserTabBackendId } from "@/lib/file-tab-id"
  * - `browser://console-errors` → the mark on the "send to chat" control of a
  *   tab whose page has printed an error, and its removal when a new document
  *   commits
+ * - `browser://egress` → whether a remote connection's tunnel still carries
+ *   its tabs (the banner over a remote tab turns red when it does not)
  *
  * It also carries two preferences the other way: the user's site rules (the
  * backend enforces `block` on every navigation a tab attempts) and the
@@ -108,6 +115,18 @@ const HOST_RULES_RETRY_MS = 1000
 export function BrowserEventsBridge() {
   const { adoptBrowserTab, closeFileTab, openBrowserTab } =
     useWorkspaceActions()
+
+  // The empty tab's page is a document the BACKEND paints (the engine's own
+  // is white in every theme — `browser::blank_page`), in colours only this
+  // side knows: they are variables of the running theme. Its own effect, not
+  // the preference push below: this follows the theme, not the browser's
+  // settings, and it is pushed before any capability round trip so the first
+  // tab of a run opens in the right colours. In web mode there are no native
+  // surfaces to paint.
+  useEffect(() => {
+    if (!isDesktop()) return
+    return watchBlankPageTheme()
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -172,7 +191,8 @@ export function BrowserEventsBridge() {
         /* no downloads to show */
       }
       if (cancelled) return
-      const transport = getTransport()
+      // This app's own backend, as for the commands (see `browser-api.ts`).
+      const transport = getShellTransport()
       const subs = await Promise.all([
         transport.subscribe<BrowserTabState>(BROWSER_STATE_EVENT, (state) => {
           setBrowserTabState(state)
@@ -193,6 +213,18 @@ export function BrowserEventsBridge() {
               return
             }
             if (!popup.tabId) return
+            // Every window hears every popup; only the one its opener lives
+            // in takes it in, or each workspace window would grow the tab.
+            // The popup's own state, sent just before this event, names that
+            // window (the one it inherited from its opener); failing that,
+            // the opener's own state does. Only with neither in hand is the
+            // popup taken in as it always was.
+            const owner =
+              getBrowserTabState(browserWorkspaceTabId(popup.tabId))
+                ?.ownerWindow ??
+              getBrowserTabState(browserWorkspaceTabId(popup.openerTabId))
+                ?.ownerWindow
+            if (owner && owner !== getCurrentWindowLabel()) return
             adoptBrowserTab({
               backendTabId: popup.tabId,
               url: popup.url,
@@ -313,6 +345,14 @@ export function BrowserEventsBridge() {
               browserWorkspaceTabId(payload.tabId),
               payload.errors
             )
+          }
+        ),
+        // Every connection's: a window only looks up the one its remote
+        // tabs go through.
+        transport.subscribe<BrowserEgressPayload>(
+          BROWSER_EGRESS_EVENT,
+          (payload) => {
+            setBrowserEgressStatus(payload.connectionId, payload.status)
           }
         ),
         transport.subscribe<BrowserOpenRequestPayload>(

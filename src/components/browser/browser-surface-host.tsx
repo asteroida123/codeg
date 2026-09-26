@@ -1,6 +1,14 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState } from "react"
+import { Loader2 } from "lucide-react"
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from "react"
 
 import type { BrowserWorkspaceTab } from "@/contexts/workspace-context"
 import { useWorkspaceView } from "@/contexts/workspace-context"
@@ -19,17 +27,22 @@ import {
 } from "@/lib/browser/browser-prefs"
 import { browserClose } from "@/lib/browser/browser-api"
 import {
+  browserHostsShowing,
   claimSurfaceCreation,
   forgetSurfaceCreation,
   getBrowserTabState,
   hasSurfaceClaim,
+  markBrowserCreatePending,
+  markBrowserHostShowing,
   markBrowserTabHidden,
   markBrowserTabShown,
   releaseBrowserTab,
   runSurfaceOp,
   setBrowserTabState,
+  settleBrowserCreate,
   surfaceClaimIsCurrent,
   useBrowserBoundsResync,
+  useBrowserCreateOutcome,
   useBrowserTabState,
 } from "@/lib/browser/browser-tab-store"
 import {
@@ -38,10 +51,18 @@ import {
   useNativeSurfaceOccluded,
   useNativeSurfaceOcclusionPassive,
 } from "@/lib/browser/native-surface-occlusion"
-import { isBlankPageUrl } from "@/lib/browser/browser-url"
 import type { Bounds, BrowserTabState } from "@/lib/browser/types"
 import { browserTabBackendId } from "@/lib/file-tab-id"
 import { cn } from "@/lib/utils"
+
+/**
+ * True for a host rendered beside the workbench's content region rather than
+ * in it — the transcript's side panel, portalled over whatever route is up.
+ * The route only decides for hosts inside the region it swaps out (the file
+ * column, CSS-hidden under a full-page route); one beside it is on screen
+ * whatever the route.
+ */
+export const NativeSurfaceBesideRoute = createContext(false)
 
 /** How often the host re-checks CSS visibility it cannot observe otherwise
  *  (a `visibility: hidden` ancestor toggled by the layout). One
@@ -145,6 +166,13 @@ export interface NativeSurfaceHostProps {
   /** Force-hide (e.g. while a DOM error page replaces the page). */
   hidden?: boolean
   className?: string
+  /** Show a refused create as this host's one line of error text. Off when
+   *  the caller shows it itself (from `useBrowserCreateOutcome`): a remote
+   *  tab puts its placeholder back, with the reason, in the surface's place. */
+  showCreateError?: boolean
+  /** Shown in the slot while the create is on its way — worth saying when it
+   *  takes a moment, as a remote tab's does (a tunnel to open, a probe). */
+  pendingLabel?: string
 }
 
 /**
@@ -165,11 +193,14 @@ export function NativeSurfaceHost({
   destroyOnUnmount = false,
   hidden = false,
   className,
+  showCreateError = true,
+  pendingLabel,
 }: NativeSurfaceHostProps) {
   const ref = useRef<HTMLDivElement | null>(null)
   const lastBoundsRef = useRef<Bounds | null>(null)
   const lastVisibleRef = useRef<boolean | null>(null)
-  const [createError, setCreateError] = useState<string | null>(null)
+  // Whichever host of this tab asked, the answer is every host's.
+  const createOutcome = useBrowserCreateOutcome(storeKey)
   // The page's last frame, painted here while the surface is hidden under
   // an overlay (a data URL). Cleared once the surface is showing again — not
   // before, or the pane would flash blank between the two.
@@ -190,17 +221,20 @@ export function NativeSurfaceHost({
   const fallbackOverlay = useFallbackOverlayOpen()
   const view = useWorkspaceView()
   const route = useOptionalWorkbenchRoute()
-  const routeVisible = route ? route.isConversations : true
+  const besideRoute = useContext(NativeSurfaceBesideRoute)
+  const routeVisible = besideRoute || (route ? route.isConversations : true)
   // The whole workspace surface is CSS-hidden under a full-page route.
   const hostHidden = useOverlayHostHidden()
   // Whether this tab has a page to leave a still of. A surface that has never
-  // committed a document — just created, or sitting on the blank page — has
-  // nothing to freeze, and hiding it would put an empty pane under the toast
-  // that asked for it. An overlay the user opened still gets its way (they
-  // are looking at the overlay, not at the pane); a notice does not.
+  // committed a document — just created, or still on its way to its first
+  // page — has nothing to freeze, and hiding it would put an empty pane under
+  // the toast that asked for it. A COMMITTED blank page is not one of those:
+  // the empty tab's own page is a document like any other (the backend paints
+  // it in the app's colours — see `browser::blank_page`), and so is the one a
+  // popup's opener writes into. An overlay the user opened still gets its way
+  // (they are looking at the overlay, not at the pane); a notice does not.
   const state = useBrowserTabState(storeKey)
-  const showsDocument =
-    state !== null && !state.error && !!state.url && !isBlankPageUrl(state.url)
+  const showsDocument = state !== null && !state.error && !!state.url
   const noticeOnly = occluded && passiveOcclusion && !fallbackOverlay
   const occludedNow = occluded && (!noticeOnly || showsDocument)
   const onScreen = !hidden && routeVisible && !hostHidden
@@ -219,6 +253,19 @@ export function NativeSurfaceHost({
   // Everything else hands focus back so Esc and Tab reach the overlay.
   const handoffFocus = !noticeOnly
 
+  // What this host last told the backend about visibility, kept in step with
+  // the tab's count of hosts showing it (`markBrowserHostShowing`).
+  const setLastVisible = useCallback(
+    (next: boolean | null) => {
+      const wasShowing = lastVisibleRef.current === true
+      lastVisibleRef.current = next
+      if (wasShowing !== (next === true)) {
+        markBrowserHostShowing(storeKey, next === true)
+      }
+    },
+    [storeKey]
+  )
+
   // One pass: measure, push bounds if they moved, push visibility if it
   // flipped. Called from every signal that could change either.
   const sync = useCallback(() => {
@@ -229,7 +276,9 @@ export function NativeSurfaceHost({
     // apply, and there are no bounds to push.
     if (getBrowserTabState(storeKey)?.surface === "window") {
       if (lastVisibleRef.current !== windowShouldShow) {
-        lastVisibleRef.current = windowShouldShow
+        setLastVisible(windowShouldShow)
+        // Another host still shows the tab: hiding it is not this one's call.
+        if (!windowShouldShow && browserHostsShowing(storeKey) > 0) return
         void browserSetVisible(
           backendId,
           windowShouldShow,
@@ -246,7 +295,11 @@ export function NativeSurfaceHost({
       void browserSetBounds(backendId, bounds).catch(() => {})
     }
     if (lastVisibleRef.current !== visible) {
-      lastVisibleRef.current = visible
+      setLastVisible(visible)
+      // Another host still shows the tab — the side panel over a full-page
+      // route, while this one is the file column's, hidden under it: hiding
+      // the page is not this one's call.
+      if (!visible && browserHostsShowing(storeKey) > 0) return
       hideSeqRef.current += 1
       const seq = hideSeqRef.current
       if (visible) {
@@ -307,6 +360,7 @@ export function NativeSurfaceHost({
     backendId,
     handoffFocus,
     overlayHide,
+    setLastVisible,
     shouldShow,
     storeKey,
     windowShouldShow,
@@ -328,7 +382,7 @@ export function NativeSurfaceHost({
     if (!el) return
     if (getBrowserTabState(storeKey)) {
       lastBoundsRef.current = null
-      lastVisibleRef.current = null
+      setLastVisible(null)
       sync()
       return
     }
@@ -339,7 +393,9 @@ export function NativeSurfaceHost({
     }
     const bounds = measure(el)
     lastBoundsRef.current = bounds
-    lastVisibleRef.current = true
+    // The surface is created visible, at these bounds.
+    setLastVisible(true)
+    markBrowserCreatePending(storeKey)
     // Queued per tab id: a close issued for an earlier generation must reach
     // the backend before this create, never after it.
     runSurfaceOp(backendId, () => create(bounds))
@@ -356,13 +412,32 @@ export function NativeSurfaceHost({
           }
           return
         }
-        setBrowserTabState(next)
+        // Seed, never overwrite. This answer was decided before the page had
+        // begun to load, so it is the OLDEST state this tab will ever have —
+        // and on WKWebView the answer to an `invoke` and the eval that
+        // delivers an event are not ordered against each other (the same race
+        // `TauriTransport.subscribe` works around), so a `browser://state`
+        // for a page that has already committed can arrive first. Writing
+        // this over it would put the tab back to `loading` with nothing left
+        // to correct it: an empty tab's `about:blank` commits in
+        // microseconds and then emits nothing ever again, which is exactly
+        // the tab that used to spin for the rest of the session.
+        if (!getBrowserTabState(storeKey)) setBrowserTabState(next)
+        settleBrowserCreate(storeKey)
+        // Nobody is showing the tab any more — its host went away while the
+        // surface was being built, and the hide it sent on the way out found
+        // no such tab yet. Hidden now, or it would stay painted over whatever
+        // took its place. A host that is showing it syncs as usual.
+        if (ref.current === null && browserHostsShowing(storeKey) === 0) {
+          void browserSetVisible(backendId, false, false).catch(() => {})
+          return
+        }
         sync()
       })
       .catch((error: unknown) => {
         if (!surfaceClaimIsCurrent(backendId, token)) return
         forgetSurfaceCreation(backendId)
-        setCreateError(String(error))
+        settleBrowserCreate(storeKey, { error })
       })
     // Intentionally not re-run on `sync` identity changes: creation is a
     // one-shot per mount, the effect below handles every later sync.
@@ -428,12 +503,17 @@ export function NativeSurfaceHost({
   useEffect(() => {
     markBrowserTabShown(storeKey)
     return () => {
+      if (lastVisibleRef.current === true) {
+        markBrowserHostShowing(storeKey, false)
+      }
       lastVisibleRef.current = null
       hideSeqRef.current += 1
       markBrowserTabHidden(storeKey)
       if (destroyOnUnmount) {
         releaseBrowserTab(storeKey)
-      } else {
+      } else if (browserHostsShowing(storeKey) === 0) {
+        // Hidden only once no host shows the tab: another one still showing
+        // it (the side panel and a pane at once) keeps it where it is.
         void browserSetVisible(backendId, false, false).catch(() => {})
       }
     }
@@ -449,46 +529,49 @@ export function NativeSurfaceHost({
     noticeOnly && !shouldShow ? () => requestNativeSurfaceReclaim() : undefined
 
   return (
-    // 2px of padding, so the measured element below — and with it the native
-    // view — stops short of its slot's edges. A resize divider is a 1px box
-    // whose line thickens to 5px CENTRED on it (`ui/resizable.tsx`), so it
-    // paints (5-1)/2 = 2px into each neighbour. Where that neighbour is a
-    // native view the overhang is painted over, and the divider reads thinner
-    // beside a page than beside a file — and thinner below the header band,
-    // which is plain DOM, than through it. The page yields the 2px because it
-    // is the only side that can: a native view always paints above the DOM.
+    // No inset: the page fills its slot to the edge, so nothing of the pane
+    // behind it shows as a frame around it. A resize divider is a 1px box
+    // whose line thickens to 5px CENTRED on it (`ui/resizable.tsx`), painting
+    // (5-1)/2 = 2px into each neighbour — which a native view paints back
+    // over, since it always paints above the DOM. So while a divider is
+    // hovered or dragged its line reads 3px beside a page and 5px beside the
+    // plain DOM above it. That is the whole cost, it lasts only as long as
+    // the pointer is on the divider, and the resting 1px hairline — the state
+    // it is in the rest of the time — covers its box exactly and never
+    // overhung anything.
     <div
+      ref={ref}
+      data-browser-surface={backendId}
+      onPointerDown={reclaim}
+      onWheel={reclaim}
       className={cn(
-        "relative h-full w-full min-h-0 min-w-0 p-[2px]",
+        "relative h-full w-full min-h-0 min-w-0 bg-background",
         className
       )}
       aria-hidden
     >
-      <div
-        ref={ref}
-        data-browser-surface={backendId}
-        onPointerDown={reclaim}
-        onWheel={reclaim}
-        className="relative h-full w-full bg-background"
-      >
-        {frozen ? (
-          // A data URL the backend just produced, shown for the life of an
-          // overlay: nothing for next/image to optimise, load or cache.
-          // eslint-disable-next-line @next/next/no-img-element
-          <img
-            src={frozen}
-            alt=""
-            draggable={false}
-            data-browser-frozen-frame=""
-            className="pointer-events-none absolute inset-0 h-full w-full select-none object-cover object-left-top"
-          />
-        ) : null}
-        {createError ? (
-          <div className="absolute inset-0 flex items-center justify-center p-6 text-center text-sm text-destructive">
-            {createError}
-          </div>
-        ) : null}
-      </div>
+      {frozen ? (
+        // A data URL the backend just produced, shown for the life of an
+        // overlay: nothing for next/image to optimise, load or cache.
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={frozen}
+          alt=""
+          draggable={false}
+          data-browser-frozen-frame=""
+          className="pointer-events-none absolute inset-0 h-full w-full select-none object-cover object-left-top"
+        />
+      ) : null}
+      {createOutcome?.kind === "failed" && showCreateError ? (
+        <div className="absolute inset-0 flex items-center justify-center p-6 text-center text-sm text-destructive">
+          {String(createOutcome.error)}
+        </div>
+      ) : createOutcome?.kind === "pending" && pendingLabel ? (
+        <div className="absolute inset-0 flex items-center justify-center gap-2 p-6 text-center text-xs text-muted-foreground">
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          {pendingLabel}
+        </div>
+      ) : null}
     </div>
   )
 }
@@ -503,11 +586,19 @@ export function BrowserSurfaceHost({
   tab,
   hidden = false,
   className,
+  egress = null,
+  showCreateError,
+  pendingLabel,
 }: {
   tab: BrowserWorkspaceTab
   /** Force-hide (e.g. while a DOM error page replaces the page). */
   hidden?: boolean
   className?: string
+  /** The remote connection a remote tab's page goes through (see
+   *  `browserOpenTab`); null for a tab of this computer. */
+  egress?: number | null
+  showCreateError?: boolean
+  pendingLabel?: string
 }) {
   const backendId = browserTabBackendId(tab.id)
   const initialUrl = tab.browser.initialUrl
@@ -529,9 +620,10 @@ export function BrowserSurfaceHost({
         profile: browserProfileExists(prefs, profile)
           ? profile
           : DEFAULT_BROWSER_PROFILE_ID,
+        egress,
       })
     },
-    [backendId, folderId, initialUrl, profile]
+    [backendId, egress, folderId, initialUrl, profile]
   )
   // A browser tab always has a backend id; anything else is not a browser
   // tab and gets no surface.
@@ -543,6 +635,8 @@ export function BrowserSurfaceHost({
       create={create}
       hidden={hidden}
       className={className}
+      showCreateError={showCreateError}
+      pendingLabel={pendingLabel}
     />
   )
 }

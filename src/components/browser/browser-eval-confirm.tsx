@@ -16,13 +16,14 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { browserEvalDecide } from "@/lib/browser/browser-api"
+import { readBrowserEvalApprovalNow } from "@/lib/browser/browser-prefs"
 import { displayHostPort } from "@/lib/browser/browser-url"
 import {
   BROWSER_EVAL_REQUEST_EVENT,
   type BrowserEvalRequestPayload,
 } from "@/lib/browser/types"
 import { getCurrentWindowLabel } from "@/lib/browser/window-label"
-import { getTransport, isDesktop } from "@/lib/transport"
+import { getShellTransport, isDesktop } from "@/lib/transport"
 
 /**
  * The question `browser_eval` puts to a person: this code, on this site, once.
@@ -31,12 +32,22 @@ import { getTransport, isDesktop } from "@/lib/transport"
  * the tab the question is about is very often not the one on screen — an agent
  * works on a page while its user reads the conversation.
  *
- * What the dialog is for is that the person reads the code. So it shows all of
- * it, verbatim, unhighlighted and unsummarised, and the backend has already
- * refused anything longer than someone could reasonably read. Nothing here
- * abbreviates, and there is no "always allow": the thing being approved is
- * different every time, so an answer that carried over would be an answer to a
- * question nobody asked.
+ * It is raised only for someone who asked for it: `evalApproval` in Settings →
+ * Built-in browser is `silent` by default, and this component answers "yes" for
+ * them without showing anything. The decision it stands in for is made on the
+ * `browser_eval` tool switch, which ships off and whose own text says that
+ * turning it on means code runs without asking. What this component does NOT
+ * decide is whether anything may run at all: that switch and the tab's
+ * `control` grant are enforced in the backend and are not reachable from here,
+ * and a silent run is still recorded on that tab's activity strip.
+ *
+ * What the dialog is for, when there is one, is that the person reads the code.
+ * So it shows all of it, verbatim, unhighlighted and unsummarised, and the
+ * backend has already refused anything longer than someone could reasonably
+ * read. Nothing here abbreviates, and no answer is ever carried from one
+ * snippet to the next: somebody who turned this dialog ON wants each snippet,
+ * so an "always allow" button beside the code would undo the only thing they
+ * asked for.
  *
  * Refusing is the default in every direction — Escape, the focused button
  * (Radix focuses Cancel in an alert dialog), the window going away, and simply
@@ -60,33 +71,6 @@ export function BrowserEvalConfirm() {
   const [pending, setPending] = useState<Pending | null>(null)
   const [answering, setAnswering] = useState(false)
 
-  useEffect(() => {
-    // Server mode has no native tabs, so nothing can ask.
-    if (!isDesktop()) return
-    let cancelled = false
-    let unsubscribe: (() => void) | undefined
-    void (async () => {
-      const sub = await getTransport().subscribe<BrowserEvalRequestPayload>(
-        BROWSER_EVAL_REQUEST_EVENT,
-        (request) => {
-          // Broadcast to every window; shown by the one that owns the tab.
-          if (request.ownerWindow !== getCurrentWindowLabel()) return
-          setPending({
-            ...request,
-            lapsesAt: Math.max(Date.now(), request.expiresAt),
-          })
-          setAnswering(false)
-        }
-      )
-      if (cancelled) sub()
-      else unsubscribe = sub
-    })()
-    return () => {
-      cancelled = true
-      unsubscribe?.()
-    }
-  }, [])
-
   const answer = useCallback((requestId: string, allow: boolean) => {
     setAnswering(true)
     // The dialog goes as soon as the answer is on its way. There is nothing
@@ -100,6 +84,52 @@ export function BrowserEvalConfirm() {
       // case, and the safe reading of it in the "yes" case.
     })
   }, [])
+
+  useEffect(() => {
+    // Server mode has no native tabs, so nothing can ask.
+    if (!isDesktop()) return
+    let cancelled = false
+    let unsubscribe: (() => void) | undefined
+    void (async () => {
+      // This app's own backend, as for every browser event (see
+      // `browser-api.ts`): the tabs an agent asks about are of this computer.
+      const sub =
+        await getShellTransport().subscribe<BrowserEvalRequestPayload>(
+          BROWSER_EVAL_REQUEST_EVENT,
+          (request) => {
+            // Broadcast to every window; shown by the one that owns the tab.
+            // The standing answer is applied AFTER this test, not before: every
+            // window would otherwise race to approve, and the backend would
+            // count whichever arrived first as the answer to a question its
+            // owner never saw.
+            if (request.ownerWindow !== getCurrentWindowLabel()) return
+            // Straight from storage, here, rather than from a rendered value or
+            // the cached snapshot. Both of those are updated by something that
+            // happens AFTER the person changed the setting — a commit and a
+            // passive effect for one, a delivered `storage` event for the
+            // other — and the lag is in the unsafe direction: somebody who has
+            // just asked to be shown each snippet would have the next one run
+            // without being asked. `localStorage` is written by the settings
+            // window before it notifies anyone.
+            if (readBrowserEvalApprovalNow() === "silent") {
+              answer(request.requestId, true)
+              return
+            }
+            setPending({
+              ...request,
+              lapsesAt: Math.max(Date.now(), request.expiresAt),
+            })
+            setAnswering(false)
+          }
+        )
+      if (cancelled) sub()
+      else unsubscribe = sub
+    })()
+    return () => {
+      cancelled = true
+      unsubscribe?.()
+    }
+  }, [answer])
 
   // Running out of time is a refusal here as well as in the backend, which
   // holds the same deadline — measured on a real machine, the two land within

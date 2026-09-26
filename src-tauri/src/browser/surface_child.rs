@@ -123,14 +123,11 @@ fn message_sink(app: &AppHandle) -> MessageSink {
 }
 
 /// Main thread only. Hook the engine's navigation reporting so failures and
-/// provisional starts reach the registry. Not fatal when it cannot be done:
-/// the load watcher still notices a failed load, only later and untyped.
-fn attach_navigation_delegate(
-    app: &AppHandle,
-    tab_id: &str,
-    kind: &ChildKind,
-    webview: &wry::WebView,
-) {
+/// provisional starts reach the registry, and its `window.close()` so a page
+/// that closes its own window is heard. Neither is fatal when it cannot be
+/// done: the load watcher still notices a failed load, only later and untyped,
+/// and a popup that closes itself simply stays until the person closes it.
+fn attach_engine_hooks(app: &AppHandle, tab_id: &str, kind: &ChildKind, webview: &wry::WebView) {
     #[cfg(target_os = "macos")]
     let installed = {
         let _ = kind;
@@ -146,6 +143,14 @@ fn attach_navigation_delegate(
     if let Err(err) = installed {
         tracing::warn!(
             "[browser] tab {tab_id}: navigation hooks not installed ({err}); failures are detected by polling"
+        );
+    }
+    // Installed on every child, guest included: whether a tab may act on the
+    // request is `hooks::page_may_close_itself`'s to say, and it says no to
+    // everything but an adopted popup.
+    if let Err(err) = shim::install_page_close_hook(webview, hooks::page_close_sink(app, tab_id)) {
+        tracing::warn!(
+            "[browser] tab {tab_id}: window.close() not hooked ({err}); a page closing its own window is ignored"
         );
     }
 }
@@ -596,6 +601,17 @@ fn build_child(
 ) -> Result<wry::WebView, String> {
     #[cfg(target_os = "windows")]
     {
+        // Before the window's first child webview exists, because dropping one
+        // takes the window's own resize hook away with it: see
+        // `shim::hold_resize_hook`. Not fatal — a window that keeps wry's hook
+        // until its first tab closes is still better than no tab at all.
+        if let Err(err) = shim::hold_resize_hook(owner) {
+            tracing::warn!(
+                "[browser] window {}: resize hook not held ({err}); the app's webview may keep \
+                 the wrong size once a tab closes",
+                owner.label()
+            );
+        }
         // A popup is built into the environment its opener handed over —
         // WebView2 refuses a new window created from any other one — and that
         // environment already carries the opener's profile directory. Only a
@@ -832,6 +848,27 @@ fn configure_child<'a>(
                     return false;
                 }
             }
+            // A remote profile's page on macOS addresses the remote host's
+            // loopback by an alias (see `browser::remote`), WebKit sending
+            // loopback addresses around the proxy: a link, redirect or script
+            // that goes to one is refused, and the tab goes to the same
+            // address on the alias instead. After the modifier-click check,
+            // which opens its own tab and so its own rewrite. A frame cannot
+            // be sent anywhere by the host; it is refused (its load would be
+            // stopped by the profile's loopback rules all the same). A form
+            // POSTed to a loopback address arrives as a GET: rare, since a
+            // remote page's own forms post to its own (alias) origin.
+            #[cfg(target_os = "macos")]
+            if profile::is_remote_profile(&nav_profile) {
+                if let Some(alias) = crate::browser::remote::alias_for(&parsed) {
+                    if main_frame {
+                        crate::browser::remote::redirect_to_alias(&nav_app, &nav_id, alias);
+                    } else {
+                        tracing::debug!("[browser] tab {nav_id} blocked a loopback frame: {url}");
+                    }
+                    return false;
+                }
+            }
             true
         })
         .with_on_page_load_handler({
@@ -907,7 +944,7 @@ fn configure_child<'a>(
         // store that dies with it.
         let configuration = match (configuration, kind) {
             (Some(configuration), _) => configuration,
-            (None, ChildKind::Page) => super::shim::macos::profile_configuration(mtm, profile),
+            (None, ChildKind::Page) => super::shim::macos::profile_configuration(mtm, profile)?,
             (None, ChildKind::Document(_)) => super::shim::macos::document_configuration(mtm),
         };
         builder = builder.with_webview_configuration(configuration);
@@ -915,13 +952,10 @@ fn configure_child<'a>(
     #[cfg(target_os = "windows")]
     {
         use tauri_runtime_wry::wry::WebViewBuilderExtWindows;
-        let _ = profile;
         // WebView2 takes the proxy (and everything else) from the environment's
-        // browser arguments: one string for every browser webview of the
-        // process, see `profile::windows_browser_args`.
-        builder = builder.with_additional_browser_args(profile::windows_browser_args(
-            profile::frozen_proxy().as_ref(),
-        ));
+        // browser arguments: one string per user-data folder for the life of
+        // the process, see `profile::windows_args_for`.
+        builder = builder.with_additional_browser_args(profile::windows_args_for(profile)?);
         // A popup: the opener's environment, arguments and user-data folder
         // included, which is what makes `NewWindowResponse::Create` acceptable
         // to the engine.
@@ -968,7 +1002,7 @@ pub fn create(
     run_on_main(&app.clone(), move || -> Result<(), String> {
         let kind = ChildKind::Page;
         let webview = build_child(&app, &owner, &id, &label, bounds, !background, devtools, None, &kind, &profile)?;
-        attach_navigation_delegate(&app, &id, &kind, &webview);
+        attach_engine_hooks(&app, &id, &kind, &webview);
         SURFACES.with(|s| s.borrow_mut().insert(id, webview));
         Ok(())
     })?
@@ -1004,7 +1038,7 @@ pub fn create_document(
         // A guest's store is its own (non-persistent); the profile only names
         // the WebView2 environment it would share on Windows.
         let webview = build_child(&app, &owner, &id, &label, bounds, !background, devtools, None, &kind, profile::DEFAULT_PROFILE_ID)?;
-        attach_navigation_delegate(&app, &id, &kind, &webview);
+        attach_engine_hooks(&app, &id, &kind, &webview);
         SURFACES.with(|s| s.borrow_mut().insert(id, webview));
         Ok(())
     })?
@@ -1110,7 +1144,7 @@ fn new_window_handler(
             );
             #[cfg(target_os = "windows")]
             let platform = tauri_runtime_wry::wry::WebViewExtWindows::webview(&webview);
-            attach_navigation_delegate(&app, &tab_id, &kind, &webview);
+            attach_engine_hooks(&app, &tab_id, &kind, &webview);
             SURFACES.with(|s| s.borrow_mut().insert(tab_id.clone(), webview));
             let handle = ChildHandle {
                 tab_id: tab_id.clone(),
@@ -1146,7 +1180,7 @@ fn new_window_handler(
                 origin: None,
                 zoom: 1.0,
                 error: None,
-                remote_host: None,
+                remote_host: profile::remote_host(&profile),
                 opener_tab_id: Some(opener_tab_id.clone()),
                 profile: Some(profile.clone()),
                 agent_grant: None,
