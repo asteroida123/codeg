@@ -28,6 +28,7 @@ use crate::acp::delegation::broker::{DelegationBroker, DelegationConfig};
 use crate::acp::delegation::types::AgentDelegationDefaults;
 use crate::app_error::AppCommandError;
 use crate::db::service::app_metadata_service;
+use crate::db::service::delegation_task_service::{self, DelegatedChildSession};
 use crate::models::AgentType;
 use crate::web::event_bridge::{emit_event, EventEmitter, DELEGATION_SETTINGS_CHANGED_EVENT};
 
@@ -233,6 +234,28 @@ pub async fn set_delegation_settings_core(
 }
 
 // -------- Tauri commands -----------------------------------------------------
+
+/// Parent-scoped `@Session` recall: the delegated child sessions a parent
+/// conversation spawned, with their ledger-derived status projection (§14.4).
+/// Shared by the Tauri command and the web handler so both transports return
+/// the identical shape.
+pub async fn list_delegated_child_sessions_core(
+    conn: &DatabaseConnection,
+    parent_conversation_id: i32,
+) -> Result<Vec<DelegatedChildSession>, AppCommandError> {
+    delegation_task_service::list_child_sessions(conn, parent_conversation_id)
+        .await
+        .map_err(AppCommandError::from)
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn list_delegated_child_sessions(
+    db: tauri::State<'_, crate::db::AppDatabase>,
+    parent_conversation_id: i32,
+) -> Result<Vec<DelegatedChildSession>, AppCommandError> {
+    list_delegated_child_sessions_core(&db.conn, parent_conversation_id).await
+}
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn get_delegation_settings(

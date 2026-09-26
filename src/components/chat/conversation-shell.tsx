@@ -35,6 +35,9 @@ interface ConversationShellProps {
   status: ConnectionStatus | null
   promptCapabilities: PromptCapabilitiesInfo
   defaultPath?: string
+  /** Pass-through: see `MessageInput.conversationId` (the `@` panel's
+   *  delegated-children group is scoped to this conversation). */
+  conversationId?: number | null
   agentName?: string
   /** The in-flight retry line under the composer (see
    *  `ComposerStatusStrips`). The session's errors are notifications, raised by
@@ -151,6 +154,7 @@ export function ConversationShell({
   status,
   promptCapabilities,
   defaultPath,
+  conversationId,
   agentName,
   claudeApiRetry,
   sessionFailures,
@@ -272,6 +276,7 @@ export function ConversationShell({
               status={status}
               promptCapabilities={promptCapabilities}
               defaultPath={defaultPath}
+              conversationId={conversationId}
               agentName={agentName}
               onFocus={onFocus}
               onSend={onSend}

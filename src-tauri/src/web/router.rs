@@ -66,6 +66,10 @@ pub fn build_router(
             post(handlers::delegation::set_delegation_settings),
         )
         .route(
+            "/list_delegated_child_sessions",
+            post(handlers::delegation::list_delegated_child_sessions),
+        )
+        .route(
             "/get_codeg_mcp_service_status",
             post(handlers::mcp_service::get_codeg_mcp_service_status),
         )

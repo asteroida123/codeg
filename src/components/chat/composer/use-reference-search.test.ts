@@ -5,15 +5,16 @@ import type { FlatFileEntry } from "@/hooks/use-file-tree"
 import type {
   AcpAgentInfo,
   DbConversationSummary,
+  DelegatedChildSession,
   GitLogEntry,
 } from "@/lib/types"
 
-import type { ReferenceKind } from "./types"
-import type { SuggestionGroup } from "./suggestion/types"
+import type { SuggestionGroup, SuggestionGroupKind } from "./suggestion/types"
 import {
   buildReferenceGroups,
   DEFAULT_GROUP_LABELS,
   useReferenceSearch,
+  type ReferenceGroupLabels,
   type ReferenceSearchSources,
 } from "./use-reference-search"
 
@@ -57,6 +58,33 @@ function makeConversation(id: number, title: string): DbConversationSummary {
   } as unknown as DbConversationSummary
 }
 
+function makeDelegatedChild(
+  id: number,
+  over: Partial<DelegatedChildSession> = {}
+): DelegatedChildSession {
+  return {
+    parent_conversation_id: 1,
+    child_conversation_id: id,
+    agent_type: "codex",
+    title: `Child ${id}`,
+    git_branch: null,
+    status: "completed",
+    continuable: true,
+    rounds: 1,
+    latest_task: "do the thing",
+    last_activity_at: "2026-01-01T00:00:00Z",
+    ...over,
+  }
+}
+
+/** Localized labels with distinctive text, exercising the injected pieces. */
+const DELEGATED_LABELS: ReferenceGroupLabels = {
+  ...DEFAULT_GROUP_LABELS,
+  delegatedSession: "本次对话的子智能体",
+  delegationRound: (rounds) => `第 ${rounds} 轮`,
+  delegationStatus: (status) => `状态:${status}`,
+}
+
 function makeCommit(
   hash: string,
   message = "msg",
@@ -87,7 +115,7 @@ function emptySources(
   }
 }
 
-const itemsOf = (groups: SuggestionGroup[], kind: ReferenceKind) =>
+const itemsOf = (groups: SuggestionGroup[], kind: SuggestionGroupKind) =>
   groups.find((g) => g.kind === kind)?.items ?? []
 
 // --- pure builder -----------------------------------------------------------
@@ -121,6 +149,7 @@ describe("buildReferenceGroups", () => {
 
   it("accepts injected (localized) group headings", () => {
     const labels = {
+      ...DEFAULT_GROUP_LABELS,
       file: "文件",
       agent: "智能体",
       session: "会话",
@@ -214,6 +243,148 @@ describe("buildReferenceGroups", () => {
     expect(sessions[0].reference.uri).toBe("codeg://session/7")
   })
 
+  // --- delegated children (§14.4) -------------------------------------------
+
+  it("omits the delegated-children group when the conversation has none", () => {
+    const groups = buildReferenceGroups("", emptySources())
+    expect(groups.map((g) => g.kind)).toEqual([
+      "file",
+      "agent",
+      "session",
+      "commit",
+    ])
+  })
+
+  it("places the delegated-children group between agents and sessions", () => {
+    const groups = buildReferenceGroups(
+      "",
+      emptySources({
+        delegatedSessions: [makeDelegatedChild(3)],
+        sessions: [makeConversation(7, "Some session")],
+      })
+    )
+    expect(groups.map((g) => g.kind)).toEqual([
+      "file",
+      "agent",
+      "delegatedSession",
+      "session",
+      "commit",
+    ])
+    expect(groups.find((g) => g.kind === "delegatedSession")?.label).toBe(
+      DEFAULT_GROUP_LABELS.delegatedSession
+    )
+  })
+
+  it("inserts delegated children as session references with round/status detail", () => {
+    const groups = buildReferenceGroups(
+      "",
+      emptySources({
+        delegatedSessions: [
+          makeDelegatedChild(5, {
+            status: "running",
+            continuable: false,
+            rounds: 3,
+            git_branch: "feature/x",
+            latest_task: "hunt the flaky test",
+          }),
+        ],
+      }),
+      DELEGATED_LABELS,
+      Date.parse("2026-01-02T00:00:00Z")
+    )
+    const items = itemsOf(groups, "delegatedSession")
+    expect(items).toHaveLength(1)
+    expect(items[0].reference).toEqual({
+      refType: "session",
+      id: "5",
+      label: "Child 5",
+      uri: "codeg://session/5",
+      meta: { agentType: "codex", status: "running", branch: "feature/x" },
+    })
+    // Round + status (localized) + branch + relative activity in the detail.
+    expect(items[0].detail).toContain("第 3 轮")
+    expect(items[0].detail).toContain("状态:running")
+    expect(items[0].detail).toContain("feature/x")
+    expect(items[0].detail).toContain("1d")
+    // The task text is searchable…
+    expect(items[0].keywords).toContain("hunt the flaky test")
+  })
+
+  it("orders delegated children running → continuable → needs recovery → closed", () => {
+    const groups = buildReferenceGroups(
+      "",
+      emptySources({
+        delegatedSessions: [
+          // Deliberately listed out of order: closed, recovery, stale
+          // continuable, fresh continuable, running.
+          makeDelegatedChild(1, {
+            status: "canceled",
+            continuable: false,
+            last_activity_at: "2026-03-01T00:00:00Z",
+          }),
+          makeDelegatedChild(2, {
+            status: "interrupted",
+            continuable: true,
+            last_activity_at: "2026-03-01T00:00:00Z",
+          }),
+          makeDelegatedChild(3, {
+            status: "completed",
+            continuable: true,
+            last_activity_at: "2026-01-01T00:00:00Z",
+          }),
+          makeDelegatedChild(4, {
+            status: "completed",
+            continuable: true,
+            last_activity_at: "2026-02-01T00:00:00Z",
+          }),
+          makeDelegatedChild(5, {
+            status: "running",
+            continuable: false,
+            last_activity_at: "2026-01-01T00:00:00Z",
+          }),
+        ],
+      })
+    )
+    expect(
+      itemsOf(groups, "delegatedSession").map((i) => i.reference.id)
+    ).toEqual(["5", "4", "3", "2", "1"])
+  })
+
+  it("falls back to #id for an untitled delegated child", () => {
+    const groups = buildReferenceGroups(
+      "",
+      emptySources({
+        delegatedSessions: [makeDelegatedChild(9, { title: "   " })],
+      })
+    )
+    expect(itemsOf(groups, "delegatedSession")[0].reference.label).toBe("#9")
+  })
+
+  it("filters delegated children by title, task text, agent, and branch", () => {
+    const sources = emptySources({
+      delegatedSessions: [
+        makeDelegatedChild(1, { latest_task: "hunt the flaky test" }),
+        makeDelegatedChild(2, {
+          agent_type: "claude_code",
+          latest_task: "unrelated",
+          git_branch: "feature/y",
+        }),
+      ],
+    })
+    expect(
+      itemsOf(buildReferenceGroups("flaky", sources), "delegatedSession")
+    ).toHaveLength(1)
+    expect(
+      itemsOf(buildReferenceGroups("feature/y", sources), "delegatedSession")
+    ).toHaveLength(1)
+    expect(
+      itemsOf(buildReferenceGroups("claude_code", sources), "delegatedSession")
+    ).toHaveLength(1)
+    expect(
+      itemsOf(buildReferenceGroups("nomatch", sources), "delegatedSession")
+    ).toHaveLength(0)
+  })
+
   it("omits the commit group when there is no repoKey (R8)", () => {
     const groups = buildReferenceGroups(
       "",
@@ -286,6 +457,7 @@ const mocks = vi.hoisted(() => ({
   files: { allFiles: [] as FlatFileEntry[], loaded: false },
   listAllConversations: vi.fn(),
   gitLog: vi.fn(),
+  listDelegatedChildSessions: vi.fn(),
 }))
 
 vi.mock("@/hooks/use-file-tree", () => ({
@@ -303,6 +475,8 @@ vi.mock("@/lib/api", () => ({
   listAllConversations: (...args: unknown[]) =>
     mocks.listAllConversations(...args),
   gitLog: (...args: unknown[]) => mocks.gitLog(...args),
+  listDelegatedChildSessions: (...args: unknown[]) =>
+    mocks.listDelegatedChildSessions(...args),
 }))
 
 describe("useReferenceSearch", () => {
@@ -313,6 +487,7 @@ describe("useReferenceSearch", () => {
     mocks.gitLog
       .mockReset()
       .mockResolvedValue({ entries: [], has_upstream: false })
+    mocks.listDelegatedChildSessions.mockReset().mockResolvedValue([])
   })
 
   it("returns a referentially stable search across data-source updates (R7)", async () => {
@@ -507,5 +682,110 @@ describe("useReferenceSearch", () => {
     expect(mocks.listAllConversations).toHaveBeenCalledTimes(2)
     // …which succeeds and populates the group.
     expect(itemsOf(second, "session")).toHaveLength(1)
+  })
+
+  // --- delegated children (§14.4) -------------------------------------------
+
+  it("lazily fetches the conversation's delegated children on the first search", async () => {
+    mocks.listDelegatedChildSessions.mockResolvedValue([
+      makeDelegatedChild(5, { status: "running" }),
+    ])
+
+    const { result } = renderHook(() =>
+      useReferenceSearch({ enabled: true, conversationId: 42 })
+    )
+    let groups!: SuggestionGroup[]
+    await act(async () => {
+      groups = (await result.current("")) as SuggestionGroup[]
+    })
+
+    expect(mocks.listDelegatedChildSessions).toHaveBeenCalledWith(42)
+    expect(groups.map((g) => g.kind)).toContain("delegatedSession")
+    expect(itemsOf(groups, "delegatedSession")).toHaveLength(1)
+    expect(itemsOf(groups, "delegatedSession")[0].reference.uri).toBe(
+      "codeg://session/5"
+    )
+
+    // Cached across searches — one fetch per conversation id.
+    await act(async () => {
+      await result.current("chi")
+    })
+    expect(mocks.listDelegatedChildSessions).toHaveBeenCalledTimes(1)
+  })
+
+  it("never fetches delegated children without a conversationId", async () => {
+    const { result } = renderHook(() => useReferenceSearch({ enabled: true }))
+    let groups!: SuggestionGroup[]
+    await act(async () => {
+      groups = (await result.current("")) as SuggestionGroup[]
+    })
+    expect(mocks.listDelegatedChildSessions).not.toHaveBeenCalled()
+    expect(groups.map((g) => g.kind)).not.toContain("delegatedSession")
+  })
+
+  it("keeps the delegated group hidden when the conversation has no children", async () => {
+    mocks.listDelegatedChildSessions.mockResolvedValue([])
+    const { result } = renderHook(() =>
+      useReferenceSearch({ enabled: true, conversationId: 42 })
+    )
+    let groups!: SuggestionGroup[]
+    await act(async () => {
+      groups = (await result.current("")) as SuggestionGroup[]
+    })
+    expect(mocks.listDelegatedChildSessions).toHaveBeenCalledWith(42)
+    expect(groups.map((g) => g.kind)).toEqual([
+      "file",
+      "agent",
+      "session",
+      "commit",
+    ])
+  })
+
+  it("refetches when the conversation changes and discards the stale result mid-flight", async () => {
+    // Conversation A's fetch hangs until released by hand; B resolves at once.
+    let resolveA!: (value: DelegatedChildSession[]) => void
+    mocks.listDelegatedChildSessions.mockImplementation((id: number) => {
+      if (id === 1) {
+        return new Promise((resolve) => {
+          resolveA = resolve
+        })
+      }
+      return Promise.resolve([makeDelegatedChild(9)])
+    })
+
+    const { result, rerender } = renderHook(
+      (props: { conversationId: number | null }) =>
+        useReferenceSearch({
+          enabled: true,
+          conversationId: props.conversationId,
+        }),
+      { initialProps: { conversationId: 1 } }
+    )
+
+    let pending!: SuggestionGroup[] | Promise<SuggestionGroup[]>
+    await act(async () => {
+      pending = result.current("")
+    })
+
+    // The composer switches to conversation 2 before 1's fetch resolves.
+    await act(async () => {
+      rerender({ conversationId: 2 })
+    })
+
+    let groups!: SuggestionGroup[]
+    await act(async () => {
+      resolveA([makeDelegatedChild(1)])
+      groups = (await pending) as SuggestionGroup[]
+    })
+    // The stale invocation bails; conversation 1's children never leak into
+    // conversation 2's panel.
+    expect(groups).toEqual([])
+
+    let fresh!: SuggestionGroup[]
+    await act(async () => {
+      fresh = (await result.current("")) as SuggestionGroup[]
+    })
+    expect(mocks.listDelegatedChildSessions).toHaveBeenCalledWith(2)
+    expect(itemsOf(fresh, "delegatedSession")[0].reference.id).toBe("9")
   })
 })

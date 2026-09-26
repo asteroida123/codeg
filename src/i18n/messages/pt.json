@@ -3157,7 +3157,16 @@
         "mentionGroupAgent": "Agentes",
         "mentionGroupSession": "Sessões",
         "mentionGroupCommit": "Commits",
-        "mentionGroupSkill": "Habilidades"
+        "mentionGroupSkill": "Habilidades",
+        "mentionGroupDelegatedSession": "Subagentes desta conversa",
+        "mentionDelegationRound": "Rodada {rounds}",
+        "mentionDelegationStatus": {
+          "running": "Em execução",
+          "completed": "Concluído",
+          "failed": "Falhou",
+          "canceled": "Cancelado",
+          "interrupted": "Precisa de recuperação"
+        }
       },
       "messageQueue": {
         "addToQueue": "Adicionar à fila",

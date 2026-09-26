@@ -3157,7 +3157,16 @@
         "mentionGroupAgent": "智能体",
         "mentionGroupSession": "会话",
         "mentionGroupCommit": "提交",
-        "mentionGroupSkill": "技能"
+        "mentionGroupSkill": "技能",
+        "mentionGroupDelegatedSession": "本次对话的子智能体",
+        "mentionDelegationRound": "第 {rounds} 轮",
+        "mentionDelegationStatus": {
+          "running": "运行中",
+          "completed": "已完成",
+          "failed": "失败",
+          "canceled": "已取消",
+          "interrupted": "需恢复"
+        }
       },
       "messageQueue": {
         "addToQueue": "加入队列",

@@ -4,16 +4,24 @@ import { useCallback, useEffect, useLayoutEffect, useRef } from "react"
 
 import { useAcpAgents } from "@/hooks/use-acp-agents"
 import { useFileTree, type FlatFileEntry } from "@/hooks/use-file-tree"
-import { gitLog, listAllConversations } from "@/lib/api"
+import {
+  gitLog,
+  listAllConversations,
+  listDelegatedChildSessions,
+} from "@/lib/api"
 import type {
   AcpAgentInfo,
   DbConversationSummary,
+  DelegatedChildSession,
+  DelegatedChildStatus,
   GitLogEntry,
 } from "@/lib/types"
 
 import {
   agentToSuggestion,
   commitToSuggestion,
+  compareDelegatedSessions,
+  delegatedSessionToSuggestion,
   fileToSuggestion,
   sessionToSuggestion,
 } from "./suggestion/adapters"
@@ -35,6 +43,7 @@ const MAX_PER_GROUP = 50
 /** How many commits the git-log group pulls (client-filtered down from here). */
 const GIT_LOG_LIMIT = 100
 const EMPTY_COMMITS: Promise<GitLogEntry[]> = Promise.resolve([])
+const EMPTY_DELEGATED: Promise<DelegatedChildSession[]> = Promise.resolve([])
 
 /** Display headings for each group; injected so the host can localize them. */
 export interface ReferenceGroupLabels {
@@ -43,6 +52,11 @@ export interface ReferenceGroupLabels {
   session: string
   commit: string
   skill: string
+  /** Heading for the "this conversation's sub-agents" group (§14.4). */
+  delegatedSession: string
+  /** Row-detail pieces for the delegated-children group (round / status). */
+  delegationRound: (rounds: number) => string
+  delegationStatus: (status: DelegatedChildStatus) => string
 }
 
 /**
@@ -55,6 +69,9 @@ export const DEFAULT_GROUP_LABELS: ReferenceGroupLabels = {
   session: "Sessions",
   commit: "Commits",
   skill: "Skills",
+  delegatedSession: "Sub-agent sessions",
+  delegationRound: (rounds) => `Round ${rounds}`,
+  delegationStatus: (status) => status,
 }
 
 /** Raw, already-loaded data the pure group builder turns into suggestions. */
@@ -67,6 +84,13 @@ export interface ReferenceSearchSources {
   commits: GitLogEntry[]
   /** Repo identity for commit URIs; null disables the commit group. */
   repoKey: string | null
+  /**
+   * Delegated child sessions of the conversation the composer belongs to
+   * (§14.4). Empty (or omitted) → the priority group is absent from the
+   * returned groups entirely, so it only ever appears for a parent that
+   * actually spawned sub-agents.
+   */
+  delegatedSessions?: DelegatedChildSession[]
 }
 
 /** Case-insensitive substring match against an adapted item's searchable text. */
@@ -83,15 +107,19 @@ function suggestionMatches(item: SuggestionItem, lowerQuery: string): boolean {
 
 /**
  * Pure: filter + adapt the raw sources into the fixed-order grouped suggestions
- * the `@` panel renders (files → agents → sessions → commits). Each group is
- * independently capped at {@link MAX_PER_GROUP}; empty groups are kept
- * (the popup hides them) so the order is always stable. Extracted from the hook
- * so the matching/ordering/dedup logic is testable without React.
+ * the `@` panel renders (files → agents → [delegated children] → sessions →
+ * commits). Each group is independently capped at {@link MAX_PER_GROUP}; empty
+ * groups are kept (the popup hides them) so the order is always stable — with
+ * one deliberate exception: the delegated-children group is only included when
+ * the source list is non-empty, so its tab never shows for a childless
+ * conversation. Extracted from the hook so the matching/ordering/dedup logic
+ * is testable without React.
  */
 export function buildReferenceGroups(
   query: string,
   sources: ReferenceSearchSources,
-  labels: ReferenceGroupLabels = DEFAULT_GROUP_LABELS
+  labels: ReferenceGroupLabels = DEFAULT_GROUP_LABELS,
+  now: number = Date.now()
 ): SuggestionGroup[] {
   const q = query.trim().toLowerCase()
 
@@ -143,7 +171,7 @@ export function buildReferenceGroups(
     }
   }
 
-  return [
+  const groups: SuggestionGroup[] = [
     {
       kind: "file",
       label: labels.file,
@@ -156,6 +184,36 @@ export function buildReferenceGroups(
       items: agentItems,
       truncated: agentMatches.length > MAX_PER_GROUP,
     },
+  ]
+
+  // §14.4 priority group: present only when this conversation actually has
+  // delegated children, ordered running → continuable → needs recovery →
+  // closed, most recent activity first within a bucket. Sits above the plain
+  // global Sessions group in the panel's tab order.
+  const delegated = sources.delegatedSessions ?? []
+  if (delegated.length > 0) {
+    const delegatedMatches = [...delegated]
+      .sort(compareDelegatedSessions)
+      .map((child) =>
+        delegatedSessionToSuggestion(
+          child,
+          {
+            round: labels.delegationRound,
+            status: labels.delegationStatus,
+          },
+          now
+        )
+      )
+      .filter((item) => suggestionMatches(item, q))
+    groups.push({
+      kind: "delegatedSession",
+      label: labels.delegatedSession,
+      items: delegatedMatches.slice(0, MAX_PER_GROUP),
+      truncated: delegatedMatches.length > MAX_PER_GROUP,
+    })
+  }
+
+  groups.push(
     {
       kind: "session",
       label: labels.session,
@@ -167,8 +225,9 @@ export function buildReferenceGroups(
       label: labels.commit,
       items: commitItems,
       truncated: commitTruncated,
-    },
-  ]
+    }
+  )
+  return groups
 }
 
 export interface UseReferenceSearchOptions {
@@ -178,6 +237,13 @@ export interface UseReferenceSearchOptions {
    * resolve, so a brand-new draft tab degrades gracefully (R8).
    */
   defaultPath?: string | null
+  /**
+   * The conversation the composer belongs to. When set, the first `@` lazily
+   * fetches its delegated child sessions and surfaces the §14.4 priority
+   * group ("this conversation's sub-agents"). Null/undefined (a draft with no
+   * conversation yet) keeps the group absent.
+   */
+  conversationId?: number | null
   /**
    * Gates loading. When false the search resolves to empty groups and the file
    * tree is never fetched — let the host pre-warm only the active composer.
@@ -207,6 +273,7 @@ export interface UseReferenceSearchOptions {
  */
 export function useReferenceSearch({
   defaultPath,
+  conversationId,
   enabled = true,
   labels,
 }: UseReferenceSearchOptions): ReferenceSearch {
@@ -227,19 +294,23 @@ export function useReferenceSearch({
   })
   const agentsRef = useRef(agents)
   const pathRef = useRef(path)
+  const conversationIdRef = useRef(conversationId)
   const enabledRef = useRef(enabled)
   const labelsRef = useRef(labels)
 
-  // `pathRef` and `enabledRef` gate the post-await freshness check in `search`,
-  // so they must reflect the *committed* folder/enabled state synchronously at
-  // commit — a passive effect can lag behind a stale in-flight fetch that
-  // resolves in the post-commit / pre-effect window, leaking the old folder's
-  // commits into the new panel. A layout effect (not a render-phase write) keeps
-  // them commit-accurate without updating from an uncommitted transition render.
+  // `pathRef`/`conversationIdRef` and `enabledRef` gate the post-await
+  // freshness check in `search`, so they must reflect the *committed*
+  // folder/conversation/enabled state synchronously at commit — a passive
+  // effect can lag behind a stale in-flight fetch that resolves in the
+  // post-commit / pre-effect window, leaking the old folder's commits or the
+  // old conversation's children into the new panel. A layout effect (not a
+  // render-phase write) keeps them commit-accurate without updating from an
+  // uncommitted transition render.
   useIsomorphicLayoutEffect(() => {
     pathRef.current = path
+    conversationIdRef.current = conversationId
     enabledRef.current = enabled
-  }, [path, enabled])
+  }, [path, conversationId, enabled])
 
   useEffect(() => {
     // Only expose files once the tree has loaded for the *current* path, so the
@@ -263,14 +334,20 @@ export function useReferenceSearch({
     key: string
     promise: Promise<GitLogEntry[]>
   } | null>(null)
+  const delegatedRef = useRef<{
+    key: number
+    promise: Promise<DelegatedChildSession[]>
+  } | null>(null)
 
   // Bust the lazy caches when the window regains focus so a session created in
-  // another window (or new commits) show up on the next `@` — matching the
-  // focus-refresh idiom of the other data hooks, without per-keystroke fetches.
+  // another window (or new commits, or a delegation that just settled) show up
+  // on the next `@` — matching the focus-refresh idiom of the other data hooks,
+  // without per-keystroke fetches.
   useEffect(() => {
     const onFocus = () => {
       sessionsRef.current = null
       commitsRef.current = null
+      delegatedRef.current = null
     }
     window.addEventListener("focus", onFocus)
     return () => window.removeEventListener("focus", onFocus)
@@ -280,6 +357,7 @@ export function useReferenceSearch({
     if (!enabledRef.current) return []
 
     const path = pathRef.current
+    const conversationId = conversationIdRef.current
 
     // Lazy session fetch. On rejection the cache entry is cleared (not cached as
     // an empty result) so the next `@` retries instead of wedging on `[]`.
@@ -319,17 +397,46 @@ export function useReferenceSearch({
       commitsRef.current = null
     }
 
-    const [sessions, commits] = await Promise.all([
+    // Lazy delegated-children fetch, keyed by the owning conversation. A
+    // composer with no conversation (a fresh draft) never fetches; a rejected
+    // fetch clears the cache so the next `@` retries.
+    let delegatedPromise = EMPTY_DELEGATED
+    if (conversationId != null) {
+      let delegatedEntry = delegatedRef.current
+      if (delegatedEntry?.key !== conversationId) {
+        const created: NonNullable<typeof delegatedRef.current> = {
+          key: conversationId,
+          promise: listDelegatedChildSessions(conversationId).catch(() => {
+            if (delegatedRef.current === created) delegatedRef.current = null
+            return [] as DelegatedChildSession[]
+          }),
+        }
+        delegatedRef.current = created
+        delegatedEntry = created
+      }
+      delegatedPromise = delegatedEntry.promise
+    } else {
+      delegatedRef.current = null
+    }
+
+    const [sessions, commits, delegatedSessions] = await Promise.all([
       sessionsEntry.promise,
       commitsPromise,
+      delegatedPromise,
     ])
     // Discard this result if it can no longer be trusted for the live panel: a
     // newer query aborted us, the composer was disabled, or the workspace folder
-    // changed while the network fetch was in flight (the popup only aborts on a
-    // query change, so a folder switch would otherwise leak the old repo's
-    // commits — built against `path` — into the new folder's panel). The next
-    // keystroke re-runs the search against the current folder.
-    if (signal?.aborted || !enabledRef.current || pathRef.current !== path) {
+    // / owning conversation changed while the network fetch was in flight (the
+    // popup only aborts on a query change, so a switch would otherwise leak the
+    // old folder's commits — built against `path` — or the old conversation's
+    // children into the new panel). The next keystroke re-runs the search
+    // against the current folder/conversation.
+    if (
+      signal?.aborted ||
+      !enabledRef.current ||
+      pathRef.current !== path ||
+      conversationIdRef.current !== conversationId
+    ) {
       return []
     }
 
@@ -343,6 +450,7 @@ export function useReferenceSearch({
         sessions,
         commits,
         repoKey: path,
+        delegatedSessions,
       },
       labelsRef.current ?? DEFAULT_GROUP_LABELS
     )

@@ -301,6 +301,152 @@ pub async fn list_for_parent(
     Ok(entries)
 }
 
+/// One `@Session`-recall row: a delegated child session of a parent
+/// conversation, with the ledger-derived projection the parent's `@` panel
+/// renders (design doc §14.4). Serialized straight to the frontend; the field
+/// names are the wire contract mirrored in `src/lib/types.ts`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct DelegatedChildSession {
+    pub parent_conversation_id: i32,
+    pub child_conversation_id: i32,
+    pub agent_type: AgentType,
+    pub title: Option<String>,
+    pub git_branch: Option<String>,
+    /// Wire-stable projection of the child's LATEST round:
+    /// `running` | `completed` | `failed` | `canceled` | `interrupted`.
+    /// `interrupted` comes exclusively from [`boot_reconcile_interrupted`]
+    /// freezing a run the process abandoned — `finish` only ever writes
+    /// completed/failed/canceled, so `unknown` in the ledger means "needs
+    /// recovery", never "evicted from cache" (that `TaskStatus::Unknown`
+    /// meaning applies to the in-memory broker path only).
+    pub status: String,
+    /// Whether a continuation can be admitted from the latest round right now:
+    /// the round is terminal-or-interrupted AND released — exactly the
+    /// precondition [`admit`] enforces on a continuation source. An
+    /// `interrupted` child is continuable too (via strict recovery), which is
+    /// why this flag alone must not drive the panel's "needs recovery"
+    /// bucketing — pair it with `status`.
+    pub continuable: bool,
+    /// Rounds admitted against this child ("第 N 轮"): every continuation
+    /// round reserves its own ledger row, so this is the per-child row count.
+    /// For a well-formed chain (each round's `source_task_id` naming its
+    /// predecessor) the count equals the chain length; counting rows keeps the
+    /// derivation correct even if a link is missing.
+    pub rounds: u32,
+    /// The latest round's task text (the child's most recent prompt).
+    pub latest_task: String,
+    /// Most recent of (child conversation `updated_at`, latest round
+    /// `updated_at`): the conversation row advances with transcript writes,
+    /// the ledger row with finish/release, so the max is the honest
+    /// "last activity" for the row.
+    pub last_activity_at: DateTime<Utc>,
+}
+
+/// List a parent's delegated child sessions with their status projection, for
+/// the parent composer's `@` panel (§14.4 "本次对话的子智能体"). Ledger-driven:
+/// a child appears only if at least one visible ledger row names it, and
+/// visibility follows [`list_for_parent`] (live parent/child/folder rows), so
+/// soft-deleted children and foreign-parent tasks never surface. The global
+/// history's default exclusion of delegation children is untouched — this is a
+/// separate, parent-scoped entrance.
+pub async fn list_child_sessions(
+    conn: &DatabaseConnection,
+    parent_conversation_id: i32,
+) -> Result<Vec<DelegatedChildSession>, DbError> {
+    let entries = list_for_parent(conn, parent_conversation_id).await?;
+    let children = conversation::Entity::find()
+        .filter(conversation::Column::ParentId.eq(parent_conversation_id))
+        .filter(conversation::Column::DeletedAt.is_null())
+        .all(conn)
+        .await?;
+    Ok(project_child_sessions(&entries, &children))
+}
+
+/// Pure projection from ledger rows + child conversation rows to the
+/// `@Session`-recall entries. Children with no ledger rows (pre-ledger legacy
+/// spawns) are deliberately absent — the ledger is the authoritative spawn
+/// record, and every broker path admits a row before sending the prompt.
+/// Returns entries ordered by child id ascending (deterministic; the frontend
+/// applies the §14.4 display order on top).
+fn project_child_sessions(
+    entries: &[TaskLedgerEntry],
+    children: &[conversation::Model],
+) -> Vec<DelegatedChildSession> {
+    let mut by_child: BTreeMap<i32, Vec<&TaskLedgerEntry>> = BTreeMap::new();
+    for entry in entries {
+        by_child
+            .entry(entry.child_conversation_id)
+            .or_default()
+            .push(entry);
+    }
+    let mut rows = Vec::with_capacity(by_child.len());
+    for (child_id, rounds) in by_child {
+        // The latest round is the highest ledger id: admission assigns
+        // monotonically increasing ids, and a continuation always admits after
+        // its source.
+        let latest = rounds
+            .iter()
+            .max_by_key(|entry| entry.id)
+            .expect("grouped entries are non-empty");
+        let Some(child) = children
+            .iter()
+            .find(|child| child.id == child_id)
+            .map(|child| (child.title.clone(), child.git_branch.clone(), child.updated_at))
+        else {
+            // `list_for_parent` already filtered these out; skip defensively
+            // rather than emit a row that cannot be opened.
+            continue;
+        };
+        let (title, git_branch, child_updated_at) = child;
+        // Last activity = the newest write anywhere in the child's story: any
+        // round's finish/release can land after a later round was admitted, so
+        // this is a max over ALL rounds' `updated_at`, not just the latest's.
+        let last_round_activity = rounds
+            .iter()
+            .map(|entry| entry.updated_at)
+            .max()
+            .unwrap_or(latest.updated_at);
+        rows.push(DelegatedChildSession {
+            parent_conversation_id: latest.parent_conversation_id,
+            child_conversation_id: child_id,
+            agent_type: latest.resume_binding.agent_type,
+            title,
+            git_branch,
+            status: project_child_status(latest.status).to_owned(),
+            continuable: continuation_eligible(latest),
+            rounds: rounds.len() as u32,
+            latest_task: latest.task.clone(),
+            last_activity_at: last_round_activity.max(child_updated_at),
+        });
+    }
+    rows
+}
+
+/// Map the latest round's ledger status onto the wire-stable projection the
+/// panel buckets on. See [`DelegatedChildSession::status`].
+fn project_child_status(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Running => "running",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Canceled => "canceled",
+        TaskStatus::Unknown => "interrupted",
+    }
+}
+
+/// Continuation admission precondition for the latest round, mirrored from the
+/// `is_terminal_status` + `released` check in [`admit`] (`unknown` counts as
+/// terminal there so an interrupted run can be recovered from).
+fn continuation_eligible(entry: &TaskLedgerEntry) -> bool {
+    matches!(
+        entry.status,
+        TaskStatus::Completed
+            | TaskStatus::Failed
+            | TaskStatus::Canceled
+            | TaskStatus::Unknown
+    ) && entry.released
+}
+
 /// Return the one successor reserved by `source_task_id`, if it is visible to
 /// the authorized parent.
 pub async fn successor(
@@ -1264,5 +1410,285 @@ mod tests {
             assert!(entry.released);
             assert_eq!(entry.status, TaskStatus::Completed);
         }
+    }
+
+    // -------- @Session recall projection ---------------------------------------
+
+    use crate::acp::delegation::spawner::DelegationLink;
+
+    /// A delegation child row linked to its parent the way the spawner does
+    /// (`parent_id` set, `kind == delegate`), so the projection's
+    /// conversation-side join matches production shape.
+    async fn linked_child(
+        db: &crate::db::AppDatabase,
+        parent: i32,
+        title: Option<&str>,
+    ) -> i32 {
+        let folder = conversation::Entity::find_by_id(parent)
+            .one(&db.conn)
+            .await
+            .expect("parent row")
+            .expect("parent")
+            .folder_id;
+        conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            title.map(str::to_owned),
+            Some("feature/child".to_owned()),
+            Some(DelegationLink {
+                parent_conversation_id: parent,
+                parent_tool_use_id: format!("toolu_{parent}"),
+                delegation_call_id: format!("call_{parent}"),
+                admission: None,
+            }),
+        )
+        .await
+        .expect("linked child")
+        .id
+    }
+
+    /// admit → finish → release one round against `child`.
+    async fn settle(
+        db: &crate::db::AppDatabase,
+        parent: i32,
+        child: i32,
+        task_id: &str,
+        source: Option<&str>,
+        task: &str,
+        status: TaskStatus,
+    ) {
+        admit(&db.conn, input(task_id, parent, child, source, task))
+            .await
+            .expect("admit");
+        finish(
+            &db.conn,
+            parent,
+            task_id,
+            &report(task_id, child, "done", status),
+        )
+        .await
+        .expect("finish");
+        mark_released(&db.conn, parent, task_id)
+            .await
+            .expect("release");
+    }
+
+    #[tokio::test]
+    async fn child_sessions_empty_without_ledger_rows_or_link() {
+        let db = fresh_in_memory_db().await;
+        let (parent, _plain_child) = conversations(&db).await;
+        // A child conversation exists and is linked, but no ledger row was ever
+        // admitted — the projection must not invent an entry.
+        let linked = linked_child(&db, parent, Some("never ran")).await;
+        assert_ne!(linked, _plain_child);
+
+        assert!(
+            list_child_sessions(&db.conn, parent)
+                .await
+                .expect("no ledger rows")
+                .is_empty()
+        );
+
+        // A ledger row alone (child row not linked to this parent) is equally
+        // invisible: the conversation-side join drops it.
+        settle(&db, parent, _plain_child, "t0", None, "task", TaskStatus::Completed)
+            .await;
+        assert!(
+            list_child_sessions(&db.conn, parent)
+                .await
+                .expect("unlinked child")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn child_sessions_project_rounds_status_and_continuity() {
+        let db = fresh_in_memory_db().await;
+        let (parent, _unused) = conversations(&db).await;
+
+        // Multi-round chain: two settled rounds + a third still running. The
+        // chain derives round 3 from the row count, and the projection must
+        // follow the LATEST round (running), not the settled ones.
+        let chained = linked_child(&db, parent, Some("Chained child")).await;
+        settle(&db, parent, chained, "c0", None, "first", TaskStatus::Completed).await;
+        settle(&db, parent, chained, "c1", Some("c0"), "second", TaskStatus::Failed).await;
+        admit(
+            &db.conn,
+            input("c2", parent, chained, Some("c1"), "third"),
+        )
+        .await
+        .expect("admit running round");
+
+        // Single settled round: completed + released → continuable.
+        let done = linked_child(&db, parent, Some("Done child")).await;
+        settle(&db, parent, done, "d0", None, "one shot", TaskStatus::Completed).await;
+
+        // Finished but NOT released: terminal, yet not continuable (the
+        // continuation admission precondition fails on `released`).
+        let unreleased = linked_child(&db, parent, None).await;
+        admit(&db.conn, input("u0", parent, unreleased, None, "pending release"))
+            .await
+            .expect("admit");
+        finish(
+            &db.conn,
+            parent,
+            "u0",
+            &report("u0", unreleased, "done", TaskStatus::Canceled),
+        )
+        .await
+        .expect("finish without release");
+
+        let rows = list_child_sessions(&db.conn, parent)
+            .await
+            .expect("projection");
+        assert_eq!(rows.len(), 3);
+
+        let by_id = |id: i32| rows.iter().find(|row| row.child_conversation_id == id);
+
+        let chain = by_id(chained).expect("chained entry");
+        assert_eq!(chain.rounds, 3);
+        assert_eq!(chain.status, "running");
+        assert!(!chain.continuable);
+        assert_eq!(chain.latest_task, "third");
+        assert_eq!(chain.title.as_deref(), Some("Chained child"));
+        assert_eq!(chain.git_branch.as_deref(), Some("feature/child"));
+        assert_eq!(chain.agent_type, AgentType::Codex);
+        assert_eq!(chain.parent_conversation_id, parent);
+
+        let done_row = by_id(done).expect("done entry");
+        assert_eq!(done_row.rounds, 1);
+        assert_eq!(done_row.status, "completed");
+        assert!(done_row.continuable);
+
+        let unreleased_row = by_id(unreleased).expect("unreleased entry");
+        assert_eq!(unreleased_row.status, "canceled");
+        assert!(!unreleased_row.continuable);
+
+        // Last activity reflects the newest write in the child's story: the
+        // still-running round's admission (or anything later) — never a stale
+        // earlier round.
+        let running_round = lookup(&db.conn, parent, "c2")
+            .await
+            .expect("lookup c2")
+            .expect("c2 entry");
+        assert!(chain.last_activity_at >= running_round.created_at);
+    }
+
+    #[tokio::test]
+    async fn interrupted_child_projects_needs_recovery_and_stays_continuable() {
+        let db = fresh_in_memory_db().await;
+        let (parent, _unused) = conversations(&db).await;
+        let child = linked_child(&db, parent, Some("Crashed run")).await;
+        admit(&db.conn, input("r0", parent, child, None, "running task"))
+            .await
+            .expect("admit");
+        // Simulate the process dying mid-run: boot reconcile freezes the
+        // unreleased running row as `unknown` + released.
+        assert_eq!(
+            boot_reconcile_interrupted(&db.conn).await.expect("reconcile"),
+            1
+        );
+
+        let rows = list_child_sessions(&db.conn, parent)
+            .await
+            .expect("projection");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "interrupted");
+        // Recovery continuation is admissible from an interrupted source, so
+        // the row stays continuable — the panel buckets it as "needs recovery"
+        // via `status`, not via `continuable`.
+        assert!(rows[0].continuable);
+        assert_eq!(rows[0].rounds, 1);
+
+        // A strict-recovery continuation admitted afterwards flips the
+        // projection back to running with two rounds.
+        admit(&db.conn, input("r1", parent, child, Some("r0"), "recover"))
+            .await
+            .expect("recover admit");
+        let rows = list_child_sessions(&db.conn, parent)
+            .await
+            .expect("projection after recovery");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].rounds, 2);
+        assert_eq!(rows[0].status, "running");
+        assert!(!rows[0].continuable);
+        assert_eq!(rows[0].latest_task, "recover");
+    }
+
+    #[tokio::test]
+    async fn child_sessions_respect_visibility_of_child_and_folder() {
+        let db = fresh_in_memory_db().await;
+        let (parent, _unused) = conversations(&db).await;
+        let child = linked_child(&db, parent, None).await;
+        settle(&db, parent, child, "v0", None, "task", TaskStatus::Completed).await;
+        assert_eq!(
+            list_child_sessions(&db.conn, parent).await.expect("visible").len(),
+            1
+        );
+
+        // Soft-deleted child: hidden from the ledger's authorized lookup.
+        conversation_service::soft_delete(&db.conn, child)
+            .await
+            .expect("delete child");
+        assert!(
+            list_child_sessions(&db.conn, parent)
+                .await
+                .expect("child deleted")
+                .is_empty()
+        );
+
+        // Soft-deleted folder hides every row under it (parent included).
+        let (parent2, _unused2) = conversations(&db).await;
+        let child2 = linked_child(&db, parent2, None).await;
+        settle(&db, parent2, child2, "w0", None, "task", TaskStatus::Completed).await;
+        let folder_id = conversation::Entity::find_by_id(parent2)
+            .one(&db.conn)
+            .await
+            .expect("parent2 row")
+            .expect("parent2")
+            .folder_id;
+        folder_service::soft_delete_folder(&db.conn, folder_id)
+            .await
+            .expect("delete folder");
+        assert!(
+            list_child_sessions(&db.conn, parent2)
+                .await
+                .expect("folder deleted")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn child_sessions_are_scoped_to_their_own_parent() {
+        let db = fresh_in_memory_db().await;
+        let (parent_a, _a) = conversations(&db).await;
+        let folder = folder_service::add_folder(&db.conn, "/workspace/other")
+            .await
+            .expect("folder")
+            .id;
+        let parent_b =
+            conversation_service::create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("parent b")
+                .id;
+
+        let child_a = linked_child(&db, parent_a, None).await;
+        let child_b = linked_child(&db, parent_b, None).await;
+        settle(&db, parent_a, child_a, "a0", None, "a task", TaskStatus::Completed).await;
+        settle(&db, parent_b, child_b, "b0", None, "b task", TaskStatus::Completed).await;
+
+        let rows_a = list_child_sessions(&db.conn, parent_a)
+            .await
+            .expect("parent a");
+        assert_eq!(rows_a.len(), 1);
+        assert_eq!(rows_a[0].child_conversation_id, child_a);
+        assert_eq!(rows_a[0].latest_task, "a task");
+
+        let rows_b = list_child_sessions(&db.conn, parent_b)
+            .await
+            .expect("parent b");
+        assert_eq!(rows_b.len(), 1);
+        assert_eq!(rows_b[0].child_conversation_id, child_b);
     }
 }

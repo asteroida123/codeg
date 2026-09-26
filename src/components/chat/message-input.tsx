@@ -182,6 +182,13 @@ interface MessageInputProps {
   onSend: (draft: PromptDraft, modeId?: string | null) => void
   placeholder?: string
   defaultPath?: string
+  /**
+   * The conversation this composer sends into. Feeds the `@` panel's
+   * "this conversation's sub-agents" group (§14.4): when set, the first `@`
+   * lazily loads the delegated child sessions of this conversation. Null /
+   * undefined (a draft that has no conversation yet) keeps the group away.
+   */
+  conversationId?: number | null
   disabled?: boolean
   autoFocus?: boolean
   onFocus?: () => void
@@ -365,6 +372,7 @@ export function MessageInput({
   onSend,
   placeholder,
   defaultPath,
+  conversationId,
   disabled = false,
   autoFocus = false,
   onFocus,
@@ -562,6 +570,7 @@ export function MessageInput({
   // this composer is the active one (`enabled`). Referentially stable.
   const referenceSearch = useReferenceSearch({
     defaultPath: defaultPath ?? null,
+    conversationId: conversationId ?? null,
     enabled: isActive,
     labels: referenceGroupLabels,
   })

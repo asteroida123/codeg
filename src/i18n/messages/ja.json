@@ -3157,7 +3157,16 @@
         "mentionGroupAgent": "エージェント",
         "mentionGroupSession": "セッション",
         "mentionGroupCommit": "コミット",
-        "mentionGroupSkill": "スキル"
+        "mentionGroupSkill": "スキル",
+        "mentionGroupDelegatedSession": "この会話のサブエージェント",
+        "mentionDelegationRound": "第 {rounds} ラウンド",
+        "mentionDelegationStatus": {
+          "running": "実行中",
+          "completed": "完了",
+          "failed": "失敗",
+          "canceled": "キャンセル済み",
+          "interrupted": "復元が必要"
+        }
       },
       "messageQueue": {
         "addToQueue": "キューに追加",
