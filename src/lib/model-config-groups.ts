@@ -64,19 +64,42 @@ function sharedNamePrefix(
   return shared
 }
 
+// True when a value prefix is an opaque machine id rather than anything a user
+// would read as a name: a UUID, a `namespace:` key (`builtin:bigmodel-coding-plan`),
+// or a bare hex blob. ZCode ships its provider ids in exactly these forms while
+// labelling the rows with human names, so a single-model provider there would
+// otherwise advertise its raw id/UUID as the header.
+function isOpaquePrefix(prefix: string): boolean {
+  return (
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      prefix
+    ) ||
+    /^[a-z][a-z0-9_-]*:/i.test(prefix) ||
+    /^[0-9a-f]{16,}$/i.test(prefix)
+  )
+}
+
 // The shared display-name prefix worth stripping from a group's rows, or null to
 // leave the rows untouched. A group of 2+ rows that all repeat the same leading
-// segment is clearly redundant. A single-row group is only stripped when its
-// name's leading segment IS the value-id prefix (a genuine `provider/model` like
+// segment is clearly redundant. A single-row group is stripped when its name's
+// leading segment IS the value-id prefix (a genuine `provider/model` like
 // `anthropic/claude-opus`) — a lone slashed display name like `GPT-4o/preview`
-// must not be mistaken for a provider prefix.
+// must not be mistaken for a provider prefix — or when the value prefix is an
+// opaque machine id, where the display name's head is the only readable header
+// available.
 function strippablePrefix(
   valuePrefix: string,
   items: SessionConfigSelectOptionInfo[]
 ): string | null {
   const shared = sharedNamePrefix(items)
   if (shared === null) return null
-  if (items.length < 2 && shared !== valuePrefix) return null
+  if (
+    items.length < 2 &&
+    shared !== valuePrefix &&
+    !isOpaquePrefix(valuePrefix)
+  ) {
+    return null
+  }
   return shared
 }
 

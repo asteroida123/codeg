@@ -214,6 +214,32 @@ describe("deriveModelGroups", () => {
     expect(deriveModelGroups(option)).toBeNull()
   })
 
+  it("names a lone opaque-prefix provider from its display name (ZCode shape)", () => {
+    // ZCode ships provider ids as UUIDs / `builtin:` keys while rows are labelled
+    // `Provider / Model`; a provider with a single model must still get its
+    // readable name as the header, not the raw id.
+    for (const prefix of [
+      "76438100-5bc5-4417-a347-5f3007936987",
+      "builtin:bigmodel-coding-plan",
+    ]) {
+      const option = modelOption([
+        opt(`${prefix}/deepseek-v4-pro`, "deepseek / deepseek-v4-pro"),
+      ])
+      const groups = deriveModelGroups(option)
+      expect(groups?.map((g) => g.name)).toEqual(["deepseek"])
+      expect(groups?.[0].options.map((o) => o.name)).toEqual([
+        "deepseek-v4-pro",
+      ])
+    }
+    // A CJK provider name travels through the same path.
+    const cjk = deriveModelGroups(
+      modelOption([
+        opt("ba9edc46-e611-4f82-8b9a-c4a289d02135/glm-5.2", "黑与白 / glm-5.2"),
+      ])
+    )
+    expect(cjk?.map((g) => g.name)).toEqual(["黑与白"])
+  })
+
   it("does not mistake a lone slashed display name for a provider prefix", () => {
     // The `meta` group has a single row whose display-name slash is NOT the
     // provider (head `Big` ≠ value prefix `meta`) → leave the label intact.
