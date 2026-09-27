@@ -50,6 +50,27 @@ cargo insta review
 INSTA_UPDATE=auto cargo test --features test-utils     # 自动写新 .snap
 ```
 
+### 磁盘占用（`target/` 会涨到几百 GB，按需回收）
+
+门禁要跑 4 套 feature 组合（桌面 / server / mcp / test-utils），而本仓库是**一个巨大的单 crate**：同一份 `codeg_lib` 会被按 feature 各编译链接一遍（实测 `target/debug/deps` 里同时躺着 15 份 `codeg_lib`，>100MB 的文件 110 个），加上 200MB 级的测试二进制与 671 个增量编译会话，自用迭代一天后实测：
+
+| 位置 | 实测 | 说明 |
+| --- | --- | --- |
+| `target/debug/deps` | 137G | 各 feature / profile 的重复产物 |
+| `target/debug/incremental` | 114G | 增量编译缓存 |
+| `target/release` + `target/<triple>/release` | ~6G | 含 `.app` bundle 与 sidecar |
+
+回收（都不动已构建的 `.app`）：
+
+```bash
+rm -rf src-tauri/target/debug              # 最有效；下次 cargo 全量重编（10-20 分钟）
+rm -rf src-tauri/target/debug/incremental  # 温和：只牺牲增量编译速度
+rm -rf .next                               # 前端 dev 构建产物
+cargo clean -p codeg                       # 只清本 crate
+```
+
+不要默认关增量编译（`incremental = false` 能省那 114G，但开发期重编明显变慢）；磁盘紧张时可选 `[profile.dev] debug = 0`。要连 release 树一起清时，先把 `.app` 拷到 `target/` 之外。
+
 ## 架构
 
 ### 双模式运行
