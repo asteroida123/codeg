@@ -1965,7 +1965,7 @@ async fn build_agent(
     debug_assert_eq!(meta.agent_type, agent_type);
 
     let agent = match meta.distribution {
-        AgentDistribution::Npx { cmd, args, env, .. } => {
+        AgentDistribution::Npx { version, package, cmd, args, env, .. } => {
             // pi-acp spawns the real `pi` binary; fail fast with a clear,
             // install-prompt-routable error if it (or a BYO-pi override) isn't
             // resolvable, rather than letting pi-acp die mid-connection on a raw
@@ -2035,9 +2035,34 @@ async fn build_agent(
             for (k, v) in &merged_env {
                 parts.push(format!("{k}={v}"));
             }
+            let resolved_cmd = crate::commands::acp::resolve_npx_command(cmd).await;
+            // Say which build this session will actually run. The resolver prefers
+            // a PATH install, so a stale global package silently shadows the pin —
+            // and the drift is otherwise invisible in the logs.
+            match resolved_cmd
+                .as_deref()
+                .and_then(crate::commands::acp::installed_package_version)
+            {
+                Some(installed) if installed != version => tracing::warn!(
+                    "[ACP][{agent_type}] {package}: resolved to {} (version {installed}) but the pin is \
+                     {version} — codeg runs the resolved build; install the pinned version \
+                     (`npm i -g {package}`) or remove the global one",
+                    resolved_cmd
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                ),
+                Some(installed) => tracing::info!(
+                    "[ACP][{agent_type}] {package}: {} (version {installed})",
+                    resolved_cmd
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                ),
+                None => {}
+            }
             parts.push(
-                crate::commands::acp::resolve_npx_command(cmd)
-                    .await
+                resolved_cmd
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|| {
                         crate::process::normalized_program(cmd)

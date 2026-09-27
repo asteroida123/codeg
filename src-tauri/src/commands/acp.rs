@@ -458,6 +458,32 @@ pub(crate) async fn resolve_npx_command(cmd: &str) -> Option<PathBuf> {
     resolve_npx_command_from_current_npm_prefix(cmd).await
 }
 
+/// Best-effort version of the npm package a resolved command belongs to.
+///
+/// [`resolve_npx_command`] deliberately prefers whatever the command resolves to
+/// on PATH, so a global install can shadow the pinned version of an npx-
+/// distributed agent. That drift is invisible: the session simply runs the older
+/// build (a live field report: the ZCode adapter stayed on a stale global 0.1.4
+/// through two releases). The spawn site logs this and warns on a mismatch.
+///
+/// Walks at most four levels up, because a package's manifest sits at or above
+/// its bin script and npm bin shims are already followed by the resolver.
+pub(crate) fn installed_package_version(resolved: &Path) -> Option<String> {
+    let mut dir = resolved.parent()?;
+    for _ in 0..4 {
+        let manifest_path = dir.join("package.json");
+        if let Ok(raw) = std::fs::read_to_string(&manifest_path) {
+            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(version) = manifest.get("version").and_then(|value| value.as_str()) {
+                    return Some(version.to_string());
+                }
+            }
+        }
+        dir = dir.parent()?;
+    }
+    None
+}
+
 #[derive(Default)]
 struct NpxCommandResolver {
     per_cmd_cache: HashMap<String, Option<PathBuf>>,
@@ -13649,6 +13675,31 @@ pub(crate) async fn codex_poll_device_code_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_package_version_reads_the_manifest_above_a_bin_script() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let package = dir.path().join("node_modules").join("some-agent");
+        std::fs::create_dir_all(package.join("bin")).expect("mkdir");
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"name":"some-agent","version":"1.2.3"}"#,
+        )
+        .expect("manifest");
+        let script = package.join("bin").join("agent.js");
+        std::fs::write(&script, "").expect("script");
+        assert_eq!(
+            installed_package_version(&script).as_deref(),
+            Some("1.2.3")
+        );
+
+        // Nothing to read above the script: report nothing rather than guess.
+        let nested = dir.path().join("nested");
+        std::fs::create_dir_all(&nested).expect("nested");
+        let bare = nested.join("lonely.js");
+        std::fs::write(&bare, "").expect("bare script");
+        assert_eq!(installed_package_version(&bare), None);
+    }
 
     #[test]
     fn extract_version_token_finds_the_version_in_common_banners() {
