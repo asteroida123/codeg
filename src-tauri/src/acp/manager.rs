@@ -5087,25 +5087,22 @@ impl crate::acp::capability_catalog::CapabilityCatalogAccess
                     e
                 }
                 AgentType::ZCode => {
-                    match cc::zcode_provider_config_raw(dirs::home_dir().as_deref())
+                    // The live advertisement (the adapter's selector, built
+                    // from the provider stores the desktop currently writes)
+                    // is authoritative and preferred; the on-disk table is the
+                    // legacy format the desktop stopped updating. See
+                    // `capability_catalog::zcode_capabilities`.
+                    let legacy = cc::zcode_provider_config_raw(dirs::home_dir().as_deref())
                         .as_deref()
-                        .and_then(cc::parse_zcode_provider_config)
-                    {
-                        Some(catalog) => cc::from_zcode_provider_catalog(&slug, &name, &catalog),
-                        // Unreadable / absent config: fall through to the
-                        // advertised cache; without one, unknown.
-                        None => advertised
+                        .and_then(cc::parse_zcode_provider_config);
+                    cc::zcode_capabilities(
+                        &slug,
+                        &name,
+                        advertised
                             .as_ref()
-                            .map(|snap| {
-                                cc::from_advertised(
-                                    &slug,
-                                    &name,
-                                    snap.modes.as_ref(),
-                                    &snap.config_options,
-                                )
-                            })
-                            .unwrap_or_else(|| cc::AgentCapabilities::unknown(&slug, &name)),
-                    }
+                            .map(|snap| (snap.modes.as_ref(), snap.config_options.as_slice())),
+                        legacy.as_ref(),
+                    )
                 }
                 _ => advertised
                     .as_ref()

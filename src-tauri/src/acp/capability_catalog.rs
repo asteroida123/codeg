@@ -16,8 +16,9 @@
 //!   * Pure builders that project the two data source families into that one
 //!     shape:
 //!     - **static** — on-disk catalogs read without starting any agent
-//!       process (codex's generated `model_catalog_json` chain, ZCode's
-//!       `~/.zcode/v2/config.json` provider table);
+//!       process (codex's generated `model_catalog_json` chain, ZCode's LEGACY
+//!       `~/.zcode/v2/config.json` provider table — the desktop stopped
+//!       writing that file, so it is only a fallback);
 //!     - **advertised** — the modes + config options a live ACP connection of
 //!       that agent type has already published (the same
 //!       [`SessionState`](crate::acp::SessionState) selectors the composer
@@ -407,9 +408,9 @@ pub fn parse_zcode_provider_config(raw: &str) -> Option<ZcodeProviderCatalog> {
 }
 
 /// Project a parsed [`ZcodeProviderCatalog`] into an [`AgentCapabilities`].
-/// The model names are exactly as ZCode's config spells them (bare names,
-/// not provider-qualified), and the note says so — the id a live session's
-/// selector accepts may be qualified, and that is only knowable from an
+/// The model names are exactly as ZCode's LEGACY config spells them (bare
+/// names, not provider-qualified), and the note says so — the id a live
+/// session's selector accepts is qualified, and that is only knowable from an
 /// advertisement.
 pub fn from_zcode_provider_catalog(
     agent_type: &str,
@@ -428,11 +429,44 @@ pub fn from_zcode_provider_catalog(
         reasoning_option_id: None,
         source: CapabilitySource::Static,
         notes: vec![
-            "Model names come from ZCode's own provider config (bare names, one \
-             list across enabled providers); reasoning variants are the union \
-             across those models."
+            "Model names come from ZCode's LEGACY provider table, which the \
+             desktop no longer writes (bare names, one list across the \
+             providers it still enabled); reasoning variants are the union \
+             across those models. A live ZCode session's advertisement is \
+             authoritative and is preferred whenever one exists."
                 .to_string(),
         ],
+    }
+}
+
+/// The ZCode capability entry, with its source precedence.
+///
+/// A live advertisement WINS whenever it carries a model selector: it is the
+/// selector the adapter built from the provider stores the desktop currently
+/// writes (`~/.zcode/v2/provider_config.json` + the refreshed
+/// `zcode-builtin.json`), and its values are exactly what
+/// `session/set_model` accepts. The on-disk table is the legacy single-file
+/// format the desktop stopped updating, so preferring it served providers and
+/// models that no longer exist while hiding every provider added since — the
+/// reason a user's own active model was missing from the delegation catalog.
+///
+/// The legacy table stays as the fallback (an advertisement that has not
+/// published its selectors yet is not evidence of anything), and a truly
+/// unknown agent answers `unknown` rather than inventing a list.
+pub fn zcode_capabilities(
+    agent_type: &str,
+    display_name: &str,
+    advertised: Option<(Option<&SessionModeStateInfo>, &[SessionConfigOptionInfo])>,
+    legacy: Option<&ZcodeProviderCatalog>,
+) -> AgentCapabilities {
+    if let Some((modes, config_options)) = advertised {
+        if config_options.iter().any(is_model_option) {
+            return from_advertised(agent_type, display_name, modes, config_options);
+        }
+    }
+    match legacy {
+        Some(catalog) => from_zcode_provider_catalog(agent_type, display_name, catalog),
+        None => AgentCapabilities::unknown(agent_type, display_name),
     }
 }
 
@@ -901,5 +935,99 @@ mod tests {
         // Empty lists — unknown source, or a source that advertised no such
         // selector — always pass through as preferences.
         assert_eq!(check_selector(&[], "anything"), SelectorCheck::Unknown);
+    }
+}
+
+#[cfg(test)]
+mod zcode_precedence_tests {
+    use super::*;
+    use crate::acp::types::{
+        SessionConfigKindInfo, SessionConfigSelectInfo, SessionConfigSelectOptionInfo,
+        SessionModeInfo,
+    };
+
+    fn model_selector(values: &[&str]) -> SessionConfigOptionInfo {
+        SessionConfigOptionInfo {
+            id: "model".to_string(),
+            name: "Model".to_string(),
+            description: None,
+            category: Some("model".to_string()),
+            kind: SessionConfigKindInfo::Select(SessionConfigSelectInfo {
+                current_value: values.first().unwrap_or(&"").to_string(),
+                options: values
+                    .iter()
+                    .map(|value| SessionConfigSelectOptionInfo {
+                        value: value.to_string(),
+                        name: value.to_string(),
+                        description: None,
+                    })
+                    .collect(),
+                groups: Vec::new(),
+            }),
+            recommended_value: None,
+        }
+    }
+
+    fn modes(ids: &[&str]) -> SessionModeStateInfo {
+        SessionModeStateInfo {
+            current_mode_id: ids.first().unwrap_or(&"").to_string(),
+            available_modes: ids
+                .iter()
+                .map(|id| SessionModeInfo {
+                    id: id.to_string(),
+                    name: id.to_string(),
+                    description: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn legacy() -> ZcodeProviderCatalog {
+        ZcodeProviderCatalog {
+            models: vec!["Glm-from-legacy".to_string()],
+            reasoning_variants: Vec::new(),
+        }
+    }
+
+    /// Field report 2026-09-28: the live selector names the model the user is
+    /// actually running; the legacy table does not know it exists. The
+    /// advertisement must win, or delegation is planned against a list of
+    /// providers that are gone.
+    #[test]
+    fn a_live_model_selector_beats_the_legacy_table() {
+        let state = modes(&["build"]);
+        let options = vec![model_selector(&[
+            "new-provider-3/cline-pass/deepseek-v4.1-flash",
+        ])];
+        let legacy = legacy();
+        let caps = zcode_capabilities(
+            "zcode",
+            "ZCode",
+            Some((Some(&state), &options)),
+            Some(&legacy),
+        );
+        assert_eq!(caps.source, CapabilitySource::Advertised);
+        assert_eq!(
+            caps.models,
+            vec!["new-provider-3/cline-pass/deepseek-v4.1-flash"]
+        );
+        assert_eq!(caps.model_option_id.as_deref(), Some("model"));
+        assert_eq!(caps.modes, vec!["build"]);
+    }
+
+    /// An advertisement that has not published selectors yet is not evidence:
+    /// the legacy table (and, without it, `unknown`) still answers, so a
+    /// connection mid-handshake cannot blank the catalog.
+    #[test]
+    fn an_advertisement_without_a_model_selector_falls_back_to_the_legacy_table() {
+        let state = modes(&["build"]);
+        let legacy = legacy();
+        let caps = zcode_capabilities("zcode", "ZCode", Some((Some(&state), &[])), Some(&legacy));
+        assert_eq!(caps.source, CapabilitySource::Static);
+        assert_eq!(caps.models, vec!["Glm-from-legacy"]);
+
+        let unknown = zcode_capabilities("zcode", "ZCode", None, None);
+        assert_eq!(unknown.source, CapabilitySource::Unknown);
+        assert!(unknown.models.is_empty());
     }
 }
