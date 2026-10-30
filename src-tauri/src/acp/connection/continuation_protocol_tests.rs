@@ -80,6 +80,7 @@ async fn run_driver(
             Some(cwd.to_string_lossy().into_owned()),
             Some("source-session".into()),
             rx,
+            CancellationToken::new(),
             EventEmitter::Noop,
             worker_state,
             BTreeMap::new(),
@@ -89,6 +90,7 @@ async fn run_driver(
             None,
             FsAccessPolicy::from_env(&cwd, AgentType::ClaudeCode, &BTreeMap::new()),
             HostToolsPolicy::Default,
+            cwd.join("claude-projects"),
             Arc::new(StderrTail::new()),
             SessionRecoveryPolicy::Strict,
         )
@@ -178,6 +180,7 @@ impl ConnectionSpawner for FixtureContinuationSpawner {
                 Some(cwd.to_string_lossy().into_owned()),
                 Some(binding.external_session_id),
                 rx,
+                CancellationToken::new(),
                 EventEmitter::Noop,
                 worker_state,
                 BTreeMap::new(),
@@ -187,6 +190,7 @@ impl ConnectionSpawner for FixtureContinuationSpawner {
                 None,
                 FsAccessPolicy::from_env(&cwd, agent_type, &BTreeMap::new()),
                 HostToolsPolicy::Default,
+                cwd.join("claude-projects"),
                 Arc::new(StderrTail::new()),
                 SessionRecoveryPolicy::Strict,
             )
@@ -217,6 +221,7 @@ impl ConnectionSpawner for FixtureContinuationSpawner {
         _conn_id: &str,
         task: String,
         link: DelegationLink,
+        _brief: Option<String>,
     ) -> Result<DelegationDispatch, SpawnerError> {
         let admission = link
             .admission
@@ -261,6 +266,7 @@ impl ConnectionSpawner for FixtureContinuationSpawner {
             (connection.tx.clone(), Arc::clone(&connection.state))
         };
         tx.send(ConnectionCommand::Prompt {
+            internal_suffix: Vec::new(),
             blocks: vec![PromptInputBlock::Text { text: task }],
             user_message: None,
         })
@@ -308,6 +314,7 @@ impl ConnectionSpawner for FixtureContinuationSpawner {
         _folder_id: i32,
         _child_conversation_id: i32,
         _link: DelegationLink,
+        _brief: Option<String>,
     ) -> Result<(), SpawnerError> {
         Err(SpawnerError::Send(
             "legacy resume is outside this fixture".into(),
@@ -407,6 +414,7 @@ fn immediate_text_is_reduced_before_prompt_response_every_time() {
 
         for turn in 1..=50 {
             tx.send(ConnectionCommand::Prompt {
+                internal_suffix: Vec::new(),
                 blocks: vec![PromptInputBlock::Text {
                     text: format!("turn {turn}"),
                 }],
@@ -493,6 +501,7 @@ fn durable_continuation_reopens_the_source_session_and_admits_one_successor() {
             Some("source child".into()),
             None,
             Some(DelegationLink {
+                assistant: None,
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: "source-tool".into(),
                 delegation_call_id: source_task_id.into(),
@@ -531,6 +540,9 @@ fn durable_continuation_reopens_the_source_session_and_admits_one_successor() {
         .expect("admit source task");
         assert!(matches!(admitted, ledger::AdmissionResult::New { .. }));
         let source_report = DelegationTaskReport {
+            assistant_id: None,
+            assistant_name: None,
+            progress: None,
             task_id: Some(source_task_id.into()),
             status: TaskStatus::Completed,
             child_conversation_id: Some(child.id),
@@ -587,6 +599,7 @@ fn durable_continuation_reopens_the_source_session_and_admits_one_successor() {
 
         let ack = broker
             .start_delegation(DelegationRequest {
+                assistant: None,
                 parent_connection_id: "parent-after-reopen".into(),
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: "follow-up-tool".into(),

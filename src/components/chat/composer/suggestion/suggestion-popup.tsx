@@ -13,10 +13,11 @@ import {
 import { createPortal } from "react-dom"
 
 import { isImeCompositionKey } from "@/lib/ime-composition"
+import { MENTION_TAB_KINDS } from "@/lib/mention-panel-prefs"
 import { cn } from "@/lib/utils"
 
 import { ReferenceIcon } from "../badges/reference-badge"
-import type { ReferenceAttrs } from "../types"
+import type { ReferenceAttrs, ReferenceKind } from "../types"
 import type { MentionRenderState } from "./mention-suggestion"
 import { placeAnchoredPopup, readViewport } from "./popup-position"
 import type {
@@ -28,27 +29,11 @@ import type {
 
 const FETCH_DEBOUNCE_MS = 150
 
-// Tab order in the panel: agent first (per product decision), then the rest in
-// their usual order — with one §14.4 addition: this conversation's sub-agent
-// sessions sit immediately ABOVE the plain global Sessions tab ("优先分组").
-// This is a *display* order; the search provider keeps its own (file-first)
-// group order, which other code/tests depend on. `skill` is intentionally
-// absent — skills, commands and experts are inserted via the `/` and `$`
-// triggers, not the `@` panel. `delegatedSession` renders as a tab ONLY when
-// the search returned that group (a parent with no children never shows it —
-// see `visibleTabs`).
-const TAB_ORDER: readonly SuggestionGroupKind[] = [
-  "agent",
-  "file",
-  "delegatedSession",
-  "session",
-  "commit",
-]
-
 // English fallbacks for the tab labels; the host injects localized ones. `skill`
 // is kept for type completeness (`ReferenceKind`) though it is not a shown tab.
 const DEFAULT_TAB_LABELS: Record<SuggestionGroupKind, string> = {
   agent: "Agents",
+  assistant: "Assistants",
   file: "Files",
   delegatedSession: "Sub-agent sessions",
   session: "Sessions",
@@ -125,6 +110,15 @@ export interface SuggestionPopupProps {
   /** Localized per-kind tab labels (English fallbacks apply when omitted). */
   tabLabels?: Record<SuggestionGroupKind, string>
   /**
+   * The tabs to show, in display order — the user's `@` panel preference (see
+   * `mention-panel-prefs.ts`); the built-in order when omitted. A *display*
+   * order only: the search keeps its own (file-first) group order, and the
+   * panel picks groups out of it by kind. Also handed to `search`, so a source
+   * no shown tab needs is never loaded. Must be referentially stable — it is a
+   * dependency of the fetch effect.
+   */
+  tabs?: readonly ReferenceKind[]
+  /**
    * The composer box the panel lines up with. When given, the panel adopts that
    * box's width and left edge and opens above it — the same geometry as the
    * host's own `/` command menu, so both panels read as one affordance. Without
@@ -141,12 +135,12 @@ export interface SuggestionPopupProps {
 
 /**
  * The unified `@` panel: tabbed, keyboard-navigable suggestions anchored to the
- * composer box (or, without one, to the caret). One tab per reference kind
- * (agent first); only the active tab's group is shown. Keys are forwarded from
- * the suggestion plugin via the imperative handle (the editor keeps DOM focus),
- * so selection and the active tab are tracked manually rather than relying on
- * focus-based libraries — the tab strip never takes focus (`tabIndex={-1}` +
- * mousedown `preventDefault`).
+ * composer box (or, without one, to the caret). One tab per reference kind the
+ * user chose to show, in their order (agent first by default); only the active
+ * tab's group is shown. Keys are forwarded from the suggestion plugin via the
+ * imperative handle (the editor keeps DOM focus), so selection and the active
+ * tab are tracked manually rather than relying on focus-based libraries — the
+ * tab strip never takes focus (`tabIndex={-1}` + mousedown `preventDefault`).
  */
 export const SuggestionPopup = forwardRef<
   SuggestionPopupHandle,
@@ -163,21 +157,30 @@ export const SuggestionPopup = forwardRef<
     countLabel = (count) => `${count} results`,
     moreLabel = "More results — keep typing to filter",
     tabLabels = DEFAULT_TAB_LABELS,
+    tabs = MENTION_TAB_KINDS,
     anchorRef,
     onActiveOptionChange,
   },
   ref
 ) {
-  // Results are tagged with the query they answer. While that tag doesn't match
-  // the live query (initial mount, or mid-debounce after the query changed) the
-  // panel is "stale": it shows loading and nothing is selectable, so Enter can
-  // never insert a row from a previous query.
+  // Never an empty strip: with no tab there would be no active tab to show,
+  // select from or switch away from. (The stored preference can't express
+  // this — the file tab is pinned — so it only guards a bad prop.)
+  const searchTabs = tabs.length > 0 ? tabs : MENTION_TAB_KINDS
+  // Results are tagged with the query they answer and the tabs they were fetched
+  // for. A tab whose results don't answer the live query (initial mount, or
+  // mid-debounce after the query changed) — or that wasn't shown when they were
+  // fetched — is "stale": it shows loading and nothing in it is selectable, so
+  // Enter can never insert a row from a previous query, and a tab switched back
+  // on while the panel is open never reads "No matches" before its source has
+  // even been asked.
   const [result, setResult] = useState<{
     // null until the first fetch resolves, so results read as "stale"
     // (and the panel shows loading) before any search has answered.
     query: string | null
+    kinds: readonly ReferenceKind[]
     groups: SuggestionGroup[]
-  }>({ query: null, groups: [] })
+  }>({ query: null, kinds: [], groups: [] })
   const [selectedIndex, setSelectedIndex] = useState(0)
   // The tab the user explicitly chose (via Tab/click), or null to auto-follow
   // the first non-empty tab. Pinning survives subsequent keystrokes within this
@@ -196,23 +199,28 @@ export const SuggestionPopup = forwardRef<
   // brings it back exactly as the in-tree `/` menu does.
   const [anchorHidden, setAnchorHidden] = useState(false)
   const listRef = useRef<HTMLDivElement>(null)
-  const stale = result.query !== state.query
+  const fresh = result.query === state.query
+  const isLoaded = (kind: SuggestionGroupKind) =>
+    fresh &&
+    result.kinds.includes(kind === "delegatedSession" ? "session" : kind)
 
-  // Debounced, abortable fetch on every query change. All state updates run
-  // inside the (async) timer callback, never synchronously in the effect body.
+  // Debounced, abortable fetch on every query change — and when the shown tabs
+  // change while the panel is open (the preference lives in another window), so
+  // a tab switched back on gets its source loaded. All state updates run inside
+  // the (async) timer callback, never synchronously in the effect body.
   useEffect(() => {
     const abort = new AbortController()
     let active = true
     const timer = setTimeout(() => {
-      Promise.resolve(search(state.query, abort.signal))
+      Promise.resolve(search(state.query, abort.signal, searchTabs))
         .then((groups) => {
           if (!active || abort.signal.aborted) return
-          setResult({ query: state.query, groups })
+          setResult({ query: state.query, kinds: searchTabs, groups })
           setSelectedIndex(0)
         })
         .catch(() => {
           if (!active || abort.signal.aborted) return
-          setResult({ query: state.query, groups: [] })
+          setResult({ query: state.query, kinds: searchTabs, groups: [] })
           setSelectedIndex(0)
         })
     }, FETCH_DEBOUNCE_MS)
@@ -221,34 +229,37 @@ export const SuggestionPopup = forwardRef<
       abort.abort()
       clearTimeout(timer)
     }
-  }, [state.query, search])
+  }, [state.query, search, searchTabs])
 
   const groupByKind = useMemo(
     () => new Map(result.groups.map((group) => [group.kind, group])),
     [result.groups]
   )
-  // The delegated-children group is only in the results when the conversation
-  // has children (§14.4), so its tab comes and goes with the data — every other
-  // tab always renders.
-  const visibleTabs = useMemo(
+  const tabOrder = useMemo<readonly SuggestionGroupKind[]>(
     () =>
-      TAB_ORDER.filter(
-        (kind) => kind !== "delegatedSession" || groupByKind.has(kind)
+      searchTabs.flatMap((kind) =>
+        kind === "session" && groupByKind.has("delegatedSession")
+          ? ["delegatedSession", kind]
+          : [kind]
       ),
-    [groupByKind]
+    [searchTabs, groupByKind]
   )
-  // Auto-target the first non-empty tab (agent-first) until the user pins one,
-  // so a file/session/… query never strands the user on an empty agent tab.
-  // With children present, "this conversation's sub-agents" outranks the plain
-  // global Sessions tab.
+  // Auto-target the first non-empty tab, in the user's order, until the user
+  // pins one — so a file/session/… query never strands the user on an empty
+  // first tab.
   const firstNonEmpty = useMemo(
     () =>
-      TAB_ORDER.find(
-        (kind) => (groupByKind.get(kind)?.items.length ?? 0) > 0
-      ) ?? TAB_ORDER[0],
-    [groupByKind]
+      tabOrder.find((kind) => (groupByKind.get(kind)?.items.length ?? 0) > 0) ??
+      tabOrder[0],
+    [groupByKind, tabOrder]
   )
-  const activeTab = pinnedTab ?? firstNonEmpty
+  // A pinned tab that was switched off while the panel is open hands back to
+  // the auto-target rather than leaving a tab active that isn't on the strip.
+  const activeTab =
+    pinnedTab !== null && tabOrder.includes(pinnedTab)
+      ? pinnedTab
+      : firstNonEmpty
+  const stale = !isLoaded(activeTab)
   const activeGroup = useMemo(
     () => (stale ? null : (groupByKind.get(activeTab) ?? null)),
     [stale, groupByKind, activeTab]
@@ -377,12 +388,12 @@ export const SuggestionPopup = forwardRef<
       }
       // A move with no resize has no event at all — not `resize`, not `scroll`,
       // and ResizeObserver is deaf to it by definition. The sidebar animating
-      // open slides the centred (`max-w-3xl`) welcome composer sideways at a
-      // constant width, so nothing above would fire and the panel would sit at
-      // the old left edge for the rest of its life; an animation also has no
-      // "done" event the ancestor mutation could stand in for. Watch the box per
-      // frame and re-measure only when it actually moved — one rect read per
-      // frame, and only while the panel is open.
+      // open slides the centred (`chat-content-w`) welcome composer sideways
+      // at a constant width, so nothing above would fire and the panel would
+      // sit at the old left edge for the rest of its life; an animation also
+      // has no "done" event the ancestor mutation could stand in for. Watch the
+      // box per frame and re-measure only when it actually moved — one rect
+      // read per frame, and only while the panel is open.
       if (typeof requestAnimationFrame !== "undefined") {
         let last = anchorEl.getBoundingClientRect()
         const watch = () => {
@@ -435,18 +446,13 @@ export const SuggestionPopup = forwardRef<
             }
             return true
           case "Tab": {
-            // Tab / Shift+Tab move between tabs (pinning the choice); Enter still
-            // selects. Wraps around the VISIBLE tabs (the delegated-children tab
-            // may be absent for a childless conversation).
+            // Tab / Shift+Tab move between the shown tabs (pinning the choice);
+            // Enter still selects. Wraps around at either end.
             const dir = event.shiftKey ? -1 : 1
-            const at = visibleTabs.indexOf(activeTab)
-            const next =
-              at === -1
-                ? dir === 1
-                  ? 0
-                  : visibleTabs.length - 1
-                : (at + dir + visibleTabs.length) % visibleTabs.length
-            setPinnedTab(visibleTabs[next])
+            const at = tabOrder.indexOf(activeTab)
+            setPinnedTab(
+              tabOrder[(at + dir + tabOrder.length) % tabOrder.length]
+            )
             setSelectedIndex(0)
             return true
           }
@@ -475,15 +481,7 @@ export const SuggestionPopup = forwardRef<
         }
       },
     }),
-    [
-      flat,
-      selectedIndex,
-      activeTab,
-      visibleTabs,
-      onSelect,
-      onClose,
-      state.range,
-    ]
+    [flat, selectedIndex, activeTab, tabOrder, onSelect, onClose, state.range]
   )
 
   const activeLabel = tabLabels[activeTab]
@@ -546,9 +544,12 @@ export const SuggestionPopup = forwardRef<
           aria-orientation="horizontal"
           className="flex shrink-0 gap-0.5 overflow-x-auto border-b border-border p-1"
         >
-          {visibleTabs.map((kind) => {
+          {tabOrder.map((kind) => {
             const isActive = kind === activeTab
-            const count = stale ? 0 : (groupByKind.get(kind)?.items.length ?? 0)
+            // Counted only once this tab's own results are in, like its rows.
+            const count = isLoaded(kind)
+              ? (groupByKind.get(kind)?.items.length ?? 0)
+              : 0
             return (
               <button
                 key={kind}
@@ -574,7 +575,7 @@ export const SuggestionPopup = forwardRef<
                 )}
               >
                 <span>{tabLabels[kind]}</span>
-                {!stale && count > 0 && (
+                {count > 0 && (
                   <span className="rounded bg-muted px-1 text-[0.7rem] tabular-nums text-muted-foreground">
                     {count}
                   </span>

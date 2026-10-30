@@ -20,10 +20,9 @@
  * boolean. Because recognition is by `_meta` key and NOT by agent, an adapter
  * that adopts the convention lights the card up with no wiring — which is
  * exactly what claude 0.75.0 did. Matching renders through the dedicated
- * `<ContextCompactionCard>` (a subtle status row, not the generic tool shell)
- * and must NOT fold into a "调用 N 个工具" tool-group.
+ * `<ContextCompactionCard>` (a subtle status row, not the generic tool shell).
  *
- * Kept in a dependency-free module so both the grouping pass
+ * Kept in a dependency-free module so the adapter's passes
  * (`ai-elements-adapter.ts`) and the card/renderer can share it without an
  * import cycle (the card re-exports `ToolCallState` from the adapter).
  */
@@ -41,9 +40,11 @@ export function isContextCompactionMeta(meta: unknown): boolean {
 /**
  * `_meta` key with which the backend claims a compaction call's output IS its
  * retained summary. The Rust twin (`COMPACTION_SUMMARY_META_KEY` in
- * `acp/connection.rs`) is stamped only by the reader that translates the ACP
+ * `parsers/mod.rs`) is stamped by the reader that translates the ACP
  * `compaction_update` / `compaction_summary_chunk` lifecycle, whose summary
- * streams on the call's `raw_output`.
+ * streams on the call's `raw_output`, and by the history parsers that recover
+ * the summary from the transcript onto the divider's result (claude's
+ * continuation record, codex's `compacted` record).
  */
 export const COMPACTION_SUMMARY_META_KEY = "codeg.compactionSummary"
 
@@ -53,8 +54,7 @@ export const COMPACTION_SUMMARY_META_KEY = "codeg.compactionSummary"
  * Requires the backend's explicit claim rather than trusting any output: the
  * LEGACY compaction call puts other things on the same channel (claude's parks
  * its `{trigger, preTokens, …}` metadata object there), and a history divider
- * never has a summary at all — claude's lives in the separate continuation
- * turn the parser emits beneath it.
+ * whose transcript kept no summary has none to claim.
  */
 export function contextCompactionSummary(
   meta: unknown,

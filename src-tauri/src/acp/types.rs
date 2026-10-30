@@ -92,6 +92,31 @@ pub struct SessionNotice {
     pub description: Option<String>,
 }
 
+/// One plugin Claude Code could not load, as its `system/init` frame lists it
+/// in `plugin_errors` (CLI 2.1.283+): a plugin that did not load at all, or one
+/// that loaded without one of its components.
+///
+/// claude-agent-acp gives these no ACP surface — it only writes them to its
+/// stderr — so codeg reads them off the raw SDK stream it already subscribes to
+/// (`emitRawSDKMessages`). Field for field the CLI's entry, except that its
+/// `type` is `kind` here, the key the frontend reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginLoadFailure {
+    /// `name@marketplace`, or the positional `inline[N]` / `synced[N]` tag of a
+    /// directory entry that failed before it had a name.
+    pub plugin: String,
+    /// The CLI's category, from an OPEN set (`path-not-found`,
+    /// `generic-error`, `manifest-validation-error`, `dependency-unsatisfied`,
+    /// `hook-load-failed`, …) — a plain string so a new one passes through.
+    pub kind: String,
+    /// CLI-authored display text, in its own English; shown verbatim.
+    pub message: String,
+    /// The entry's path, present only for a directory entry that did not load
+    /// at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
 /// One JetBrains AIR typed session failure record
 /// (`session_info_update._meta.jetbrains.air.sessionFailure`; claude-agent-acp
 /// 0.67+/codex-acp 1.2+, published only because `build_client_capabilities`
@@ -147,7 +172,9 @@ pub struct AsyncTaskUsage {
 /// from the three `session/update` variants that describe it (claude-agent-acp
 /// 0.73+: background shells, workflows, monitors; codex-acp 1.10+: background
 /// terminals). Published only because `build_client_capabilities` advertises the
-/// `asyncTasks` AIR capability.
+/// `asyncTasks` AIR capability. Grok's background workflows land here too,
+/// translated from its own `workflow_updated` (Grok speaks no AIR — see
+/// `connection::grok_workflow_task_delta`).
 ///
 /// This is the MERGED projection, not a wire frame: the adapter announces a
 /// task once with its full identity (`async_task_spawned`) and then revises it
@@ -167,10 +194,12 @@ pub struct AsyncTaskRecord {
     pub name: String,
     /// Already FRIENDLY, not the SDK's raw type: claude maps
     /// `local_bash`→`"shell"`, `local_workflow`→`"workflow"`,
-    /// `local_monitor`/`mcp`→`"monitor"`, and anything else to `"task"`; codex
-    /// publishes `"shell"` for every background terminal. Kept a plain string so
-    /// an unmapped future type renders as itself instead of failing to
-    /// deserialize.
+    /// `local_monitor`/`mcp`→`"monitor"`, and anything else to `"task"`; from
+    /// 0.97.0 it names a turn Claude Code started on its own `"turn"`, and from
+    /// 0.98.0 the task of a `Monitor` call (which the SDK reports as
+    /// `local_bash`) `"monitor"`. codex publishes `"shell"` for every
+    /// background terminal. Kept a plain string so an unmapped future type
+    /// renders as itself instead of failing to deserialize.
     pub task_type: String,
     pub description: String,
     /// Whether this task earns its own transcript card upstream. codeg renders
@@ -180,9 +209,10 @@ pub struct AsyncTaskRecord {
     /// distinguish a task already drawn as an ordinary tool call (a background
     /// `Bash` is one) from a standalone job doesn't need a wire change.
     pub show_in_transcript: bool,
-    /// Whether `_session/async_task/stop` is offered. The adapter announces
-    /// `true` for every task it publishes; it is carried rather than assumed so
-    /// a future adapter can withdraw the affordance without a codeg release.
+    /// Whether `_session/async_task/stop` is offered. Carried rather than
+    /// assumed: claude-agent-acp 0.98.0 announces `false` for a monitor
+    /// (stopping one would only end the agent's wait) and refuses the request,
+    /// while every other task it publishes is `true`.
     pub can_stop: bool,
     /// `running` | `paused` | `completed` | `failed` | `stopped`. Plain string
     /// for the same forward-compatibility reason as `task_type`; treat anything
@@ -201,6 +231,14 @@ pub struct AsyncTaskRecord {
     /// the card already in the transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// The phase a multi-step task is in (a Grok workflow's current phase).
+    /// Empty = none right now (see [`AsyncTaskDelta::phase`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// The child agent the task is running right now (a Grok workflow's
+    /// current agent). Empty = none right now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_agent: Option<String>,
 }
 
 /// One async-task delta as it arrived on the wire.
@@ -213,11 +251,13 @@ pub struct AsyncTaskRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AsyncTaskDelta {
     pub task_id: String,
-    /// True only for `async_task_spawned`. A progress/state delta naming an
-    /// unknown task is DROPPED rather than creating a placeholder row: the
-    /// adapter publishes progress only for tasks it already announced, so an
-    /// unknown id means a frame we failed to read, and a row with a default
-    /// name and no type is worse than no row (see `SessionState::apply_event`).
+    /// True only for a frame that carries the task's identity: AIR's
+    /// `async_task_spawned`, and every Grok `workflow_updated` (each one
+    /// restates the whole run). A progress/state delta naming an unknown task
+    /// is DROPPED rather than creating a placeholder row: the adapter publishes
+    /// progress only for tasks it already announced, so an unknown id means a
+    /// frame we failed to read, and a row with a default name and no type is
+    /// worse than no row (see `SessionState::apply_event`).
     pub spawned: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -241,6 +281,14 @@ pub struct AsyncTaskDelta {
     pub output_file_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Grok restates its whole run on every frame, so from Grok an EMPTY string
+    /// in these two (and in `summary`) means "none any more" — the agent
+    /// finished, the pause was resumed. Absent still means unchanged, which
+    /// keeps one merge rule for everyone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_agent: Option<String>,
 }
 
 impl AsyncTaskDelta {
@@ -261,6 +309,8 @@ impl AsyncTaskDelta {
             usage: self.usage.clone(),
             output_file_path: self.output_file_path.clone(),
             tool_call_id: self.tool_call_id.clone(),
+            phase: self.phase.clone(),
+            current_agent: self.current_agent.clone(),
         }
     }
 
@@ -298,6 +348,12 @@ impl AsyncTaskDelta {
         }
         if let Some(v) = &self.tool_call_id {
             record.tool_call_id = Some(v.clone());
+        }
+        if let Some(v) = &self.phase {
+            record.phase = Some(v.clone());
+        }
+        if let Some(v) = &self.current_agent {
+            record.current_agent = Some(v.clone());
         }
     }
 }
@@ -401,7 +457,29 @@ pub enum AcpEvent {
     /// keeping the pet pinned on `Waiting` through whatever work the agent
     /// does after the approval (which, for ExitPlanMode, is the entire
     /// implementation phase).
-    PermissionResolved { request_id: String },
+    PermissionResolved {
+        request_id: String,
+        /// The option that took effect, when the request was ANSWERED. `None`
+        /// when the agent withdrew it or the connection drained it — then no
+        /// option took effect. Omitted from the wire when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        option_id: Option<String>,
+        /// Who gave that answer. The first answer wins (a later one to the same
+        /// request is a no-op), so this is the only place that can say whose
+        /// answer it was: comparing options cannot tell a person's pick from a
+        /// policy that submitted the same one a moment later. `None` exactly
+        /// when `option_id` is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<PermissionAnswerOrigin>,
+    },
+    /// What an answered permission request decided about its tool call.
+    /// Follows the `PermissionResolved` that retired the card, and only for an
+    /// answer that took effect on a card naming a tool call and an option it
+    /// offered — never for a withdrawal or a drain. The lifecycle worker keeps
+    /// it in `tool_approval` (agent transcripts record no approvals), and the
+    /// snapshot carries the connection's recent ones for a client that attaches
+    /// later; both end up as a chip on the call's row in the transcript.
+    ToolApproval { approval: ToolApprovalInfo },
     /// Turn completed
     TurnComplete {
         session_id: String,
@@ -605,6 +683,14 @@ pub enum AcpEvent {
     /// advertises `session.notices` to: claude-agent-acp (0.81+) and codex-acp
     /// (1.13+). Dropped on the replay seam — a notice has no history position.
     SessionNotice { notice: SessionNotice },
+    /// The plugins Claude Code reported it could not load (see
+    /// [`PluginLoadFailure`]). The CLI repeats the list on every turn's
+    /// `system/init`, so this is emitted once per conversation loop and again
+    /// only when the list changes — which includes coming back after an init
+    /// that listed none. Like [`Self::SessionNotice`] it is an event,
+    /// not state: `SessionState::apply_event` keeps none of it, and the frontend
+    /// shows it as a warning notification.
+    PluginLoadFailures { failures: Vec<PluginLoadFailure> },
     /// A JetBrains AIR async-task delta (see [`AsyncTaskDelta`]). Emitted for
     /// every frame codeg could read; the merge into whole rows happens
     /// identically in `SessionState::apply_event` (which the snapshot is taken
@@ -613,25 +699,53 @@ pub enum AcpEvent {
     ///
     /// Reaches codeg from the two adapters `build_client_capabilities`
     /// advertises `asyncTasks` to: claude-agent-acp (0.73+) and codex-acp
-    /// (1.10+).
+    /// (1.10+) — and from Grok, whose background workflows codeg translates
+    /// into the same deltas without advertising anything to it.
     AsyncTask { delta: AsyncTaskDelta },
     /// `session/load` failed in a way codeg cannot paper over — the agent has
-    /// no record of this `session_id`, the session/process died, or it is
-    /// archived. Emitted instead of silently falling back to `session/new`, so
-    /// the frontend can surface the failure with reload / new-conversation
-    /// actions.
+    /// no record of this `session_id`, the session/process died, it is
+    /// archived, or another client holds it open. Emitted instead of silently
+    /// falling back to `session/new`, so the frontend can surface the failure
+    /// with reload / new-conversation actions.
     SessionLoadFailed {
         session_id: String,
         message: String,
         /// Stable machine-readable identifier: `"resource_not_found"` for
-        /// JSON-RPC -32002, or `"session_unavailable"` / `"session_archived"`
-        /// matched on the wire message. See `classify_session_load_failure`.
+        /// JSON-RPC -32002, `"session_busy"` for codex-acp's typed
+        /// `data.reason: "thread_active_writer"` (2.1.0+; matched on the wire
+        /// message before that), or `"session_unavailable"` /
+        /// `"session_archived"` matched on the wire message. See
+        /// `classify_session_load_error`.
         code: String,
     },
     /// Available slash commands updated
     AvailableCommands { commands: Vec<AvailableCommandInfo> },
     /// Session usage/context window updated during conversation
     UsageUpdate { used: u64, size: u64 },
+    /// The prompt the agent predicts the user will send next, which the
+    /// composer offers as gray text while it is empty (Tab fills it in, nothing
+    /// is sent). `None` clears the one held. Read from claude-agent-acp
+    /// 0.92.0's `session_info_update._meta.promptSuggestions` (see
+    /// `connection::prompt_suggestion_update`).
+    ///
+    /// Current state, not an event: `SessionState::apply_event` keeps the last
+    /// one so a client that attaches between turns offers it too, and a new
+    /// prompt clears it there and in the frontend reducer alike.
+    PromptSuggestion {
+        #[serde(default)]
+        text: Option<String>,
+    },
+    /// Claude Code's Remote Control turned on (`Some`) or off (`None`) for the
+    /// session, read from claude-agent-acp's reply to a `/remote-control`
+    /// prompt (0.93.0; see `connection::remote_control_reply`).
+    ///
+    /// Current state, not an event: `SessionState::apply_event` keeps it for
+    /// the snapshot, and while it is on the idle sweeps leave the connection
+    /// alone, since disconnecting would end the remote session with the CLI.
+    RemoteControl {
+        #[serde(default)]
+        remote_control: Option<RemoteControlInfo>,
+    },
     /// Out-of-turn activity surfaced from the agent's own session transcript
     /// by the background watcher (`acp::background_watch`; Claude-only today).
     /// Covers everything that happens OUTSIDE a codeg-driven prompt turn:
@@ -681,6 +795,13 @@ pub enum AcpEvent {
         /// `task_id=<id>` — so the live card can label the delegation before
         /// the ack text lands on the tool output.
         task_id: String,
+        /// The assistant the child runs as (its id, and its name when the task
+        /// started); absent for a plain agent delegation. `agent_type` is then
+        /// the assistant's agent — the one actually running.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assistant_id: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assistant_name: Option<String>,
     },
     /// The child sub-session has finished (or errored / timed out / been
     /// canceled). The MCP tool_result has been delivered to the parent agent.
@@ -696,6 +817,12 @@ pub enum AcpEvent {
         /// hardcoded default. Mirrors `DelegationStarted.agent_type`.
         agent_type: crate::models::agent::AgentType,
         result: DelegationResultSummary,
+        /// Mirrors `DelegationStarted`'s assistant identity, for the same
+        /// missed-start reason as `agent_type`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assistant_id: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assistant_name: Option<String>,
     },
     /// A human submitted a prompt from the Codeg conversation UI (desktop or
     /// web). Synthetic, notification-only event: it mutates no `SessionState`
@@ -797,8 +924,10 @@ pub enum AcpEvent {
 /// transcript mid-`#870`-hold and both double-renders the held turn and races
 /// the file's own last write.
 /// `tool_use_id` is the launching `tool_use`/`tool_result` block's id (Claude's
-/// SDK-level `toolu_…`), NOT `task_id`; `None` for a background shell (its
-/// notification carries no tool-use-id and it has no marker card to flip).
+/// SDK-level `toolu_…`), NOT `task_id`. A background shell's notification names
+/// its `Bash` call too, whose card has no marker to flip, so the frontend leaves
+/// it alone; `None` when the notification names no call (an MCP call moved to
+/// the background).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundSettledInfo {
     pub task_id: String,
@@ -815,6 +944,12 @@ pub struct BackgroundSettledInfo {
     /// parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
+    /// The notification says the task will notify again
+    /// ([`crate::parsers::claude::task_notification_is_interim`]): the task is
+    /// still alive, so it stays in the watcher's outstanding count, the card
+    /// reads its result as interim, and no "finished" notification is raised.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interim: bool,
 }
 
 /// Which settings surface drifted, so the frontend can word the
@@ -1256,6 +1391,73 @@ pub struct PermissionOptionInfo {
     pub meta: Option<serde_json::Value>,
 }
 
+impl PermissionOptionInfo {
+    /// The option that lets this one call through: the `allow_once` one.
+    /// For answers given away from the card — a chat channel's `/approve` and
+    /// its auto-approve — where nobody sees which option gets picked.
+    ///
+    /// Found by the kind `connection.rs` normalized, never by position: an
+    /// adapter orders its options as it sees fit, and claude-agent-acp 0.91.0
+    /// leads with the rejection for a call the Claude CLI marks `defaultToNo`.
+    /// Never an `allow_always` either: it writes a standing rule into the
+    /// user's own agent settings (as `codeg_ask_auto_allow_option` declines
+    /// to). `None` when the request offers no such option — leave it to the
+    /// card.
+    pub fn allow_once_in(options: &[Self]) -> Option<&Self> {
+        options.iter().find(|o| o.kind == "allow_once")
+    }
+
+    /// The option that turns this one call away: the `reject_once` one — not
+    /// a `reject_always`, which writes a standing rule just the same. As
+    /// [`Self::allow_once_in`].
+    pub fn reject_once_in(options: &[Self]) -> Option<&Self> {
+        options.iter().find(|o| o.kind == "reject_once")
+    }
+}
+
+/// Who answered a permission request. It travels WITH the answer to the
+/// connection, which reports it on [`AcpEvent::PermissionResolved`] for the
+/// answer that took effect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PermissionAnswerOrigin {
+    /// A person, on the permission card in a Codeg window (desktop or web).
+    User,
+    /// A chat channel: its `/approve` / `/deny` commands or its auto-approve.
+    ChatChannel,
+    /// The permission policy of a headless `codeg-cli` run.
+    CliPolicy { run_id: String },
+}
+
+impl PermissionAnswerOrigin {
+    /// The origin's `kind` tag, which is what an approval record keeps: the
+    /// run id of a CLI policy says nothing about the decision.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::ChatChannel => "chat_channel",
+            Self::CliPolicy { .. } => "cli_policy",
+        }
+    }
+}
+
+/// One answered permission request, as a record about its tool call: what was
+/// chosen, by whom, and when. See [`AcpEvent::ToolApproval`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolApprovalInfo {
+    pub tool_call_id: String,
+    /// The chosen option's ACP kind: `allow_once`, `allow_always`,
+    /// `reject_once` or `reject_always` (passed through verbatim, so a kind a
+    /// newer agent invents survives to the reader).
+    pub option_kind: String,
+    /// The chosen option's label, in the agent's own words — the only place
+    /// that says what an "always" covers for that agent.
+    pub option_name: String,
+    /// [`PermissionAnswerOrigin::kind`] of whoever answered.
+    pub origin: String,
+    pub decided_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionModeInfo {
     pub id: String,
@@ -1269,21 +1471,21 @@ pub struct SessionModeStateInfo {
     pub available_modes: Vec<SessionModeInfo>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionConfigSelectOptionInfo {
     pub value: String,
     pub name: String,
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionConfigSelectGroupInfo {
     pub group: String,
     pub name: String,
     pub options: Vec<SessionConfigSelectOptionInfo>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionConfigSelectInfo {
     pub current_value: String,
     pub options: Vec<SessionConfigSelectOptionInfo>,
@@ -1292,19 +1494,19 @@ pub struct SessionConfigSelectInfo {
 
 /// An on/off toggle config option (ACP's boolean `SessionConfigOption`). Cline
 /// 3.0.50+ ships one as `auto_approve` ("Auto-approve tools").
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionConfigBooleanInfo {
     pub current_value: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionConfigKindInfo {
     Select(SessionConfigSelectInfo),
     Boolean(SessionConfigBooleanInfo),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionConfigOptionInfo {
     pub id: String,
     pub name: String,
@@ -1349,10 +1551,49 @@ pub struct GrokModelSpec {
     pub context_window: Option<u64>,
 }
 
+/// Grok's model catalog as its `_x.ai/models/update` broadcast states it: the
+/// list a session's model picker should offer, plus each model's spec.
+/// Backend-internal — NOT serialized onto the wire.
+#[derive(Debug, Clone)]
+pub struct GrokModelCatalog {
+    /// The picker's model rows in catalog order — `value` is the model id and
+    /// `name` its display name. No description: the rows a handshake's
+    /// `x.ai/sessionConfig` yields carry none, and the picker must read the
+    /// same whichever of the two built it.
+    pub models: Vec<SessionConfigSelectOptionInfo>,
+    /// Per-model specs, parsed exactly as a handshake's `models` are. Each
+    /// `default` here is the bare catalog default, not a session's own effort.
+    pub specs: std::collections::HashMap<String, GrokModelSpec>,
+}
+
+/// Kiro CLI's reasoning-effort state, from `_kiro.dev/metadata.reasoning`:
+/// `{"support": "alwaysOn" | "toggleable" | "unavailable", "effort"?: "high",
+/// "effortLevels": ["low", …, "max"]}` (verified against 2.24.1). `support`
+/// describes thinking, not effort, so only `effortLevels` is read; `effort` is
+/// absent until one is set in the session. Backend-internal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KiroReasoning {
+    /// Levels the CURRENT model accepts; empty when it takes none.
+    pub levels: Vec<String>,
+    /// The level the session runs at, when Kiro reports one.
+    pub current: Option<String>,
+    /// Whether the current model's thinking can be switched on and off
+    /// (`support: "toggleable"`; `alwaysOn` and `unavailable` models cannot).
+    pub thinking_toggleable: bool,
+    /// Whether thinking is on (`thinkingEnabled`), when Kiro reports it — only
+    /// once it has been set, in the session or as the model's saved default.
+    pub thinking: Option<bool>,
+}
+
 /// Read-only snapshot of the modes + config_options an agent advertises
 /// when it opens a new session. Used by `ConnectionManager::probe_agent_options`
 /// to give the delegation settings UI an authoritative view of what an
 /// agent will accept (no reliance on chat-side caches).
+///
+/// The caller's selections (the model) are applied first, as a real launch
+/// applies them, so an option the agent derives from one answers for it. Each
+/// option's current value is what it runs when the caller leaves it unset —
+/// for an applied option that is the agent's own pick, not the selection.
 ///
 /// Both fields mirror `SessionState`: `modes` is `None` when the agent
 /// reports no mode catalog (e.g. some thin wrappers); `config_options` is
@@ -1375,6 +1616,16 @@ pub struct AgentOptionsSnapshot {
     /// `None` when the agent advertised nothing within the probe window.
     #[serde(default)]
     pub prompt_capabilities: Option<PromptCapabilitiesInfo>,
+    /// The options the caller asked the probe to set that the probe session
+    /// did not end up holding — rejected, skipped as withdrawn, or no longer
+    /// listed. An editor that probed for a chosen model reads `model` here as
+    /// "these options are the OTHER model's": the probe still succeeds, and
+    /// the applied options' `current_value` is deliberately rewritten to the
+    /// agent's own pick (see `report_agent_chosen_values`), so nothing else in
+    /// the snapshot can tell. Always serialized, empty included, so a missing
+    /// field can only mean a backend that predates it.
+    #[serde(default)]
+    pub unapplied_config_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1444,6 +1695,16 @@ pub struct AcpAgentInfo {
     /// "the adapter isn't installed" instead of "the agent isn't", without
     /// hardcoding a second copy of the agent list frontend-side.
     pub is_acp_adapter: bool,
+    /// The vendor's install page for an agent codeg does not install itself
+    /// (`AgentDistribution::System`, i.e. `distribution_type == "system"`):
+    /// the Settings page links it where other agents get an Install button.
+    /// `None` for every agent codeg installs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install_url: Option<String>,
+    /// Whether that install can be upgraded from the Settings page through the
+    /// vendor's own updater (`acp_update_system_agent`). Always `false` for
+    /// agents codeg installs itself — they upgrade through their own actions.
+    pub supports_self_update: bool,
     /// For custom agents, where the definition came from (`registry` |
     /// `manual`); `None` for built-ins. A manual definition's
     /// `registry_version` is user-typed, so the version-status display shows
@@ -1466,7 +1727,6 @@ pub struct AcpAgentInfo {
     pub host_tools_agent_mode: bool,
     pub config_json: Option<String>,
     pub config_file_path: Option<String>,
-    pub opencode_auth_json: Option<String>,
     pub codex_auth_json: Option<String>,
     pub codex_config_toml: Option<String>,
     /// Compact structured codex model-catalog source (the `codeg` custom-model
@@ -1497,6 +1757,10 @@ pub struct AcpAgentInfo {
     /// permission mode is a launch flag, not a config key). Only populated
     /// for `AgentType::Cursor`. Derived from `cursor_cli_config_json`.
     pub cursor_settings: Option<CursorSettings>,
+    /// The `/model` picker ids codeg adds for codeg's Claude sessions when no
+    /// model provider is bound (`acp::claude_model_picker`). Only populated
+    /// for `AgentType::ClaudeCode`.
+    pub claude_model_picker: Option<Vec<String>>,
     pub model_provider_id: Option<i32>,
     /// Display icon for a custom ACP agent — normally an inlined
     /// `data:image/…;base64,…` URL (see
@@ -1682,6 +1946,21 @@ pub struct GrokSettings {
     pub custom_api_backend: Option<String>,
     /// `[model.<id>].context_window` — context size in tokens.
     pub custom_context_window: Option<i64>,
+    /// `[model.<id>].reasoning_efforts` — the reasoning-effort levels the custom
+    /// model declares, each as the `value` Grok sends to the provider (a bare
+    /// string entry is its own value), lowercased since Grok matches them
+    /// case-insensitively, in file order. Empty when the key is absent: Grok
+    /// then inherits levels only from its model catalog's row for the same id
+    /// (xAI's list, or `[endpoints].models_base_url`'s) — never from the model's
+    /// own `base_url` — and a model with neither advertises no effort support,
+    /// so the composer offers no effort selector for it.
+    #[serde(default)]
+    pub custom_reasoning_efforts: Vec<String>,
+    /// The endpoint's other models codeg added beside the managed one, in file
+    /// order: the `[model.<id>]` tables naming `model_provider = "codeg"`,
+    /// whose `[model_providers.codeg]` carries the managed endpoint and key.
+    #[serde(default)]
+    pub custom_extra_models: Vec<String>,
     /// `[session].auto_compact_threshold_percent` — auto-compact trigger, 0–100
     /// (Grok's default is 85).
     pub auto_compact_threshold_percent: Option<i64>,
@@ -1708,6 +1987,20 @@ pub struct GrokStructuredConfig {
     pub custom_api_key: Option<String>,
     pub custom_api_backend: Option<String>,
     pub custom_context_window: Option<i64>,
+    /// The custom model's `reasoning_efforts` levels. Unlike every other field
+    /// here, `None` leaves the key as it is, following the model through a
+    /// rename: the panel sends levels only once its chips moved, because the
+    /// list may be hand-written — in the panel's own raw config.toml editor, or
+    /// before the panel managed the key — and neither an untouched control nor a
+    /// client that predates the field may undo that. `Some(empty)` removes the
+    /// key; a non-empty list writes it.
+    pub custom_reasoning_efforts: Option<Vec<String>>,
+    /// The endpoint's other models to offer beside the managed one, each a
+    /// `[model.<id>]` on codeg's `[model_providers.codeg]`. `None` keeps the
+    /// ones codeg added (following the endpoint's URL, key and backend); a list
+    /// makes them exactly those. Ignored without `custom_model_id`.
+    #[serde(default)]
+    pub custom_extra_models: Option<Vec<String>>,
     pub auto_compact_threshold_percent: Option<i64>,
 }
 
@@ -1961,6 +2254,27 @@ pub struct AvailableCommandInfo {
     pub name: String,
     pub description: String,
     pub input_hint: Option<String>,
+    /// The agent marks the command as a skill (JetBrains AIR's command
+    /// `_meta.jetbrains.air.kind = "skill"`, read by `air_command_skill` in
+    /// `connection.rs`). Left off the wire when false, so a command of an agent
+    /// that marks nothing serializes exactly as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skill: bool,
+    /// The skill's `SKILL.md`, when the agent sent its path. Only ever set
+    /// together with `skill`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_path: Option<String>,
+}
+
+/// Claude Code's Remote Control for a session that has it on: the session can
+/// be continued from claude.ai/code or the Claude app on a phone for as long as
+/// the CLI process runs (see `AcpEvent::RemoteControl`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteControlInfo {
+    /// The remote session's claude.ai/code URL, absent when Claude Code turned
+    /// Remote Control on without returning one.
+    #[serde(default)]
+    pub session_url: Option<String>,
 }
 
 /// Internal reply shape from the connection loop back to `manager.fork_session`
@@ -2353,5 +2667,62 @@ mod envelope_tests {
             "resource": {"blob": "QUJD", "mimeType": "image/png"}
         }))
         .is_some());
+    }
+}
+
+#[cfg(test)]
+mod permission_option_tests {
+    use super::*;
+
+    fn option(option_id: &str, kind: &str) -> PermissionOptionInfo {
+        PermissionOptionInfo {
+            option_id: option_id.into(),
+            name: option_id.into(),
+            kind: kind.into(),
+            meta: None,
+        }
+    }
+
+    fn id(option: Option<&PermissionOptionInfo>) -> Option<&str> {
+        option.map(|o| o.option_id.as_str())
+    }
+
+    #[test]
+    fn one_time_options_are_found_by_kind_whatever_the_order() {
+        // claude-agent-acp 0.91.0's two orders: approvals first, and the
+        // rejection first for a call the Claude CLI marks `defaultToNo`.
+        let approvals_first = [
+            option("allow-once", "allow_once"),
+            option("allow-with-updates", "allow_always"),
+            option("reject", "reject_once"),
+        ];
+        let rejection_first = [
+            option("reject", "reject_once"),
+            option("allow-once", "allow_once"),
+            option("allow-with-updates", "allow_always"),
+        ];
+        for options in [&approvals_first[..], &rejection_first[..]] {
+            assert_eq!(
+                id(PermissionOptionInfo::allow_once_in(options)),
+                Some("allow-once")
+            );
+            assert_eq!(
+                id(PermissionOptionInfo::reject_once_in(options)),
+                Some("reject")
+            );
+        }
+    }
+
+    #[test]
+    fn a_standing_option_never_stands_in_for_a_one_time_one() {
+        let standing = [
+            option("always", "allow_always"),
+            option("never", "reject_always"),
+            option("other", "unknown"),
+        ];
+        assert_eq!(id(PermissionOptionInfo::allow_once_in(&standing)), None);
+        assert_eq!(id(PermissionOptionInfo::reject_once_in(&standing)), None);
+        assert_eq!(id(PermissionOptionInfo::allow_once_in(&[])), None);
+        assert_eq!(id(PermissionOptionInfo::reject_once_in(&[])), None);
     }
 }

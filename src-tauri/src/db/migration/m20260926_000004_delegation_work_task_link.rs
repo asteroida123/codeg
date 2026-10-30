@@ -101,7 +101,7 @@ mod tests {
             .iter()
             .position(|migration| migration.name() == "m20260926_000004_delegation_work_task_link")
             .expect("link migration is registered");
-        Migrator::up(&conn, Some(idx as u32))
+        crate::db::migration::UpstreamSchemaFixture::<4>::up(&conn, None)
             .await
             .expect("apply pre-link schema");
 
@@ -152,10 +152,8 @@ mod tests {
         assert_eq!(column, 1, "work_task_id must exist after upgrade");
 
         let legacy = conn
-            .query_one(sql(
-                "SELECT COUNT(*) AS n FROM delegation_task \
-                 WHERE task_id = 'legacy-task' AND work_task_id IS NULL",
-            ))
+            .query_one(sql("SELECT COUNT(*) AS n FROM delegation_task \
+                 WHERE task_id = 'legacy-task' AND work_task_id IS NULL"))
             .await
             .expect("probe legacy")
             .expect("row")
@@ -164,17 +162,15 @@ mod tests {
         assert_eq!(legacy, 1, "legacy rows must keep NULL attribution");
 
         // A new row can carry the link, and the index serves the task read.
-        conn.execute(sql(
-            "INSERT INTO delegation_task \
+        conn.execute(sql("INSERT INTO delegation_task \
              (task_id, parent_conversation_id, child_conversation_id, source_task_id, \
               task, requested_working_dir, status, terminal_report, resume_binding, \
               released, work_task_id, created_at, updated_at) VALUES \
              ('linked-task', 1, 2, NULL, 'work', NULL, \
               'running', NULL, '{\"agent_type\":\"codex\"}', 0, 42, \
-              '2026-09-01 00:00:00+00:00', '2026-09-01 00:00:00+00:00')",
-        ))
-        .await
-        .expect("insert linked row");
+              '2026-09-01 00:00:00+00:00', '2026-09-01 00:00:00+00:00')"))
+            .await
+            .expect("insert linked row");
         let linked = conn
             .query_one(sql(
                 "SELECT COUNT(*) AS n FROM delegation_task WHERE work_task_id = 42",

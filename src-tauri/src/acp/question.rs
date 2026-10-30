@@ -683,10 +683,11 @@ pub fn pi_select_option_id(outcome: &QuestionOutcome, ask: &PiSelectAsk) -> Opti
 /// companion tool, in whatever spelling the host composed it
 /// (`mcp__codeg-mcp__ask_user_question` from claude-agent-acp,
 /// `codeg-mcp/ask_user_question`, `codeg-mcp: ask_user_question`, …). Separators
-/// are folded and case is ignored, so only the two identifying words matter.
+/// are folded and case is ignored ([`crate::acp::delegation::is_codeg_mcp_tool`]).
 ///
-/// BOTH halves have to be present — the server name codeg itself injects
-/// (`codeg-mcp`, see `acp::connection::inject_codeg_mcp`) AND the tool name.
+/// BOTH halves have to be present, and nothing else — the server name codeg
+/// itself injects (`codeg-mcp`, see `acp::connection::inject_codeg_mcp`) AND the
+/// tool name: a server named `other-codeg-mcp` is not codeg's.
 /// The frontend can afford a bare `*ask_user_question` suffix rule because a
 /// wrong match there only picks a nicer card; this one unlocks an AUTO-APPROVAL
 /// of a blocked `session/request_permission`, and a third-party MCP server's
@@ -697,11 +698,111 @@ pub fn pi_select_option_id(outcome: &QuestionOutcome, ask: &PiSelectAsk) -> Opti
 /// block until the user answers it. The consent IS the next dialog, so gating it
 /// behind a generic "run this tool?" card asks the user to approve being asked.
 pub fn is_codeg_ask_tool_name(name: &str) -> bool {
-    let normalized = name
-        .trim()
-        .to_ascii_lowercase()
-        .replace(['-', ' ', '.', '/', ':'], "_");
-    normalized.ends_with("ask_user_question") && normalized.contains("codeg_mcp")
+    crate::acp::delegation::is_codeg_mcp_tool(name, "ask_user_question")
+}
+
+/// The id prefix antigravity-acp gives the synthetic tool call of one of its
+/// own questions: `server.py::_ask_user_handler` mints
+/// `interaction_<8 hex>` for each question it asks (the model's `ask_question`,
+/// asked one question at a time, and the workspace-trust prompt alike). It is
+/// the only producer of that prefix in 1.4.1, 1.4.3 and 1.4.4.
+pub const ANTIGRAVITY_INTERACTION_ID_PREFIX: &str = "interaction_";
+
+/// True when `id` has the shape of an antigravity-acp question's tool call id
+/// (see [`ANTIGRAVITY_INTERACTION_ID_PREFIX`]). The prefix alone says nothing
+/// about the agent, so callers must also check that the connection is
+/// Antigravity's.
+pub fn is_antigravity_interaction_id(id: &str) -> bool {
+    id.strip_prefix(ANTIGRAVITY_INTERACTION_ID_PREFIX)
+        .is_some_and(|rest| !rest.is_empty())
+}
+
+/// Antigravity 原生交互通过权限选项承载答案，保留文字到 optionId 的映射。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AntigravityAsk {
+    pub spec: QuestionSpec,
+    pub option_ids: Vec<(String, String)>,
+}
+
+/// 识别 antigravity-acp 1.4.1 的交互请求，而非模型调用 ask_question 的参数。
+/// 实测 title 是问题正文、rawInput 为空，选项位于请求外层。
+/// 调用方还必须校验 AgentType::Antigravity，避免接管其他代理的权限请求。
+pub fn parse_antigravity_ask(
+    tool_call: &Value,
+    options: &[(String, String)],
+) -> Option<AntigravityAsk> {
+    let id = tool_call.get("toolCallId")?.as_str()?;
+    if !is_antigravity_interaction_id(id) || !(MIN_OPTIONS..=MAX_OPTIONS).contains(&options.len()) {
+        return None;
+    }
+    if let Some(kind) = tool_call.get("kind").and_then(Value::as_str) {
+        if kind != "other" {
+            return None;
+        }
+    }
+    if let Some(status) = tool_call.get("status").and_then(Value::as_str) {
+        if status != "pending" {
+            return None;
+        }
+    }
+    if let Some(raw_input) = tool_call.get("rawInput") {
+        let is_empty_or_null = raw_input.is_null()
+            || raw_input.as_object().is_some_and(serde_json::Map::is_empty);
+        if !is_empty_or_null {
+            return None;
+        }
+    }
+    let question = tool_call.get("title")?.as_str()?.trim();
+    if question.is_empty() || question.chars().count() > MAX_QUESTION_TEXT_CHARS {
+        return None;
+    }
+    let mut choices = Vec::with_capacity(options.len());
+    let mut option_ids = Vec::with_capacity(options.len());
+    let mut labels = std::collections::HashSet::new();
+    let mut ids = std::collections::HashSet::new();
+    for (id, name) in options {
+        let label = name.trim();
+        if id.trim().is_empty()
+            || label.is_empty()
+            || label.chars().count() > MAX_QUESTION_TEXT_CHARS
+            || !labels.insert(label)
+            || !ids.insert(id)
+        {
+            return None;
+        }
+        choices.push(QuestionOption {
+            label: label.to_string(),
+            description: String::new(),
+        });
+        option_ids.push((label.to_string(), id.clone()));
+    }
+    Some(AntigravityAsk {
+        spec: QuestionSpec {
+            id: uuid::Uuid::new_v4().to_string(),
+            question: question.to_string(),
+            header: synthesize_header(question),
+            // ACP 权限响应只接受一个 optionId，原生代理逐题发送交互请求。
+            multi_select: false,
+            options: choices,
+            is_secret: false,
+        },
+        option_ids,
+    })
+}
+
+/// 只回传本题的一个原生选项；取消或无法表达的自由文本不伪装为首项。
+pub fn antigravity_option_id(outcome: &QuestionOutcome, ask: &AntigravityAsk) -> Option<String> {
+    if outcome.declined || outcome.answers.len() != 1 {
+        return None;
+    }
+    let answer = &outcome.answers[0];
+    if answer.question != ask.spec.question || answer.selected.len() != 1 {
+        return None;
+    }
+    ask.option_ids
+        .iter()
+        .find(|(label, _)| label == &answer.selected[0])
+        .map(|(_, id)| id.clone())
 }
 
 /// Serialize a resolved [`QuestionOutcome`] into grok's `AskUserQuestionExtResponse`
@@ -976,25 +1077,31 @@ pub enum CodexUserInputShape {
 /// The identity has to come from the connection, not from the payload. `_meta`
 /// is an OPEN namespace: the ACP spec tells implementations to make no
 /// assumptions about keys they do not own, and this parser is shared — codeg
-/// advertises `elicitation.form` to DeepSeek as well as Codex, and EITHER
-/// adapter also forwards arbitrary MCP-server forms through it. Deciding "this
-/// is codex" from `_meta.codex.*` in the request would let a third party, by
-/// coincidence or on purpose, switch on codex's orientation flip, its companion
-/// skip and its synthetic-option filter for a form codex never sent — which can
-/// hide a legitimate field or change how an answer is encoded.
+/// advertises `elicitation.form` to DeepSeek and Qoder as well as Codex, and
+/// codex-acp and deepseek-acp also forward arbitrary MCP-server forms through
+/// it. Deciding "this is codex" from `_meta.codex.*` in the request would let a
+/// third party, by coincidence or on purpose, switch on codex's orientation
+/// flip, its companion skip and its synthetic-option filter for a form codex
+/// never sent — which can hide a legitimate field or change how an answer is
+/// encoded.
 ///
 /// So `Other` is absolute: no codex fixup runs for it, whatever `_meta` claims.
 /// Only inside `Codex` does the payload get a say, and then only about WHICH
 /// generation sent it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ElicitationPeer {
-    /// Anything that is not codex-acp (DeepSeek today; any future
-    /// `elicitation.form` speaker). The form is parsed generically.
+    /// Anything that is neither codex-acp nor OpenCode (DeepSeek and Qoder
+    /// today; any future `elicitation.form` speaker). The form is parsed
+    /// generically.
     Other,
     /// codex-acp, carrying the `request_user_input` shape its RUNNING version
     /// implies — `None` when `agentInfo.version` was absent or unparseable, in
     /// which case the form's own markers have to date it.
     Codex(Option<CodexUserInputShape>),
+    /// OpenCode 2, whose question forms pair every select field `<id>` with a
+    /// free-text `<id>_custom` companion (see [`is_opencode_custom_companion`]).
+    /// Otherwise parsed generically.
+    OpenCode,
 }
 
 impl ElicitationPeer {
@@ -1078,8 +1185,15 @@ fn codex_form_shape(raw: &Value, peer: ElicitationPeer) -> Option<CodexUserInput
     )
 }
 
-/// The synthetic choice codex-acp ≥1.12.0 appends to an `isOther` question's
-/// `oneOf`, verbatim — label and description both.
+/// The synthetic choice codex-acp 1.12.0–2.0.x appends to an `isOther`
+/// question's `oneOf`, verbatim — label and description both.
+///
+/// codex-acp 2.1.0 (#570) stopped appending it for AIR clients — and codeg is
+/// one, by advertising `_meta.jetbrains.air` at all — in favour of the
+/// AIR custom answer (see [`build_elicitation_response`]). So against the pin
+/// this filter never fires; it stays for the older adapters a custom pin or a
+/// PATH install can still launch, which keep injecting the option for every
+/// client.
 ///
 /// codeg's card already offers a free-text "Other" input on every question and
 /// writes it to the MAIN field, while the note field this option points at is
@@ -1153,6 +1267,67 @@ fn is_codex_synthetic_other_choice(raw: &Value, id: &str, label: &str, value: &s
     })
 }
 
+/// True when `id` is the free-text companion OpenCode 2 puts beside a select
+/// field: `<field>_custom`, next to a `<field>` that offers choices. OpenCode
+/// marks it with nothing but the name — `custom: true` on a question field
+/// becomes a select plus a `"<title> (other)"` string property
+/// (`packages/cli/src/acp/elicitation.ts` `other` / `customKey`, 2.2.0) — so,
+/// like codex's `_meta.codex` markers, the rule is trusted only on an OpenCode
+/// connection, where the card's own "Other" input stands in for it.
+///
+/// The typed answer then rides under the select field's own id
+/// ([`build_elicitation_response`] writes every value there), which OpenCode
+/// accepts: its question fields are `custom`, so a value outside the options
+/// is the user's own answer (`core/src/form.ts`).
+fn is_opencode_custom_companion(
+    properties: &BTreeMap<String, ElicitationPropertySchema>,
+    id: &str,
+) -> bool {
+    let Some(field) = id.strip_suffix("_custom") else {
+        return false;
+    };
+    match properties.get(field) {
+        Some(ElicitationPropertySchema::String(s)) => !string_prop_choices(s).is_empty(),
+        Some(ElicitationPropertySchema::Array(_)) => true,
+        _ => false,
+    }
+}
+
+/// Whether an OpenCode 2 `elicitation/create` is its `question` tool's form:
+/// one `q<n>` field per question, each optionally beside its `q<n>_custom`
+/// companion (`core/src/tool/plugin/question.ts` `toField`, 2.2.0). OpenCode
+/// elicits one other form, the web-search provider choice
+/// (`core/src/tool/plugin/websearch.ts`, a `choice` field), which codeg does not
+/// ask the user: it is declined, and the search fails over to the model.
+pub fn is_opencode_question_form(raw: &Value) -> bool {
+    let Some(properties) = raw
+        .get("requestedSchema")
+        .and_then(|schema| schema.get("properties"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let is_question_key = |key: &str| {
+        key.strip_prefix('q')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    !properties.is_empty()
+        && properties.keys().any(|key| is_question_key(key))
+        && properties.keys().all(|key| {
+            is_question_key(key) || key.strip_suffix("_custom").is_some_and(is_question_key)
+        })
+}
+
+/// The elicitation reply that ANSWERS an OpenCode question with nothing:
+/// `accept` with no content. OpenCode then hands the model "Unanswered" for
+/// each question and the turn goes on (`core/src/tool/plugin/question.ts`
+/// `toModelContent`). Used where codeg cannot ask the user (the ask feature is
+/// off, another question is already open): a `decline` there would read to
+/// OpenCode as the user DISMISSING the question, which ends the turn.
+pub fn elicitation_unanswered_response() -> CreateElicitationResponse {
+    CreateElicitationResponse::new(ElicitationAction::Accept(ElicitationAcceptAction::new()))
+}
+
 /// True when the raw schema property carries the shared custom-answer marker
 /// (`_meta._askUserQuestionCustomAnswer.isCustomAnswer`), i.e. it is the
 /// free-text "Other" companion of a sibling select question.
@@ -1164,17 +1339,42 @@ fn is_codex_synthetic_other_choice(raw: &Value, id: &str, label: &str, value: &s
 /// marker means codeg keeps collapsing the companion into the card's built-in
 /// "Other" input no matter which adapter produced the form.
 ///
+/// claude-agent-acp 0.82.0 moved the marker to
+/// `_meta.jetbrains.air.customAnswer` (same value) and sends the old key to no
+/// client, so both spellings are read.
+///
+/// codex-acp 2.1.0 (#570) marks its `request_user_input` note field with the
+/// same AIR key but a different value: a bare `true` rather than claude's
+/// `{questionId, isCustomAnswer: true}` (both adapters' `docs/air-extensions.md`
+/// say so). 2.1.1 (#577) adds the old root key with that same bare `true`,
+/// because released AIR builds read only the old key. Either value is read
+/// under either key. A codex peer's note field is already skipped by its
+/// `_meta.codex.role`; reading the marker too means the companion is
+/// recognised by the shared AIR key alone, whoever sends it.
+///
 /// Like [`is_secret_property`], this reads the raw JSON: the typed schema
 /// property structs carry no `_meta`.
 fn is_custom_answer_property(raw: &Value, id: &str) -> bool {
-    raw.get("requestedSchema")
+    let Some(meta) = raw
+        .get("requestedSchema")
         .and_then(|s| s.get("properties"))
         .and_then(|p| p.get(id))
         .and_then(|prop| prop.get("_meta"))
-        .and_then(|m| m.get("_askUserQuestionCustomAnswer"))
-        .and_then(|c| c.get("isCustomAnswer"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let is_marked = |marker: &Value| match marker {
+        Value::Bool(marked) => *marked,
+        marker => marker
+            .get("isCustomAnswer")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    };
+    meta.get("_askUserQuestionCustomAnswer")
+        .is_some_and(is_marked)
+        || crate::acp::air_contract::air_meta_value(Some(meta), "customAnswer")
+            .is_some_and(is_marked)
 }
 
 /// True when the request is codex's MCP tool-call approval elicitation. The
@@ -1268,7 +1468,8 @@ pub fn classify_elicitation(
     }
     // Carry the elicitation's tool_call_id so the connection handler can key the
     // synthesized in-stream result card to it — codex delivers `request_user_input`
-    // ONLY as this elicitation, never as a stream tool_call.
+    // ONLY as this elicitation, never as a stream tool_call. (Qoder streams its
+    // ask as a tool_call of its own, so the handler synthesizes no card there.)
     questions.tool_call_id = tool_call_id;
     Ok(ElicitationPlan::Questions(questions))
 }
@@ -1376,8 +1577,8 @@ fn parse_form_questions(
     // `title`/`description` carries the question (see [`codex_form_shape`]).
     let codex_shape = codex_form_shape(raw, peer);
     // The 1.12.0-only fixups below apply to exactly one generation of exactly
-    // one adapter; everything else — DeepSeek, generic MCP servers — shares this
-    // parser and must come through untouched.
+    // one adapter; everything else — DeepSeek, Qoder, generic MCP servers —
+    // shares this parser and must come through untouched.
     let is_codex_112_form = codex_shape == Some(CodexUserInputShape::QuestionInTitle);
     // `_meta.codex` is only codex's to interpret. On any other peer the same
     // keys are an unrelated extension that must not silently eat a field.
@@ -1402,6 +1603,8 @@ fn parse_form_questions(
         if is_other_companion(id)
             || (peer_is_codex && codex_companion_role(raw, id).is_some())
             || is_custom_answer_property(raw, id)
+            || (peer == ElicitationPeer::OpenCode
+                && is_opencode_custom_companion(&form.requested_schema.properties, id))
         {
             continue;
         }
@@ -1554,7 +1757,14 @@ fn parse_bool_answer(v: &str) -> Option<bool> {
 /// Every value is written under the MAIN field id, including a free-text
 /// "Other": the companion property skipped by [`is_custom_answer_property`] /
 /// [`is_other_companion`] is never written back. That is correct for codex,
-/// which falls back to the main field. If codeg ever advertises
+/// which falls back to the main field — and from codex-acp 2.1.0 (#570) it is
+/// the documented AIR contract: a choice field's string that matches none of
+/// an `isOther` question's options is the user's own answer, which the adapter
+/// hands codex in codex's own "Other" encoding,
+/// `["None of the above", "user_note: <text>"]` (≤2.0.x passed the text through
+/// as the answer itself). The reloaded rollout therefore carries that pair, and
+/// the frontend's `parseCodexAnswers` decodes it back to the text the user
+/// typed, so the live card and the reloaded one agree. If codeg ever advertises
 /// `elicitation.form` to an agent that requires the answer under the companion
 /// key instead (claude-agent-acp reads `question_<n>_custom` separately), this
 /// has to route the free-text answer there using the marker's `questionId`.
@@ -1808,6 +2018,149 @@ mod tests {
         }
     }
 
+    /// OpenCode 2.2.0's `question` tool, as its bridge elicits it (live
+    /// capture): a `q<n>` select per question beside a `q<n>_custom` text
+    /// companion, scoped to the streamed tool call.
+    fn opencode_question_raw() -> Value {
+        json!({
+            "mode": "form",
+            "sessionId": "ses_e826307d6ffepX5ltg2opas3fw",
+            "toolCallId": "call_main_11_15",
+            "message": "Questions",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "q0": {
+                        "type": "string",
+                        "title": "Color",
+                        "description": "Which color do you prefer?",
+                        "oneOf": [
+                            {"const": "Red", "title": "Red", "description": "Warm"},
+                            {"const": "Blue", "title": "Blue", "description": "Cool"},
+                        ],
+                    },
+                    "q0_custom": {
+                        "type": "string",
+                        "title": "Color (other)",
+                        "description": "Type your own answer",
+                    },
+                },
+                "required": [],
+            },
+        })
+    }
+
+    #[test]
+    fn classify_elicitation_reads_opencode_question_form() {
+        let raw = opencode_question_raw();
+        assert!(is_opencode_question_form(&raw));
+        let q = expect_questions(classify_elicitation(&raw, ElicitationPeer::OpenCode).unwrap());
+        // The companion is the card's own "Other" input, not a question.
+        assert_eq!(q.specs.len(), 1, "{:?}", q.specs);
+        let spec = &q.specs[0];
+        assert_eq!(spec.id, "q0");
+        assert_eq!(spec.header, "Color");
+        assert_eq!(spec.question, "Which color do you prefer?");
+        assert!(!spec.multi_select);
+        let labels: Vec<_> = spec.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(labels, ["Red", "Blue"]);
+        assert_eq!(q.tool_call_id.as_deref(), Some("call_main_11_15"));
+
+        // A typed answer rides under the select field itself, which OpenCode
+        // takes as the user's own answer (its question fields are `custom`).
+        let outcome = QuestionOutcome {
+            answers: vec![QuestionAnsweredItem {
+                question: "Which color do you prefer?".to_string(),
+                header: "Color".to_string(),
+                multi_select: false,
+                selected: vec!["Teal".to_string()],
+            }],
+            declined: false,
+        };
+        assert_eq!(
+            serde_json::to_value(build_elicitation_response(&q, &outcome)).unwrap(),
+            json!({"action": "accept", "content": {"q0": "Teal"}})
+        );
+
+        // The name alone is no companion on another connection.
+        let generic = expect_questions(classify_elicitation(&raw, ElicitationPeer::Other).unwrap());
+        assert_eq!(generic.specs.len(), 2);
+    }
+
+    #[test]
+    fn opencode_multi_select_question_keeps_its_companion_hidden() {
+        let raw = json!({
+            "mode": "form",
+            "sessionId": "ses_1",
+            "toolCallId": "call_1",
+            "message": "Questions",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "q0": {
+                        "type": "array",
+                        "title": "Integrations",
+                        "description": "Pick the integrations",
+                        "items": {"anyOf": [
+                            {"const": "GitHub", "title": "GitHub"},
+                            {"const": "Slack", "title": "Slack"},
+                        ]},
+                        "minItems": 1,
+                    },
+                    "q0_custom": {
+                        "type": "string",
+                        "title": "Integrations (other)",
+                        "description": "Add your own answer",
+                    },
+                },
+                "required": ["q0"],
+            },
+        });
+        let q = expect_questions(classify_elicitation(&raw, ElicitationPeer::OpenCode).unwrap());
+        assert_eq!(q.specs.len(), 1);
+        assert!(q.specs[0].multi_select);
+    }
+
+    /// OpenCode's other form, the web-search provider choice, is not a
+    /// question form (`core/src/tool/plugin/websearch.ts`).
+    #[test]
+    fn opencode_websearch_form_is_not_a_question_form() {
+        let raw = json!({
+            "mode": "form",
+            "sessionId": "ses_1",
+            "message": "Web Search",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "choice": {
+                        "type": "string",
+                        "description": "Allow OpenCode to search the web for up-to-date information?",
+                        "oneOf": [
+                            {"const": "allow", "title": "Allow search via Exa"},
+                            {"const": "disable", "title": "Disable web search"},
+                        ],
+                    },
+                },
+                "required": ["choice"],
+            },
+        });
+        assert!(!is_opencode_question_form(&raw));
+        assert!(!is_opencode_question_form(&json!({"requestedSchema": {"properties": {}}})));
+        assert!(!is_opencode_question_form(&json!({
+            "requestedSchema": {"properties": {"q0_custom": {"type": "string"}}}
+        })));
+    }
+
+    /// An answer with nothing in it: OpenCode tells the model "Unanswered" and
+    /// goes on, where a decline would end the turn as a dismissal.
+    #[test]
+    fn unanswered_response_accepts_with_no_content() {
+        assert_eq!(
+            serde_json::to_value(elicitation_unanswered_response()).unwrap(),
+            json!({"action": "accept"})
+        );
+    }
+
     #[test]
     fn classify_elicitation_single_select_maps_options_and_id() {
         let raw = elicitation_raw(
@@ -1840,6 +2193,63 @@ mod tests {
             q.tool_call_id.as_deref(),
             Some("item-1"),
             "carries the elicitation toolCallId for the synthesized card"
+        );
+    }
+
+    /// qodercli 1.1.67's native `AskUserQuestion` form, verbatim off the wire
+    /// (raw ACP probe, 2026-10-10): the question prose — with qoder's own
+    /// option explanations appended — is in `description`, the short header in
+    /// `title`, choices are `oneOf` const/title pairs, and the scope is
+    /// flattened top-level (`sessionId` + `toolCallId`). The crate's flatten
+    /// lands that in `ElicitationSessionScope`, so the toolCallId is read like
+    /// any form's: it names the `Ask user` `tool_call` qoder streams just
+    /// before the elicitation, which is why the handler synthesizes no card
+    /// for qoder (see `handle_elicitation_request`).
+    #[test]
+    fn classify_elicitation_reads_qoder_ask_user_question_form() {
+        let raw = serde_json::json!({
+            "mode": "form",
+            "sessionId": "8c706dde-7ac9-4ac9-824d-29ec8179d734",
+            "toolCallId": "call_d341dc678fad4b7a8ea5f42e",
+            "message": "Answer Questions",
+            "requestedSchema": {
+                "type": "object",
+                "title": "Answer Questions",
+                "properties": {
+                    "q0": {
+                        "type": "string",
+                        "title": "选择",
+                        "description": "选 A 还是 B？\nA: 选择 A 选项。\nB: 选择 B 选项。",
+                        "oneOf": [
+                            {"const": "A", "title": "A"},
+                            {"const": "B", "title": "B"}
+                        ]
+                    }
+                },
+                "required": ["q0"]
+            },
+            "_meta": {"qoder": {"toolName": "AskUserQuestion"}}
+        });
+        let q = expect_questions(classify_elicitation(&raw, ElicitationPeer::Other).unwrap());
+        assert_eq!(q.specs.len(), 1);
+        assert_eq!(q.specs[0].id, "q0", "property key becomes the spec id");
+        assert_eq!(
+            q.specs[0].question,
+            "选 A 还是 B？\nA: 选择 A 选项。\nB: 选择 B 选项。"
+        );
+        assert_eq!(q.specs[0].header, "选择");
+        assert!(!q.specs[0].multi_select);
+        let labels: Vec<_> = q.specs[0]
+            .options
+            .iter()
+            .map(|o| o.label.as_str())
+            .collect();
+        assert_eq!(labels, ["A", "B"]);
+        assert_eq!(q.fields[0].kind, ElicitationFieldKind::Text);
+        assert_eq!(
+            q.tool_call_id.as_deref(),
+            Some("call_d341dc678fad4b7a8ea5f42e"),
+            "the flattened scope's toolCallId is read"
         );
     }
 
@@ -2384,6 +2794,185 @@ mod tests {
             vec!["notes", "question_0", "unmarked_custom"],
             "only `isCustomAnswer: true` skips; a marker without it does not"
         );
+    }
+
+    /// The `request_user_input` form codex-acp 2.1.1 sends codeg, verbatim but
+    /// for the two ids: recorded live over stdio with codeg's exact
+    /// `clientCapabilities`, a plan-mode turn whose model calls
+    /// `request_user_input` (it matches upstream's
+    /// `elicitation-user-input-air-custom-answer.json`). 2.1.0's recording
+    /// lacks only the note field's root `_askUserQuestionCustomAnswer: true`.
+    /// 2.0.1's lacks that and the note field's `jetbrains` block too, and its
+    /// `next_step` `oneOf` carries a third, synthetic "None of the above"
+    /// entry.
+    #[test]
+    fn classify_elicitation_reads_codex_211_air_custom_answer_form() {
+        let raw = json!({
+            "sessionId": "test-session-id",
+            "toolCallId": "request-user-input-1",
+            "mode": "form",
+            "message": "Codex needs your input to continue.",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "next_step": {
+                        "title": "What should I do next?",
+                        "description": "Next step",
+                        "_meta": {"codex": {"isOther": true, "isSecret": false}},
+                        "type": "string",
+                        "oneOf": [
+                            {"const": "Run tests", "title": "Run tests",
+                             "description": "Run the focused test suite."},
+                            {"const": "Stop", "title": "Stop",
+                             "description": "Stop and report current status."}
+                        ]
+                    },
+                    "next_step_note": {
+                        "type": "string",
+                        "title": "Additional answer or note",
+                        "_meta": {
+                            "codex": {"questionId": "next_step", "role": "user_note", "isSecret": false},
+                            "_askUserQuestionCustomAnswer": true,
+                            "jetbrains": {"air": {"version": 1, "customAnswer": true}}
+                        }
+                    }
+                },
+                "required": ["next_step"]
+            },
+            "_meta": {"codex": {"autoResolutionMs": null}}
+        });
+        let q = expect_questions(
+            classify_elicitation(
+                &raw,
+                ElicitationPeer::Codex(Some(CodexUserInputShape::QuestionInTitle)),
+            )
+            .unwrap(),
+        );
+        assert_eq!(q.specs.len(), 1, "the note field is the card's own Other");
+        assert_eq!(q.specs[0].id, "next_step");
+        assert_eq!(q.specs[0].question, "What should I do next?");
+        assert_eq!(q.specs[0].header, "Next step");
+        let labels: Vec<_> = q.specs[0]
+            .options
+            .iter()
+            .map(|o| o.label.as_str())
+            .collect();
+        assert_eq!(labels, ["Run tests", "Stop"]);
+        assert_eq!(q.tool_call_id.as_deref(), Some("request-user-input-1"));
+
+        // What codeg writes back, and (recorded in the same live run, off the
+        // tool output the model then received) what codex is handed for it:
+        //   pick "Run tests"          → content.next_step = "Run tests"
+        //                               → codex ["Run tests"]
+        //   type "Inspect flaky logs" → content.next_step = "Inspect flaky logs"
+        //                               → codex ["None of the above",
+        //                                        "user_note: Inspect flaky logs"]
+        // The typed text goes to the MAIN field and nothing to the note field:
+        // that main-field string is what 2.1.0+ reads as the AIR custom answer.
+        for (picked, expected) in [
+            ("Run tests", "Run tests"),
+            ("Inspect flaky logs", "Inspect flaky logs"),
+        ] {
+            let answer = QuestionAnswer {
+                answers: vec![QuestionAnswerItem {
+                    question_id: "next_step".into(),
+                    labels: vec![picked.into()],
+                }],
+                declined: false,
+            };
+            let outcome = build_outcome(&q.specs, &answer);
+            let v = serde_json::to_value(build_elicitation_response(&q, &outcome)).unwrap();
+            assert_eq!(v["action"], "accept");
+            assert_eq!(v["content"], json!({"next_step": expected}));
+        }
+    }
+
+    /// The AIR `customAnswer` key carries a different value per adapter: codex
+    /// 2.1.0 writes a bare `true`, claude 0.82+ `{questionId, isCustomAnswer:
+    /// true}`. Either marks the companion. Asserted under a NON-codex peer,
+    /// where the marker is the only thing that can skip a field (a codex peer's
+    /// note field would already be skipped by its `_meta.codex.role`).
+    #[test]
+    fn classify_elicitation_reads_both_air_custom_answer_values() {
+        let raw = elicitation_raw(
+            json!({
+                "q1": {"type": "string", "title": "Pick one", "enum": ["a", "b"]},
+                "codex_style": {
+                    "type": "string",
+                    "title": "Additional answer or note",
+                    "_meta": {"jetbrains": {"air": {"version": 1, "customAnswer": true}}}
+                },
+                "claude_style": {
+                    "type": "string",
+                    "title": "Other",
+                    "_meta": {"jetbrains": {"air": {
+                        "version": 1,
+                        "customAnswer": {"questionId": "q1", "isCustomAnswer": true}
+                    }}}
+                },
+                "bool_false": {
+                    "type": "string",
+                    "title": "Kept 1",
+                    "_meta": {"jetbrains": {"air": {"version": 1, "customAnswer": false}}}
+                },
+                "object_false": {
+                    "type": "string",
+                    "title": "Kept 2",
+                    "_meta": {"jetbrains": {"air": {
+                        "version": 1,
+                        "customAnswer": {"questionId": "q1", "isCustomAnswer": false}
+                    }}}
+                },
+                "string_true": {
+                    "type": "string",
+                    "title": "Kept 3",
+                    "_meta": {"jetbrains": {"air": {"version": 1, "customAnswer": "true"}}}
+                }
+            }),
+            json!(["q1"]),
+        );
+        let q = expect_questions(classify_elicitation(&raw, ElicitationPeer::Other).unwrap());
+        let ids: Vec<&str> = q.specs.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["bool_false", "object_false", "q1", "string_true"],
+            "a bare `true` or `isCustomAnswer: true` skips; nothing else does"
+        );
+    }
+
+    /// codex-acp 2.1.1 (#577) also writes its bare `true` under the old root
+    /// key, the one claude's marker used before it moved under AIR. Read on its
+    /// own (a non-codex peer, no AIR key), it skips the companion like the
+    /// object form always did; `false` does not.
+    #[test]
+    fn classify_elicitation_reads_a_bare_true_under_the_legacy_key() {
+        let raw = elicitation_raw(
+            json!({
+                "q1": {"type": "string", "title": "Pick one", "enum": ["a", "b"]},
+                "bare_true": {
+                    "type": "string",
+                    "title": "Additional answer or note",
+                    "_meta": {"_askUserQuestionCustomAnswer": true}
+                },
+                "object_true": {
+                    "type": "string",
+                    "title": "Other",
+                    "_meta": {"_askUserQuestionCustomAnswer": {
+                        "questionId": "q1",
+                        "isCustomAnswer": true
+                    }}
+                },
+                "bare_false": {
+                    "type": "string",
+                    "title": "Kept",
+                    "_meta": {"_askUserQuestionCustomAnswer": false}
+                }
+            }),
+            json!(["q1"]),
+        );
+        let q = expect_questions(classify_elicitation(&raw, ElicitationPeer::Other).unwrap());
+        let ids: Vec<&str> = q.specs.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["bare_false", "q1"]);
     }
 
     #[test]
@@ -3152,6 +3741,11 @@ mod tests {
             // Right server, right words, wrong tool — the match is anchored at
             // the END so a longer name cannot borrow it.
             "mcp__codeg-mcp__ask_user_question_twice",
+            // …and at the start: a server whose name only ends in codeg-mcp
+            // is another one, and so is a server `codeg` whose tool is
+            // `mcp_ask_user_question`.
+            "mcp__other-codeg-mcp__ask_user_question",
+            "mcp__codeg__mcp_ask_user_question",
             "",
         ] {
             assert!(
@@ -3335,5 +3929,96 @@ mod tests {
         let output = grok_result_card_output(&outcome);
         assert_eq!(input["questions"][0]["question"], output["answers"][0]["question"]);
         assert_eq!(output["answers"][0]["header"], "");
+    }
+    fn antigravity_interaction() -> Value {
+        json!({
+            "toolCallId": "interaction_396e46cc",
+            "status": "pending",
+            "title": "关于接下来的开发工作，您希望优先聚焦于哪个核心方向？",
+            "rawInput": {},
+            "kind": "other"
+        })
+    }
+
+    fn antigravity_choices() -> Vec<(String, String)> {
+        vec![
+            ("opaque-first".into(), "后端开发".into()),
+            ("opaque-second".into(), "前端开发".into()),
+        ]
+    }
+
+    #[test]
+    fn antigravity_live_interaction_is_recognized() {
+        let ask = parse_antigravity_ask(&antigravity_interaction(), &antigravity_choices())
+            .expect("实测交互格式应转换为问题卡片");
+        assert_eq!(ask.spec.options[1].label, "前端开发");
+        assert!(!ask.spec.multi_select);
+        assert_eq!(ask.option_ids[1].1, "opaque-second");
+
+        let mut no_kind = antigravity_interaction();
+        no_kind.as_object_mut().unwrap().remove("kind");
+        let ask_no_kind = parse_antigravity_ask(&no_kind, &antigravity_choices())
+            .expect("实测 antigravity-acp 1.4.1 省略 kind 字段亦应正确识别为问题卡片");
+        assert_eq!(ask_no_kind.spec.options[1].label, "前端开发");
+    }
+
+    #[test]
+    fn antigravity_answer_preserves_second_option_and_decline() {
+        let ask =
+            parse_antigravity_ask(&antigravity_interaction(), &antigravity_choices()).unwrap();
+        let mut outcome = QuestionOutcome {
+            answers: vec![QuestionAnsweredItem {
+                question: ask.spec.question.clone(),
+                header: ask.spec.header.clone(),
+                multi_select: false,
+                selected: vec!["前端开发".into()],
+            }],
+            declined: false,
+        };
+        assert_eq!(
+            antigravity_option_id(&outcome, &ask).as_deref(),
+            Some("opaque-second")
+        );
+        outcome.declined = true;
+        assert_eq!(antigravity_option_id(&outcome, &ask), None);
+        outcome.declined = false;
+        outcome.answers[0].selected = vec!["自由文本".into()];
+        assert_eq!(antigravity_option_id(&outcome, &ask), None);
+        outcome.answers[0].selected = vec!["后端开发".into(), "前端开发".into()];
+        assert_eq!(antigravity_option_id(&outcome, &ask), None);
+        outcome.answers.clear();
+        assert_eq!(antigravity_option_id(&outcome, &ask), None);
+    }
+
+    #[test]
+    fn antigravity_parser_preserves_ordinary_permissions_and_invalid_choices() {
+        for (field, value) in [
+            ("toolCallId", json!("tool-1")),
+            ("toolCallId", json!("interaction_")),
+            ("title", json!(" ")),
+            ("kind", json!("execute")),
+            ("status", json!("completed")),
+            ("rawInput", json!({"command":"cargo build"})),
+        ] {
+            let mut call = antigravity_interaction();
+            call[field] = value;
+            assert!(
+                parse_antigravity_ask(&call, &antigravity_choices()).is_none(),
+                "{call}"
+            );
+        }
+        for choices in [
+            vec![],
+            vec![("1".into(), "仅一项".into())],
+            vec![("1".into(), "重复".into()), ("2".into(), "重复".into())],
+            vec![("1".into(), "A".into()), ("1".into(), "B".into())],
+            vec![("".into(), "A".into()), ("2".into(), "B".into())],
+            vec![("1".into(), " ".into()), ("2".into(), "B".into())],
+            (0..5)
+                .map(|i| (i.to_string(), format!("选项{i}")))
+                .collect(),
+        ] {
+            assert!(parse_antigravity_ask(&antigravity_interaction(), &choices).is_none());
+        }
     }
 }

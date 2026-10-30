@@ -128,7 +128,10 @@ impl MigrationTrait for Migration {
                     )
                     .foreign_key(
                         ForeignKey::create()
-                            .from(WorkTaskDependency::Table, WorkTaskDependency::DependsOnTaskId)
+                            .from(
+                                WorkTaskDependency::Table,
+                                WorkTaskDependency::DependsOnTaskId,
+                            )
                             .to(WorkTask::Table, WorkTask::Id)
                             .on_delete(ForeignKeyAction::Cascade),
                     )
@@ -271,7 +274,7 @@ mod tests {
             .iter()
             .position(|migration| migration.name() == "m20260926_000002_work_task_orchestration")
             .expect("orchestration migration is registered");
-        Migrator::up(&conn, Some(idx as u32))
+        crate::db::migration::UpstreamSchemaFixture::<2>::up(&conn, None)
             .await
             .expect("apply pre-orchestration schema");
 
@@ -371,8 +374,7 @@ mod tests {
         conn.execute(sql("DELETE FROM work_task WHERE id = 2"))
             .await
             .expect("delete child");
-        let edges = probe_n(&conn, "SELECT COUNT(*) AS n FROM work_task_dependency")
-            .await;
+        let edges = probe_n(&conn, "SELECT COUNT(*) AS n FROM work_task_dependency").await;
         assert_eq!(edges, 0, "edges must cascade with their task");
 
         // The conversation probe keeps the fixture honest (no unused warnings).

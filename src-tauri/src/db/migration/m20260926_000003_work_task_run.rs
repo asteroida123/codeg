@@ -63,11 +63,7 @@ impl MigrationTrait for Migration {
                     // The agent-assigned session identity captured for this
                     // run — the strict anchor a continuation resumes. NULL when
                     // the agent never reported one.
-                    .col(
-                        ColumnDef::new(WorkTaskRun::ExternalSessionId)
-                            .text()
-                            .null(),
-                    )
+                    .col(ColumnDef::new(WorkTaskRun::ExternalSessionId).text().null())
                     .col(ColumnDef::new(WorkTaskRun::WorkingDir).text().null())
                     // Effective selectors at launch, for the run's record.
                     .col(ColumnDef::new(WorkTaskRun::EffectiveMode).string().null())
@@ -87,14 +83,14 @@ impl MigrationTrait for Migration {
                             .timestamp_with_time_zone()
                             .null(),
                     )
+                    .col(ColumnDef::new(WorkTaskRun::DurationMs).big_integer().null())
+                    // Token facts folded in at close time (best-effort: the
+                    // token-usage pipeline lags and not every agent reports).
                     .col(
-                        ColumnDef::new(WorkTaskRun::DurationMs)
+                        ColumnDef::new(WorkTaskRun::InputTokens)
                             .big_integer()
                             .null(),
                     )
-                    // Token facts folded in at close time (best-effort: the
-                    // token-usage pipeline lags and not every agent reports).
-                    .col(ColumnDef::new(WorkTaskRun::InputTokens).big_integer().null())
                     .col(
                         ColumnDef::new(WorkTaskRun::OutputTokens)
                             .big_integer()
@@ -151,7 +147,12 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
-            .drop_table(Table::drop().if_exists().table(WorkTaskRun::Table).to_owned())
+            .drop_table(
+                Table::drop()
+                    .if_exists()
+                    .table(WorkTaskRun::Table)
+                    .to_owned(),
+            )
             .await
     }
 }
@@ -232,11 +233,11 @@ mod tests {
             .expect("foreign keys");
 
         let migrations = <Migrator as MigratorTrait>::migrations();
-        let idx = migrations
+        let _idx = migrations
             .iter()
             .position(|migration| migration.name() == "m20260926_000003_work_task_run")
             .expect("run-ledger migration is registered");
-        Migrator::up(&conn, Some(idx as u32 + 1))
+        crate::db::migration::UpstreamSchemaFixture::<4>::up(&conn, None)
             .await
             .expect("apply run-ledger migration");
 

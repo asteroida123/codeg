@@ -116,6 +116,17 @@ pub struct Model {
     /// exactly once — and every explicit claim clears it too, because a task
     /// that already started has no start left to plan.
     pub scheduled_at: Option<DateTimeUtc>,
+    /// The user put this settled task aside ("handle later"): the board files
+    /// it under Done instead of "needs you", and it stops counting toward the
+    /// attention badge, until they pick it back up. NULL = not put aside.
+    ///
+    /// Only ever set on a `review` / `failed` row, and NOT a status of its own:
+    /// the task stays exactly as resumable as it was (a follow-up or a retry
+    /// starts a new run from here), so its review or failure remains the truth
+    /// about it. Every transition out of those two statuses clears it, so a
+    /// task that comes back from another run always lands in "needs you"
+    /// again — and the unattended merge refuses a row carrying it.
+    pub deferred_at: Option<DateTimeUtc>,
     /// Forge provenance: 'forge_issue' | 'forge_pr'; NULL = not forge-sourced.
     /// Set once at creation by the forge trigger command, never by the public
     /// create/update DTO paths, and never mutated afterwards.
@@ -146,6 +157,14 @@ pub struct Model {
     pub max_concurrent_children: Option<i32>,
     pub max_runs_per_child: Option<i32>,
     pub token_budget: Option<i64>,
+    /// JSON `WorkTaskDelivery` — for a task WITHOUT forge provenance only:
+    /// the repository and account its first delivery resolved from the
+    /// project's `origin` (pinned from then on), and the pull request it
+    /// opened there. NULL until such a task is first delivered. A
+    /// forge-sourced task records its pull request in `source_meta` instead,
+    /// which already names its repository and the account that triggered it.
+    #[sea_orm(column_type = "Text")]
+    pub delivery: Option<String>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
     pub started_at: Option<DateTimeUtc>,

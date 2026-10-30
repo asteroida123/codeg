@@ -435,15 +435,11 @@ impl DbChatAuthoring {
         let task = work_task_service::get_model(&self.db.conn, task_id)
             .await
             .ok()?;
-        work_task_service::is_owned_by_conversation(
-            &self.db.conn,
-            &task,
-            Some(conversation_id),
-        )
-        .await
-        .ok()
-        .filter(|owned| *owned)
-        .map(|_| task)
+        work_task_service::is_owned_by_conversation(&self.db.conn, &task, Some(conversation_id))
+            .await
+            .ok()
+            .filter(|owned| *owned)
+            .map(|_| task)
     }
 
     /// `split_work_task`: create the subtasks under an owned parent, wire the
@@ -664,8 +660,7 @@ impl DbChatAuthoring {
         wait_ms: u64,
     ) -> Vec<WorkTaskInfo> {
         let baseline = status_signature(&infos);
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -709,7 +704,10 @@ impl DbChatAuthoring {
         let mut results = Vec::with_capacity(spec.task_ids.len());
         for task_id in &spec.task_ids {
             let Some(task) = self.owned_task(*task_id, conversation_id).await else {
-                results.push(refused_result(*task_id, "not one of this conversation's tasks"));
+                results.push(refused_result(
+                    *task_id,
+                    "not one of this conversation's tasks",
+                ));
                 continue;
             };
             if task.status != WorkTaskStatus::Todo {
@@ -765,9 +763,14 @@ impl DbChatAuthoring {
         if let Some(engine) = crate::work_task::engine() {
             return engine.start(task_id).await;
         }
-        match work_task_service::claim_for_run(&self.db.conn, task_id, WorkTaskStatus::Todo, "agent")
-            .await
-            .map_err(|e| e.to_string())?
+        match work_task_service::claim_for_run(
+            &self.db.conn,
+            task_id,
+            WorkTaskStatus::Todo,
+            "agent",
+        )
+        .await
+        .map_err(|e| e.to_string())?
         {
             Some(_) => {
                 emit_event(
@@ -798,7 +801,10 @@ impl DbChatAuthoring {
         let mut results = Vec::with_capacity(spec.task_ids.len());
         for task_id in &spec.task_ids {
             let Some(task) = self.owned_task(*task_id, conversation_id).await else {
-                results.push(refused_result(*task_id, "not one of this conversation's tasks"));
+                results.push(refused_result(
+                    *task_id,
+                    "not one of this conversation's tasks",
+                ));
                 continue;
             };
             if is_terminal(task.status) {
@@ -1475,7 +1481,9 @@ mod tests {
     #[tokio::test]
     async fn orchestration_refuses_everything_while_the_switch_is_off() {
         let (db, access, _cfg) = harness(false, false).await;
-        folder_service::add_folder(&db.conn, "/repo/app").await.unwrap();
+        folder_service::add_folder(&db.conn, "/repo/app")
+            .await
+            .unwrap();
         let parent = authored(&db, 1, CONV, "parent").await;
 
         for call in [
@@ -1506,9 +1514,15 @@ mod tests {
             assert!(out.note.unwrap().contains("turned off"));
         }
         // Nothing was written: the parent is still alone on the board.
-        assert_eq!(work_task_service::list(&db.conn, None).await.unwrap().len(), 1);
         assert_eq!(
-            work_task_service::get(&db.conn, parent.id).await.unwrap().status,
+            work_task_service::list(&db.conn, None).await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            work_task_service::get(&db.conn, parent.id)
+                .await
+                .unwrap()
+                .status,
             WorkTaskStatus::Todo
         );
     }
@@ -1555,10 +1569,14 @@ mod tests {
             .await;
         assert!(out.ok, "note: {:?}", out.note);
         assert_eq!(out.tasks.len(), 2);
-        let children = work_task_service::children_of(&db.conn, mine.id).await.unwrap();
+        let children = work_task_service::children_of(&db.conn, mine.id)
+            .await
+            .unwrap();
         assert_eq!(children.len(), 2);
         for child in &children {
-            let row = work_task_service::get_model(&db.conn, child.id).await.unwrap();
+            let row = work_task_service::get_model(&db.conn, child.id)
+                .await
+                .unwrap();
             assert_eq!(row.parent_id, Some(mine.id));
             assert_eq!(row.created_by_conversation_id, Some(CONV));
         }
@@ -1566,7 +1584,9 @@ mod tests {
         let second = out.tasks.iter().find(|t| t.id == children[1].id).unwrap();
         assert_eq!(second.blocked.as_ref().unwrap().reason, "dependency");
         // The parent's limits were written.
-        let parent_row = work_task_service::get_model(&db.conn, mine.id).await.unwrap();
+        let parent_row = work_task_service::get_model(&db.conn, mine.id)
+            .await
+            .unwrap();
         assert_eq!(parent_row.max_concurrent_children, Some(1));
 
         // Another conversation's task: refused, and the refusal reads exactly
@@ -1606,7 +1626,9 @@ mod tests {
     #[tokio::test]
     async fn create_work_task_stamps_the_calling_conversation() {
         let (db, access, _cfg) = harness(false, true).await;
-        folder_service::add_folder(&db.conn, "/repo/app").await.unwrap();
+        folder_service::add_folder(&db.conn, "/repo/app")
+            .await
+            .unwrap();
 
         let out = access
             .create_work_task(ctx_conv("/repo/app", CONV), work_task_spec())
@@ -1667,7 +1689,10 @@ mod tests {
         let started = by_id(free.id);
         assert_eq!(started.outcome, "ok");
         assert_eq!(
-            work_task_service::get(&db.conn, free.id).await.unwrap().status,
+            work_task_service::get(&db.conn, free.id)
+                .await
+                .unwrap()
+                .status,
             WorkTaskStatus::Queued
         );
         let unknown = by_id(9_999);
@@ -1678,7 +1703,10 @@ mod tests {
             .contains("not one of this conversation's tasks"));
         // The blocked one was not claimed.
         assert_eq!(
-            work_task_service::get(&db.conn, child).await.unwrap().status,
+            work_task_service::get(&db.conn, child)
+                .await
+                .unwrap()
+                .status,
             WorkTaskStatus::Todo
         );
     }
@@ -1686,7 +1714,9 @@ mod tests {
     #[tokio::test]
     async fn cancel_stops_a_live_task_and_refuses_the_rest() {
         let (db, access, _cfg) = harness(false, true).await;
-        let folder_service = folder_service::add_folder(&db.conn, "/repo/app").await.unwrap();
+        let folder_service = folder_service::add_folder(&db.conn, "/repo/app")
+            .await
+            .unwrap();
         let todo = authored(&db, folder_service.id, CONV, "todo").await;
         let done = authored(&db, folder_service.id, CONV, "done").await;
         patch_status(&db, done.id, WorkTaskStatus::Done).await;
@@ -1712,7 +1742,10 @@ mod tests {
         };
         assert_eq!(note_for(todo.id).outcome, "ok");
         assert_eq!(
-            work_task_service::get(&db.conn, todo.id).await.unwrap().status,
+            work_task_service::get(&db.conn, todo.id)
+                .await
+                .unwrap()
+                .status,
             WorkTaskStatus::Canceled
         );
         let finished = note_for(done.id);
@@ -1785,7 +1818,10 @@ mod tests {
             )
             .await;
         assert!(!out.ok);
-        assert!(out.note.unwrap().contains("not one of this conversation's tasks"));
+        assert!(out
+            .note
+            .unwrap()
+            .contains("not one of this conversation's tasks"));
 
         // No window at all: everything this conversation created.
         let out = access

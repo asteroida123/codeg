@@ -13,6 +13,10 @@
 //!   `complete_without_merge` (a reviewed task with nothing to land), and never
 //!   rolls back; a failed worktree cleanup surfaces as `cleanup_state='failed'`
 //!   on the done row.
+//! - `deferred_at` (the user's "handle later") only ever sits on a `review` /
+//!   `failed` row: [`set_deferred`] is its one writer, and every transition
+//!   into or out of those two statuses clears it, so a task that runs again
+//!   always comes back to "needs you" rather than to the pile it left.
 
 use chrono::Utc;
 use sea_orm::sea_query::Expr;
@@ -91,6 +95,7 @@ fn to_info(m: work_task::Model) -> WorkTaskInfo {
         merge_queued: queued_merge(m.pending_merge.as_deref()),
         archived_at: m.archived_at,
         scheduled_at: m.scheduled_at,
+        deferred_at: m.deferred_at,
         source_kind: m.source_kind,
         source_key: m.source_key,
         source_meta: m
@@ -102,6 +107,10 @@ fn to_info(m: work_task::Model) -> WorkTaskInfo {
         max_runs_per_child: m.max_runs_per_child,
         token_budget: m.token_budget,
         blocked: None, // stamped by the list/get commands (needs the edges + live statuses)
+        delivery: m
+            .delivery
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok()),
         latest_progress: None,
         compacting: false,
         created_at: m.created_at,
@@ -484,7 +493,8 @@ pub async fn active_launched_count(
 }
 
 /// Tasks needing the user ("等你处理"): awaiting_input + review + failed, over
-/// live folders. Drives the sidebar badge.
+/// live folders — minus the ones the user set aside, archived or deferred to
+/// handle later. Drives the sidebar badge.
 pub async fn attention_count(conn: &DatabaseConnection) -> Result<u64, DbError> {
     let count = work_task::Entity::find()
         .filter(work_task::Column::DeletedAt.is_null())
@@ -494,6 +504,7 @@ pub async fn attention_count(conn: &DatabaseConnection) -> Result<u64, DbError> 
             WorkTaskStatus::Failed,
         ]))
         .filter(work_task::Column::ArchivedAt.is_null())
+        .filter(work_task::Column::DeferredAt.is_null())
         .inner_join(folder::Entity)
         .filter(folder::Column::DeletedAt.is_null())
         .count(conn)
@@ -640,6 +651,21 @@ pub async fn create_from_forge(
     source: crate::models::WorkTaskSource,
     force: bool,
 ) -> Result<ForgeCreateOutcome, DbError> {
+    create_from_forge_by(conn, draft, source, force, None).await
+}
+
+/// [`create_from_forge`], saying who asked: `auto_trigger = None` is a person
+/// (the trigger dialog), `Some(trigger)` is the repository panel's
+/// auto-processing and what woke it (`schedule` / `webhook` / `manual`). The
+/// timeline's `created` event carries it — actor `auto` and the trigger in its
+/// payload — so a task nobody clicked can say where it came from.
+pub async fn create_from_forge_by(
+    conn: &DatabaseConnection,
+    draft: WorkTaskDraft,
+    source: crate::models::WorkTaskSource,
+    force: bool,
+    auto_trigger: Option<&str>,
+) -> Result<ForgeCreateOutcome, DbError> {
     validate_draft(&draft)?;
     let folder = folder::Entity::find_by_id(draft.folder_id)
         .one(conn)
@@ -678,17 +704,50 @@ pub async fn create_from_forge(
             return Ok(ForgeCreateOutcome::Duplicate(to_info(existing)));
         }
     }
-    record_event(&txn, row.id, "created", "user", None).await?;
+    let (actor, created_payload) = match auto_trigger {
+        None => ("user", None),
+        Some(trigger) => ("auto", Some(serde_json::json!({ "auto": trigger }))),
+    };
+    record_event(&txn, row.id, "created", actor, created_payload).await?;
     record_event(
         &txn,
         row.id,
         "forge_linked",
-        "user",
+        actor,
         Some(serde_json::json!({ "source_key": source.key, "kind": source.kind })),
     )
     .await?;
     txn.commit().await?;
     Ok(ForgeCreateOutcome::Created(to_info(row)))
+}
+
+/// Which of `keys` have EVER had a task — any status, archived and deleted
+/// rows included.
+///
+/// The question auto-processing asks before it mints anything, and it is
+/// deliberately wider than the create dedup (live tasks only): an item whose
+/// automatic task was finished, canceled or deleted has been dealt with, and
+/// picking it up again on the next scan would undo the user's own decision
+/// every few minutes. Starting another task by hand stays possible — that path
+/// never asks this.
+pub async fn source_keys_ever_tasked(
+    conn: &DatabaseConnection,
+    keys: &[String],
+) -> Result<std::collections::HashSet<String>, DbError> {
+    let mut found = std::collections::HashSet::new();
+    // Chunked so a scan of a busy repository cannot outgrow SQLite's
+    // bound-parameter limit in one `IN (…)`.
+    for chunk in keys.chunks(500) {
+        let rows: Vec<Option<String>> = work_task::Entity::find()
+            .select_only()
+            .column(work_task::Column::SourceKey)
+            .filter(work_task::Column::SourceKey.is_in(chunk.iter().cloned()))
+            .into_tuple()
+            .all(conn)
+            .await?;
+        found.extend(rows.into_iter().flatten());
+    }
+    Ok(found)
 }
 
 /// Every non-terminal status — the single definition of "active" shared by
@@ -815,6 +874,7 @@ async fn insert_todo_row<C: ConnectionTrait>(
         preflight: Set(None),
         archived_at: Set(None),
         scheduled_at: Set(None),
+        deferred_at: Set(None),
         source_kind: Set(under.source.map(|s| s.kind.clone())),
         source_key: Set(under.source.map(|s| s.key.clone())),
         source_meta: Set(source_meta),
@@ -823,6 +883,7 @@ async fn insert_todo_row<C: ConnectionTrait>(
         max_concurrent_children: Set(None),
         max_runs_per_child: Set(None),
         token_budget: Set(None),
+        delivery: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
         started_at: Set(None),
@@ -1019,8 +1080,9 @@ async fn claim_inner(
         // verdict (result_summary stays visible until the next settle).
         .col_expr(work_task::Column::Verdict, Expr::value(None::<String>))
         // A user-driven claim supersedes any auto-remerge intent and stale
-        // preflight light, resurrects an archived terminal task, and consumes
-        // the planned start (the task is starting now — there is no later start
+        // preflight light, resurrects an archived terminal task, picks a
+        // deferred one back up (this run IS the "later"), and consumes the
+        // planned start (the task is starting now — there is no later start
         // left to plan, and a plan surviving into `canceled → todo` would fire
         // a run the user never asked for).
         .col_expr(
@@ -1031,6 +1093,10 @@ async fn claim_inner(
         .col_expr(work_task::Column::Preflight, Expr::value(None::<String>))
         .col_expr(
             work_task::Column::ArchivedAt,
+            Expr::value(None::<chrono::DateTime<Utc>>),
+        )
+        .col_expr(
+            work_task::Column::DeferredAt,
             Expr::value(None::<chrono::DateTime<Utc>>),
         )
         .col_expr(work_task::Column::FinishedAt, Expr::value(None::<chrono::DateTime<Utc>>))
@@ -1750,6 +1816,13 @@ pub async fn fail(
         // Any failure abandons a pending auto-remerge — the user restarts the
         // cycle explicitly.
         .col_expr(work_task::Column::PendingMerge, Expr::value(None::<String>))
+        // A fresh failure is news, never a leftover of an earlier "handle
+        // later": it lands in "needs you". (Every claim already cleared the
+        // flag; this keeps the rule local to the status it is about.)
+        .col_expr(
+            work_task::Column::DeferredAt,
+            Expr::value(None::<chrono::DateTime<Utc>>),
+        )
         .col_expr(work_task::Column::SettledAt, Expr::value(Some(now)))
         .col_expr(work_task::Column::UpdatedAt, Expr::value(now))
         .filter(work_task::Column::Id.eq(id))
@@ -1877,6 +1950,35 @@ pub async fn refresh_diff_stats(
     Ok(res.rows_affected == 1)
 }
 
+/// What a push-back learned as its push landed: the counters it measured (what
+/// the push added to the pull request) and the source snapshot naming the head
+/// it went onto. Written while the delivery is still in flight, bound to that
+/// delivery (`merging`, its `run_seq`). See `TaskEngine::push_back_to_pull`.
+pub async fn record_push_back(
+    conn: &DatabaseConnection,
+    id: i32,
+    run_seq: i32,
+    stats: (i32, i32, i32),
+    source_meta_json: &str,
+) -> Result<bool, DbError> {
+    let res = work_task::Entity::update_many()
+        .col_expr(work_task::Column::FilesChanged, Expr::value(Some(stats.0)))
+        .col_expr(work_task::Column::Additions, Expr::value(Some(stats.1)))
+        .col_expr(work_task::Column::Deletions, Expr::value(Some(stats.2)))
+        .col_expr(
+            work_task::Column::SourceMeta,
+            Expr::value(Some(source_meta_json.to_string())),
+        )
+        .col_expr(work_task::Column::UpdatedAt, Expr::value(Utc::now()))
+        .filter(work_task::Column::Id.eq(id))
+        .filter(work_task::Column::Status.eq(WorkTaskStatus::Merging))
+        .filter(work_task::Column::RunSeq.eq(run_seq))
+        .filter(work_task::Column::DeletedAt.is_null())
+        .exec(conn)
+        .await?;
+    Ok(res.rows_affected == 1)
+}
+
 pub async fn settle_review(
     conn: &DatabaseConnection,
     id: i32,
@@ -1905,6 +2007,12 @@ pub async fn settle_review(
         // A fresh review starts with a fresh light; the preflight runner
         // rewrites it right after when one is configured.
         .col_expr(work_task::Column::Preflight, Expr::value(None::<String>))
+        // ...and in "needs you", whatever an earlier generation's review was
+        // put aside as (every claim already cleared that; see `fail`).
+        .col_expr(
+            work_task::Column::DeferredAt,
+            Expr::value(None::<chrono::DateTime<Utc>>),
+        )
         .col_expr(work_task::Column::SettledAt, Expr::value(Some(now)))
         .col_expr(work_task::Column::UpdatedAt, Expr::value(now))
         .filter(work_task::Column::Id.eq(id))
@@ -2011,6 +2119,14 @@ pub async fn begin_merge(
         // dispatch came from the pump draining the queue or from a click that
         // found the slot free.
         .col_expr(work_task::Column::PendingMerge, Expr::value(None::<String>))
+        // A merge the user started IS them handling the task, so a "handle
+        // later" mark goes with it — and if the landing bounces, the task comes
+        // back to "needs you", where a failed merge belongs. (The unattended
+        // dispatch never gets this far on a deferred row; see below.)
+        .col_expr(
+            work_task::Column::DeferredAt,
+            Expr::value(None::<chrono::DateTime<Utc>>),
+        )
         .col_expr(work_task::Column::UpdatedAt, Expr::value(now))
         .filter(work_task::Column::Id.eq(id))
         .filter(work_task::Column::Status.eq(WorkTaskStatus::Review))
@@ -2032,6 +2148,11 @@ pub async fn begin_merge(
         // snapshot taken before the folder lock, so a merge queued while it
         // worked would otherwise slip through here.
         update = update.filter(work_task::Column::PendingMerge.is_null());
+        // Same shape for a task the user put aside to handle later: landing it
+        // behind their back would answer the very decision they postponed.
+        // Authoritative here for the same reason — the sweep's snapshot cannot
+        // see a deferral made while it waited for the folder lock.
+        update = update.filter(work_task::Column::DeferredAt.is_null());
     }
     // A dispatch OF a queued merge also binds to that exact intent: run_seq
     // alone cannot tell "the merge the pump picked up" from "the one the user
@@ -2085,7 +2206,9 @@ pub async fn begin_merge(
 ///
 /// Clears `last_error` like a manual dispatch does: the user re-asking for this
 /// merge IS the human intervention the banner was waiting for, and leaving it
-/// on would make the queued row look like it had already failed.
+/// on would make the queued row look like it had already failed. A "handle
+/// later" mark goes for the same reason — accepting the task is handling it,
+/// and its place in line is something the review column has to show.
 ///
 /// `expect_pending_merge` is the pump's re-queue guard: `Some(json)` demands
 /// that the row still hold exactly that intent, so a re-park cannot resurrect
@@ -2108,6 +2231,10 @@ pub async fn queue_merge(
             Expr::value(Some(intent_json)),
         )
         .col_expr(work_task::Column::LastError, Expr::value(None::<String>))
+        .col_expr(
+            work_task::Column::DeferredAt,
+            Expr::value(None::<chrono::DateTime<Utc>>),
+        )
         .col_expr(work_task::Column::UpdatedAt, Expr::value(now))
         .filter(work_task::Column::Id.eq(id))
         .filter(work_task::Column::Status.eq(WorkTaskStatus::Review))
@@ -2224,6 +2351,11 @@ pub async fn begin_delivery(
         .col_expr(work_task::Column::ConnectionId, Expr::value(None::<String>))
         .col_expr(work_task::Column::MergeState, Expr::value(Some(state_json)))
         .col_expr(work_task::Column::LastError, Expr::value(None::<String>))
+        // Delivering is handling it — same as a merge dispatch.
+        .col_expr(
+            work_task::Column::DeferredAt,
+            Expr::value(None::<chrono::DateTime<Utc>>),
+        )
         .col_expr(work_task::Column::UpdatedAt, Expr::value(now))
         .filter(work_task::Column::Id.eq(id))
         .filter(work_task::Column::Status.eq(WorkTaskStatus::Review))
@@ -2264,24 +2396,45 @@ pub async fn begin_delivery(
     Ok(Some(run_seq))
 }
 
+/// Where a settling delivery records the pull request it reached, serialized
+/// by the CALLER (see [`complete_delivered`] for why it cannot be read and
+/// rewritten inside the settle's own transaction).
+#[derive(Debug, Clone, Copy)]
+pub enum DeliveryRecord<'a> {
+    /// A forge-sourced task: its provenance snapshot, `result_pr` filled in.
+    SourceMeta(&'a str),
+    /// A task without forge provenance: its `forge::WorkTaskDelivery`.
+    Delivery(&'a str),
+}
+
+impl DeliveryRecord<'_> {
+    fn column(self) -> (work_task::Column, String) {
+        match self {
+            DeliveryRecord::SourceMeta(json) => (work_task::Column::SourceMeta, json.to_string()),
+            DeliveryRecord::Delivery(json) => (work_task::Column::Delivery, json.to_string()),
+        }
+    }
+}
+
 /// merging → done for a delivery: the pull request carrying this task is open
 /// (or already merged) and anchored to the commit we pushed.
 ///
-/// `source_meta_json` is the row's provenance snapshot with `result_pr` filled
-/// in, serialized by the CALLER. That is not an accident of layering: the
-/// update below has to be the transaction's FIRST statement. A deferred SQLite
-/// transaction that reads before it writes cannot upgrade to a writer under
-/// WAL — it fails with `database is locked` instead of waiting — so any
-/// read-modify-write of `source_meta` happens outside, and the CAS filter is
-/// what makes a stale read harmless.
+/// `record` carries the pull request (see [`DeliveryRecord`]), serialized by
+/// the CALLER. That is not an accident of layering: the update below has to be
+/// the transaction's FIRST statement. A deferred SQLite transaction that reads
+/// before it writes cannot upgrade to a writer under WAL — it fails with
+/// `database is locked` instead of waiting — so any read-modify-write of the
+/// recorded JSON happens outside, and the CAS filter is what makes a stale
+/// read harmless.
 pub async fn complete_delivered(
     conn: &DatabaseConnection,
     id: i32,
     expect_run_seq: i32,
     pr_url: &str,
-    source_meta_json: &str,
+    record: DeliveryRecord<'_>,
 ) -> Result<bool, DbError> {
     let now = Utc::now();
+    let (record_column, record_json) = record.column();
     let txn = conn.begin().await?;
     let res = work_task::Entity::update_many()
         .col_expr(
@@ -2292,10 +2445,7 @@ pub async fn complete_delivered(
             work_task::Column::CompletionKind,
             Expr::value(Some(COMPLETION_DELIVERED_PR.to_string())),
         )
-        .col_expr(
-            work_task::Column::SourceMeta,
-            Expr::value(Some(source_meta_json.to_string())),
-        )
+        .col_expr(record_column, Expr::value(Some(record_json)))
         .col_expr(work_task::Column::MergeState, Expr::value(None::<String>))
         .col_expr(work_task::Column::LastError, Expr::value(None::<String>))
         .col_expr(work_task::Column::FinishedAt, Expr::value(Some(now)))
@@ -2330,6 +2480,66 @@ pub async fn complete_delivered(
     txn.commit().await?;
     // A `done` task lifts the dependency gate of everything waiting on it.
     wake_dependents(conn, id).await;
+    Ok(true)
+}
+
+/// merging → review for a delivery that SUCCEEDED but was asked not to finish
+/// the task (`WorkTaskMergeState::keep_in_review`): the pull request is open
+/// (or merged) and anchored to the commit we pushed, exactly as for
+/// [`complete_delivered`], and the task goes back to waiting on its user with
+/// that pull request recorded — for another round on the same branch, a
+/// later delivery that does finish it, or any other acceptance.
+///
+/// Same CAS and the same caller-serialized `record` as [`complete_delivered`]
+/// (and for the same reason). No error is written — nothing failed — and the
+/// banner of an earlier attempt is cleared like a fresh dispatch clears it.
+pub async fn delivered_to_review(
+    conn: &DatabaseConnection,
+    id: i32,
+    expect_run_seq: i32,
+    pr_url: &str,
+    record: DeliveryRecord<'_>,
+) -> Result<bool, DbError> {
+    let now = Utc::now();
+    let (record_column, record_json) = record.column();
+    let txn = conn.begin().await?;
+    let res = work_task::Entity::update_many()
+        .col_expr(
+            work_task::Column::Status,
+            Expr::value(status_str(WorkTaskStatus::Review)),
+        )
+        .col_expr(record_column, Expr::value(Some(record_json)))
+        .col_expr(work_task::Column::MergeState, Expr::value(None::<String>))
+        .col_expr(work_task::Column::LastError, Expr::value(None::<String>))
+        .col_expr(work_task::Column::UpdatedAt, Expr::value(now))
+        .filter(work_task::Column::Id.eq(id))
+        .filter(work_task::Column::Status.eq(WorkTaskStatus::Merging))
+        .filter(work_task::Column::RunSeq.eq(expect_run_seq))
+        .filter(work_task::Column::DeletedAt.is_null())
+        .exec(&txn)
+        .await?;
+    if res.rows_affected != 1 {
+        txn.rollback().await?;
+        return Ok(false);
+    }
+    record_event(
+        &txn,
+        id,
+        "delivered_pr",
+        "engine",
+        Some(serde_json::json!({ "pr_url": pr_url, "kept_in_review": true })),
+    )
+    .await?;
+    status_changed_event(
+        &txn,
+        id,
+        "engine",
+        Some(WorkTaskStatus::Merging),
+        WorkTaskStatus::Review,
+        Some(serde_json::json!({ "pr_url": pr_url })),
+    )
+    .await?;
+    txn.commit().await?;
     Ok(true)
 }
 
@@ -2414,9 +2624,14 @@ pub async fn complete_without_merge(
             Expr::value(Some(COMPLETION_ACCEPTED_WITHOUT_MERGE.to_string())),
         )
         // A refused merge attempt leaves its reason on the row; the task is
-        // finishing on purpose now, so that banner must not follow it.
+        // finishing on purpose now, so that banner must not follow it — and
+        // neither does a "handle later": this is the later.
         .col_expr(work_task::Column::LastError, Expr::value(None::<String>))
         .col_expr(work_task::Column::PendingMerge, Expr::value(None::<String>))
+        .col_expr(
+            work_task::Column::DeferredAt,
+            Expr::value(None::<chrono::DateTime<Utc>>),
+        )
         .col_expr(work_task::Column::FinishedAt, Expr::value(Some(now)))
         .col_expr(work_task::Column::UpdatedAt, Expr::value(now))
         .filter(work_task::Column::Id.eq(id))
@@ -2449,6 +2664,13 @@ pub async fn complete_without_merge(
 /// path's toast has no one to pop for. Guarded on review + run_seq; a present
 /// `last_error` also excludes the row from later auto-merge attempts, so the
 /// banner doubles as the retry stop.
+///
+/// Never lands on a task the user put aside to handle later: both callers are
+/// unattended (the auto-merge sweep, the merge queue), and a sweep whose
+/// snapshot predates the deferral can still be refused for a reason of its own
+/// after it. Bannering then would decorate a row the user said can wait, and
+/// latch it out of the auto-merge it gets again once it is back in "needs
+/// you" — where a refusal that still holds banners as usual.
 pub async fn set_review_error(
     conn: &DatabaseConnection,
     id: i32,
@@ -2464,6 +2686,7 @@ pub async fn set_review_error(
         .filter(work_task::Column::Id.eq(id))
         .filter(work_task::Column::Status.eq(WorkTaskStatus::Review))
         .filter(work_task::Column::RunSeq.eq(run_seq))
+        .filter(work_task::Column::DeferredAt.is_null())
         .filter(work_task::Column::DeletedAt.is_null())
         .exec(conn)
         .await?;
@@ -2491,6 +2714,12 @@ pub async fn merge_back_to_review(
         )
         .col_expr(work_task::Column::MergeState, Expr::value(None::<String>))
         .col_expr(work_task::Column::LastError, Expr::value(error.clone()))
+        // A bounced landing is the user's to look at — back in "needs you"
+        // (the dispatch already cleared any deferral; see `settle_review`).
+        .col_expr(
+            work_task::Column::DeferredAt,
+            Expr::value(None::<chrono::DateTime<Utc>>),
+        )
         .col_expr(work_task::Column::UpdatedAt, Expr::value(now))
         .filter(work_task::Column::Id.eq(id))
         .filter(work_task::Column::Status.eq(WorkTaskStatus::Merging))
@@ -2617,6 +2846,66 @@ pub async fn set_archived(
     Ok(true)
 }
 
+/// The statuses a task can be put aside in: settled and waiting on the user,
+/// with nothing running that a deferral would leave hanging out of sight. An
+/// `awaiting_input` task is waiting on the user too, but its agent is live and
+/// holds a concurrency slot — that one is answered or canceled, not parked —
+/// and `merging` is in flight.
+pub const DEFERRABLE_STATUSES: [WorkTaskStatus; 2] =
+    [WorkTaskStatus::Review, WorkTaskStatus::Failed];
+
+/// Put a settled task aside to handle later, or bring it back to "needs you".
+/// No status change: the task stays exactly as resumable as it was, and its
+/// follow-up / retry / merge picks it back up on its own (each of those clears
+/// the mark — see the module invariants). Records the user action.
+///
+/// Deferring is refused (`false`) unless the row is reviewed or failed (see
+/// [`DEFERRABLE_STATUSES`]), not archived (archiving already put it away), not
+/// already deferred, and not waiting in its project's merge queue — a queued
+/// merge is an acceptance already made, and the decision left on it is whether
+/// to leave the queue, not when to look at the task. Bringing it back only
+/// needs the mark to be there, whatever the status, like unarchiving.
+pub async fn set_deferred(
+    conn: &DatabaseConnection,
+    id: i32,
+    deferred: bool,
+) -> Result<bool, DbError> {
+    let now = Utc::now();
+    let txn = conn.begin().await?;
+    let mut update = work_task::Entity::update_many()
+        .col_expr(
+            work_task::Column::DeferredAt,
+            Expr::value(deferred.then_some(now)),
+        )
+        .col_expr(work_task::Column::UpdatedAt, Expr::value(now))
+        .filter(work_task::Column::Id.eq(id))
+        .filter(work_task::Column::DeletedAt.is_null());
+    if deferred {
+        update = update
+            .filter(work_task::Column::Status.is_in(DEFERRABLE_STATUSES))
+            .filter(work_task::Column::DeferredAt.is_null())
+            .filter(work_task::Column::ArchivedAt.is_null())
+            .filter(work_task::Column::PendingMerge.is_null());
+    } else {
+        update = update.filter(work_task::Column::DeferredAt.is_not_null());
+    }
+    let res = update.exec(&txn).await?;
+    if res.rows_affected != 1 {
+        txn.rollback().await?;
+        return Ok(false);
+    }
+    record_event(
+        &txn,
+        id,
+        "user_action",
+        "user",
+        Some(serde_json::json!({ "action": if deferred { "defer" } else { "undefer" } })),
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(true)
+}
+
 /// Any non-terminal state EXCEPT merging → canceled. Returns whether the CAS
 /// won (the engine tears the connection down only when it did).
 ///
@@ -2681,6 +2970,13 @@ async fn cancel_inner(
         // but the clear belongs to "canceled", not to one caller.)
         .col_expr(
             work_task::Column::ScheduledAt,
+            Expr::value(None::<chrono::DateTime<Utc>>),
+        )
+        // Stopping a task the user had put aside settles the question it was
+        // put aside for; a later requeue starts from "canceled", not from a
+        // "handle later" nobody can see any more.
+        .col_expr(
+            work_task::Column::DeferredAt,
             Expr::value(None::<chrono::DateTime<Utc>>),
         )
         .col_expr(work_task::Column::FinishedAt, Expr::value(Some(now)))
@@ -4825,12 +5121,24 @@ mod tests {
         let meta = r#"{"provider":"github","result_pr":"https://x/pull/9"}"#;
         // A settle bound to the WRONG generation must miss, or a recovery pass
         // racing a live delivery could settle a run that already moved on.
-        assert!(!complete_delivered(&db.conn, id, seq, "https://x/pull/9", meta)
-            .await
-            .unwrap());
-        assert!(complete_delivered(&db.conn, id, deliver_seq, "https://x/pull/9", meta)
-            .await
-            .unwrap());
+        assert!(!complete_delivered(
+            &db.conn,
+            id,
+            seq,
+            "https://x/pull/9",
+            DeliveryRecord::SourceMeta(meta)
+        )
+        .await
+        .unwrap());
+        assert!(complete_delivered(
+            &db.conn,
+            id,
+            deliver_seq,
+            "https://x/pull/9",
+            DeliveryRecord::SourceMeta(meta)
+        )
+        .await
+        .unwrap());
 
         let done = get_model(&db.conn, id).await.unwrap();
         assert_eq!(done.status, WorkTaskStatus::Done);
@@ -4840,10 +5148,85 @@ mod tests {
         assert!(done.finished_at.is_some());
         // A second settle (event vs recovery race) is a no-op, and nothing
         // pulls a delivered task back to review.
-        assert!(!complete_delivered(&db.conn, id, deliver_seq, "https://x/pull/9", meta)
+        assert!(!complete_delivered(
+            &db.conn,
+            id,
+            deliver_seq,
+            "https://x/pull/9",
+            DeliveryRecord::SourceMeta(meta)
+        )
+        .await
+        .unwrap());
+        assert!(!merge_back_to_review(&db.conn, id, None, None, None)
             .await
             .unwrap());
         assert!(!merge_back_to_review(&db.conn, id, None, None, None).await.unwrap());
+    }
+
+    /// A delivery asked NOT to finish the task settles back to review: the
+    /// pull request lands in the record the caller named — the delivery
+    /// column for a task without provenance, nothing else touched — and the
+    /// settle binds to its own generation exactly like the `done` one.
+    #[tokio::test]
+    async fn a_delivery_kept_in_review_records_its_pull_request_and_stays_reviewable() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-deliver-keep").await;
+        let (id, seq) = reviewed(&db, folder_id, "deliver, keep reviewing").await;
+        let state = WorkTaskMergeState {
+            op: WorkTaskMergeOp::DeliverPr,
+            remote_branch: Some("task/1".into()),
+            expected_head: Some("abc123".into()),
+            keep_in_review: true,
+            ..Default::default()
+        };
+        let deliver_seq = begin_delivery(&db.conn, id, &state, seq)
+            .await
+            .unwrap()
+            .expect("CAS");
+
+        let delivery = r#"{"provider":"github","pr_url":"https://x/pull/9","pr_number":9}"#;
+        assert!(
+            !delivered_to_review(
+                &db.conn,
+                id,
+                seq,
+                "https://x/pull/9",
+                DeliveryRecord::Delivery(delivery)
+            )
+            .await
+            .unwrap(),
+            "a settle bound to the wrong generation misses"
+        );
+        assert!(delivered_to_review(
+            &db.conn,
+            id,
+            deliver_seq,
+            "https://x/pull/9",
+            DeliveryRecord::Delivery(delivery)
+        )
+        .await
+        .unwrap());
+
+        let row = get_model(&db.conn, id).await.unwrap();
+        assert_eq!(row.status, WorkTaskStatus::Review);
+        assert_eq!(row.delivery.as_deref(), Some(delivery));
+        assert!(
+            row.source_meta.is_none(),
+            "a local task grows no provenance"
+        );
+        assert!(row.completion_kind.is_none(), "it did not finish");
+        assert!(row.finished_at.is_none());
+        assert!(row.merge_state.is_none(), "the intent is spent");
+        assert!(row.last_error.is_none(), "nothing failed");
+        assert_eq!(
+            row.run_seq, deliver_seq,
+            "the next acceptance binds to this generation"
+        );
+        // Reviewable as ever: the next delivery starts from here.
+        assert!(begin_delivery(&db.conn, id, &state, deliver_seq)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     /// Run a fresh task all the way to `review` — the state every acceptance
@@ -5830,6 +6213,322 @@ mod tests {
 
         // Explicit unarchive requires an archived row.
         assert!(!set_archived(&db.conn, t.id, false).await.unwrap());
+    }
+
+    /// The `user_action` names a task's timeline recorded, oldest first.
+    async fn user_actions(db: &crate::db::AppDatabase, id: i32) -> Vec<String> {
+        list_events(&db.conn, id, 500)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "user_action")
+            .filter_map(|e| {
+                e.payload
+                    .and_then(|p| p.get("action").and_then(|a| a.as_str()).map(str::to_string))
+            })
+            .collect()
+    }
+
+    fn deferred(db_row: &work_task::Model) -> bool {
+        db_row.deferred_at.is_some()
+    }
+
+    /// "Handle later": a reviewed or failed task leaves the attention badge
+    /// without changing status, and comes back by hand. Everything else —
+    /// a live run, a merge in flight, a finished task, an archived or
+    /// merge-queued one — refuses the mark.
+    #[tokio::test]
+    async fn deferring_parks_a_settled_task_out_of_the_badge_and_back() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-defer").await;
+
+        // Nothing to put aside before the task has run.
+        let t = create(&db.conn, draft(folder_id, "t")).await.unwrap();
+        assert!(!set_deferred(&db.conn, t.id, true).await.unwrap());
+
+        // A live run is answered or stopped, never parked out of sight.
+        let seq = claim_for_run(&db.conn, t.id, WorkTaskStatus::Todo, "user")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(start_running(&db.conn, t.id, seq, 1, "c").await.unwrap());
+        assert!(!set_deferred(&db.conn, t.id, true).await.unwrap());
+        assert!(flip_awaiting(&db.conn, t.id, seq, true).await.unwrap());
+        assert!(!set_deferred(&db.conn, t.id, true).await.unwrap());
+        assert!(flip_awaiting(&db.conn, t.id, seq, false).await.unwrap());
+
+        // Reviewed: the badge counts it until it is put aside — and the status
+        // is untouched, so every acceptance stays on offer.
+        assert!(settle_review(&db.conn, t.id, seq, None, None)
+            .await
+            .unwrap());
+        assert_eq!(attention_count(&db.conn).await.unwrap(), 1);
+        assert!(set_deferred(&db.conn, t.id, true).await.unwrap());
+        let row = get_model(&db.conn, t.id).await.unwrap();
+        assert_eq!(row.status, WorkTaskStatus::Review);
+        assert!(deferred(&row));
+        assert!(get(&db.conn, t.id).await.unwrap().deferred_at.is_some());
+        assert_eq!(attention_count(&db.conn).await.unwrap(), 0);
+        // Once is enough; and the way back needs the mark to be there.
+        assert!(!set_deferred(&db.conn, t.id, true).await.unwrap());
+        assert!(set_deferred(&db.conn, t.id, false).await.unwrap());
+        assert!(!deferred(&get_model(&db.conn, t.id).await.unwrap()));
+        assert_eq!(attention_count(&db.conn).await.unwrap(), 1);
+        assert!(!set_deferred(&db.conn, t.id, false).await.unwrap());
+        assert_eq!(user_actions(&db, t.id).await, ["defer", "undefer"]);
+
+        // Waiting in the merge queue is an acceptance already made.
+        let intent = WorkTaskQueuedMerge {
+            message: None,
+            delete_worktree: true,
+            instructions: None,
+            queued_at: Utc::now(),
+        };
+        assert!(queue_merge(&db.conn, t.id, &intent, seq, None)
+            .await
+            .unwrap());
+        assert!(!set_deferred(&db.conn, t.id, true).await.unwrap());
+        assert!(unqueue_merge(&db.conn, t.id).await.unwrap());
+        assert!(set_deferred(&db.conn, t.id, true).await.unwrap());
+
+        // Failed: same deal. Archiving a deferred task keeps the mark (the way
+        // back out of the archive is to where it was), but an archived task is
+        // already put away and is not deferred on top.
+        let f = create(&db.conn, draft(folder_id, "f")).await.unwrap();
+        let fseq = claim_for_run(&db.conn, f.id, WorkTaskStatus::Todo, "user")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(start_running(&db.conn, f.id, fseq, 2, "cf").await.unwrap());
+        assert!(fail(
+            &db.conn,
+            f.id,
+            &[WorkTaskStatus::Running],
+            Some(fseq),
+            "agent_error",
+            None
+        )
+        .await
+        .unwrap());
+        assert_eq!(attention_count(&db.conn).await.unwrap(), 1);
+        assert!(set_archived(&db.conn, f.id, true).await.unwrap());
+        assert!(!set_deferred(&db.conn, f.id, true).await.unwrap());
+        assert!(set_archived(&db.conn, f.id, false).await.unwrap());
+        assert!(set_deferred(&db.conn, f.id, true).await.unwrap());
+        assert_eq!(attention_count(&db.conn).await.unwrap(), 0);
+        assert!(set_archived(&db.conn, f.id, true).await.unwrap());
+        assert!(set_archived(&db.conn, f.id, false).await.unwrap());
+        let row = get_model(&db.conn, f.id).await.unwrap();
+        assert_eq!(row.status, WorkTaskStatus::Failed);
+        assert!(deferred(&row));
+        assert_eq!(attention_count(&db.conn).await.unwrap(), 0);
+
+        // Finished or stopped tasks have nothing left to handle.
+        let d = create(&db.conn, draft(folder_id, "d")).await.unwrap();
+        to_review(&db, d.id).await;
+        assert!(complete_without_merge(&db.conn, d.id, "nothing to merge")
+            .await
+            .unwrap());
+        assert!(!set_deferred(&db.conn, d.id, true).await.unwrap());
+        let c = create(&db.conn, draft(folder_id, "c")).await.unwrap();
+        assert!(cancel(&db.conn, c.id, None).await.unwrap());
+        assert!(!set_deferred(&db.conn, c.id, true).await.unwrap());
+    }
+
+    /// A fresh task run to review and then put aside — returns (id, run_seq).
+    async fn parked(db: &crate::db::AppDatabase, folder_id: i32, title: &str) -> (i32, i32) {
+        let t = create(&db.conn, draft(folder_id, title)).await.unwrap();
+        let seq = to_review(db, t.id).await;
+        assert!(set_deferred(&db.conn, t.id, true).await.unwrap());
+        (t.id, seq)
+    }
+
+    /// A deferred task is picked back up by HANDLING it, whichever way: every
+    /// door out of review / failed takes the mark along, so the task that ran
+    /// again — or bounced — lands back in "needs you" instead of the pile it
+    /// was parked on.
+    #[tokio::test]
+    async fn every_way_of_handling_a_deferred_task_clears_the_mark() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-defer-exit").await;
+        let merge = WorkTaskMergeState {
+            pre_merge_head: "abc".into(),
+            message: String::new(),
+            strategy: "squash".into(),
+            delete_worktree: false,
+            auto_message: true,
+            ..Default::default()
+        };
+        // 继续处理: the follow-up claim starts the next run, and that run's
+        // review is news again.
+        let (id, _) = parked(&db, folder_id, "followed").await;
+        let seq = claim_for_run(&db.conn, id, WorkTaskStatus::Review, "user")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!deferred(&get_model(&db.conn, id).await.unwrap()));
+        assert!(start_running(&db.conn, id, seq, 1, "c2").await.unwrap());
+        assert!(settle_review(&db.conn, id, seq, None, None).await.unwrap());
+        assert!(!deferred(&get_model(&db.conn, id).await.unwrap()));
+        assert_eq!(attention_count(&db.conn).await.unwrap(), 1);
+
+        // A user's merge picks it up — and a bounced landing is theirs to see.
+        let (id, seq) = parked(&db, folder_id, "merged").await;
+        let merge_seq = begin_merge(&db.conn, id, &merge, seq, false, None)
+            .await
+            .unwrap()
+            .expect("a user's merge takes a deferred task");
+        assert!(!deferred(&get_model(&db.conn, id).await.unwrap()));
+        assert!(
+            merge_back_to_review(&db.conn, id, Some(merge_seq), Some("conflict".into()), None)
+                .await
+                .unwrap()
+        );
+        assert!(!deferred(&get_model(&db.conn, id).await.unwrap()));
+
+        // Queued behind another landing: its place in line belongs on review.
+        let (id, seq) = parked(&db, folder_id, "queued").await;
+        let intent = WorkTaskQueuedMerge {
+            message: None,
+            delete_worktree: false,
+            instructions: None,
+            queued_at: Utc::now(),
+        };
+        assert!(queue_merge(&db.conn, id, &intent, seq, None).await.unwrap());
+        assert!(!deferred(&get_model(&db.conn, id).await.unwrap()));
+
+        // Delivered, completed outright, or stopped.
+        let (id, seq) = parked(&db, folder_id, "delivered").await;
+        let delivery = WorkTaskMergeState {
+            op: WorkTaskMergeOp::DeliverPr,
+            remote_branch: Some("task/x".into()),
+            expected_head: Some("abc123".into()),
+            ..Default::default()
+        };
+        assert!(begin_delivery(&db.conn, id, &delivery, seq)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(!deferred(&get_model(&db.conn, id).await.unwrap()));
+        let (id, _) = parked(&db, folder_id, "completed").await;
+        assert!(complete_without_merge(&db.conn, id, "nothing to merge")
+            .await
+            .unwrap());
+        assert!(!deferred(&get_model(&db.conn, id).await.unwrap()));
+        let (id, _) = parked(&db, folder_id, "abandoned").await;
+        assert!(cancel(&db.conn, id, None).await.unwrap());
+        assert!(!deferred(&get_model(&db.conn, id).await.unwrap()));
+
+        // A deferred failure is retried by the same claim, and the retry's own
+        // failure is news too.
+        let f = create(&db.conn, draft(folder_id, "retried")).await.unwrap();
+        let seq = claim_for_run(&db.conn, f.id, WorkTaskStatus::Todo, "user")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(start_running(&db.conn, f.id, seq, 1, "cf").await.unwrap());
+        assert!(fail(
+            &db.conn,
+            f.id,
+            &[WorkTaskStatus::Running],
+            Some(seq),
+            "agent_error",
+            None
+        )
+        .await
+        .unwrap());
+        assert!(set_deferred(&db.conn, f.id, true).await.unwrap());
+        let seq = claim_for_run(&db.conn, f.id, WorkTaskStatus::Failed, "user")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!deferred(&get_model(&db.conn, f.id).await.unwrap()));
+        assert!(start_running(&db.conn, f.id, seq, 1, "cf2").await.unwrap());
+        assert!(fail(
+            &db.conn,
+            f.id,
+            &[WorkTaskStatus::Running],
+            Some(seq),
+            "agent_error",
+            None
+        )
+        .await
+        .unwrap());
+        assert!(!deferred(&get_model(&db.conn, f.id).await.unwrap()));
+    }
+
+    /// The unattended merge never lands a task the user put aside: the CAS
+    /// itself refuses it (the sweep's snapshot can predate the deferral), and
+    /// the row is left exactly as the user parked it.
+    #[tokio::test]
+    async fn auto_merge_refuses_a_deferred_task() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-defer-auto").await;
+        let t = create(&db.conn, draft(folder_id, "t")).await.unwrap();
+        let seq = to_review(&db, t.id).await;
+        let state = WorkTaskMergeState {
+            pre_merge_head: "abc".into(),
+            message: String::new(),
+            strategy: "squash".into(),
+            delete_worktree: true,
+            auto_message: true,
+            ..Default::default()
+        };
+        assert!(set_deferred(&db.conn, t.id, true).await.unwrap());
+        assert!(begin_merge(&db.conn, t.id, &state, seq, true, None)
+            .await
+            .unwrap()
+            .is_none());
+        let row = get_model(&db.conn, t.id).await.unwrap();
+        assert_eq!(row.status, WorkTaskStatus::Review);
+        assert_eq!(row.run_seq, seq);
+        assert!(deferred(&row));
+
+        // Brought back, the same dispatch goes through.
+        assert!(set_deferred(&db.conn, t.id, false).await.unwrap());
+        assert!(begin_merge(&db.conn, t.id, &state, seq, true, None)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    /// An unattended dispatch refused for a reason of its own (wrong base
+    /// branch, staged changes) after the user put the task aside — its sweep
+    /// snapshot predates the deferral — must not banner the parked row: that
+    /// would both decorate a task the user said can wait and latch it out of
+    /// the auto-merge it gets again once it is back in "needs you".
+    #[tokio::test]
+    async fn an_unattended_refusal_leaves_a_deferred_task_unbannered() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-defer-banner").await;
+        let t = create(&db.conn, draft(folder_id, "t")).await.unwrap();
+        let seq = to_review(&db, t.id).await;
+
+        assert!(set_deferred(&db.conn, t.id, true).await.unwrap());
+        assert!(
+            !set_review_error(&db.conn, t.id, seq, "auto-merge failed: staged changes")
+                .await
+                .unwrap()
+        );
+        let row = get_model(&db.conn, t.id).await.unwrap();
+        assert!(row.last_error.is_none());
+        assert!(deferred(&row));
+
+        // Back in "needs you", the next refusal banners as before.
+        assert!(set_deferred(&db.conn, t.id, false).await.unwrap());
+        assert!(
+            set_review_error(&db.conn, t.id, seq, "auto-merge failed: staged changes")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            get_model(&db.conn, t.id)
+                .await
+                .unwrap()
+                .last_error
+                .as_deref(),
+            Some("auto-merge failed: staged changes")
+        );
     }
 
     #[tokio::test]

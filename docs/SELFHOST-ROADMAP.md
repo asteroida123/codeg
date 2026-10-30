@@ -1,6 +1,6 @@
 # 自用集成线路线图（selfhost/main）
 
-> 状态：Active（2026-09-26 建立，同日按 Discussion #731 修订；2026-09-27 第二阶段完成）
+> 状态：Active（2026-10-30 同步 upstream main 0.41.3；保留自用委托续作与任务编排）
 > 性质：个人自用集成分支，先完整验证再拆小 PR 回上游（与 Discussion #731 的边界一致）
 > 基座：`codex/delegation-continuation-local`（PR #693 同会话续作）+ ZCode 内置（PR #768）+ upstream main 0.32.2
 >
@@ -9,6 +9,14 @@
 > - `docs/codeg-continuable-delegation-session-design.md` — CollaborationSession 完整设计（形态参考）
 > - `docs/STRATEGY-MEMO.md` — 战略备忘（PK/角色团队为最末期产品功能）
 > - Issue #603（续作跟踪）、Issue #724（委托结果持久化 + 子 Agent 看板）、PR #693 范围映射
+
+## 上游同步（2026-10-30）
+
+- 合入 upstream/main `ddd1f09fc`（0.41.3），原自用基线 `0ce1ff82a` 保存在本地分支 `codex/backup-selfhost-pre-upstream-20261030`。
+- ZCode 接入采用上游 `zcode-acp-server@0.79.1` 及运行时发现、模型选择、技能、附件与用量实现，替代 `zcode-codeg-adapter@0.1.9`。旧内置 ZCode 的 ACP 历史保留兼容读取，且与同名自定义适配器的数据隔离。
+- 保留严格续作、委托/任务运行账本、子会话入口、指标面板与任务依赖/预算门控；兼容上游助手快照、CLI 运行归属及任务 PR 交付。
+- 后端构建使用上游新增的 `server-bin`、`mcp-bin` feature；历史数据库迁移（含 pk_round tombstone）保留原名与顺序。
+- 验证：前端 lint、类型检查、11,214 项测试、静态导出与浏览器代理检查通过；Rust 无桌面模式的单元及集成测试通过（6,334 项单元测试，4 项忽略）；桌面全目标和 server/MCP/CLI 的 Clippy 检查通过。未进行桌面安装包发布或真实账号的 ZCode 会话验收。
 
 ## 主线（Discussion #731 的闭环）
 

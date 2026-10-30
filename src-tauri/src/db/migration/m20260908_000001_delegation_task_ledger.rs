@@ -216,11 +216,11 @@ mod tests {
             .expect("foreign keys");
 
         let migrations = <Migrator as MigratorTrait>::migrations();
-        let ledger_idx = migrations
+        let _ledger_idx = migrations
             .iter()
             .position(|migration| migration.name() == "m20260908_000001_delegation_task_ledger")
             .expect("ledger migration is registered");
-        Migrator::up(&conn, Some(ledger_idx as u32))
+        crate::db::migration::UpstreamSchemaFixture::<0>::up(&conn, None)
             .await
             .expect("apply upstream pre-ledger schema");
         assert!(
@@ -252,6 +252,7 @@ mod tests {
             Some("Legacy completed child".into()),
             Some("legacy-branch".into()),
             Some(DelegationLink {
+                assistant: None,
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: "legacy-tool-use".into(),
                 delegation_call_id: legacy_task_id.into(),
@@ -285,6 +286,7 @@ mod tests {
             Some("Legacy interrupted child".into()),
             Some("legacy-branch".into()),
             Some(DelegationLink {
+                assistant: None,
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: "legacy-interrupted-tool-use".into(),
                 delegation_call_id: interrupted_task_id.into(),
@@ -348,6 +350,7 @@ mod tests {
             Some("Post-upgrade child".into()),
             None,
             Some(DelegationLink {
+                assistant: None,
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: "post-upgrade-tool-use".into(),
                 delegation_call_id: new_task_id.into(),

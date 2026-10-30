@@ -20,9 +20,7 @@
 
 use chrono::Utc;
 use sea_orm::sea_query::OnConflict;
-use sea_orm::{
-    ColumnTrait, DatabaseConnection, EntityTrait, NotSet, QueryFilter, QueryOrder, Set,
-};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, NotSet, QueryFilter, QueryOrder, Set};
 
 use crate::db::entities::{conversation, work_task, work_task_run};
 use crate::db::error::DbError;
@@ -229,21 +227,19 @@ pub async fn close(
 
     let (tokens, external_session_id) = match row.conversation_id {
         Some(conversation_id) => {
-            let tokens = match token_usage_service::total_tokens_for_conversations(
-                conn,
-                &[conversation_id],
-            )
-            .await
-            {
-                Ok(total) if total > 0 => Some(total),
-                Ok(_) => None,
-                Err(e) => {
-                    tracing::warn!(
-                        "[work_task] run {task_id}/{run_seq}: token facts unavailable: {e}"
-                    );
-                    None
-                }
-            };
+            let tokens =
+                match token_usage_service::total_tokens_for_conversations(conn, &[conversation_id])
+                    .await
+                {
+                    Ok(total) if total > 0 => Some(total),
+                    Ok(_) => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            "[work_task] run {task_id}/{run_seq}: token facts unavailable: {e}"
+                        );
+                        None
+                    }
+                };
             let session = conversation::Entity::find_by_id(conversation_id)
                 .one(conn)
                 .await?
@@ -474,7 +470,6 @@ async fn live_external_id(
         .and_then(|c| c.external_id))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,14 +538,20 @@ mod tests {
 
         assert!(open(&db.conn, open_input(task_id, 0)).await.expect("open"));
         assert!(
-            !open(&db.conn, open_input(task_id, 0)).await.expect("re-open"),
+            !open(&db.conn, open_input(task_id, 0))
+                .await
+                .expect("re-open"),
             "a second open of the same generation must keep the first row"
         );
-        assert!(open(&db.conn, open_input(task_id, 1)).await.expect("open 1"));
-
-        assert!(bind_session(&db.conn, task_id, 0, conversation_id, "/tmp/wt")
+        assert!(open(&db.conn, open_input(task_id, 1))
             .await
-            .expect("bind"));
+            .expect("open 1"));
+
+        assert!(
+            bind_session(&db.conn, task_id, 0, conversation_id, "/tmp/wt")
+                .await
+                .expect("bind")
+        );
         assert!(close(
             &db.conn,
             task_id,
@@ -585,17 +586,11 @@ mod tests {
         let (task_id, _) = seed_task(&db).await;
         assert!(open(&db.conn, open_input(task_id, 0)).await.expect("open"));
 
-        assert!(close(
-            &db.conn,
-            task_id,
-            0,
-            STATUS_CANCELED,
-            None,
-            None,
-            None
-        )
-        .await
-        .expect("cancel close"));
+        assert!(
+            close(&db.conn, task_id, 0, STATUS_CANCELED, None, None, None)
+                .await
+                .expect("cancel close")
+        );
         assert!(
             !close(
                 &db.conn,
@@ -640,20 +635,16 @@ mod tests {
         .expect("usage fact");
 
         assert!(open(&db.conn, open_input(task_id, 0)).await.expect("open"));
-        assert!(bind_session(&db.conn, task_id, 0, conversation_id, "/tmp/wt")
-            .await
-            .expect("bind"));
-        assert!(close(
-            &db.conn,
-            task_id,
-            0,
-            STATUS_SETTLED,
-            None,
-            None,
-            None
-        )
-        .await
-        .expect("close"));
+        assert!(
+            bind_session(&db.conn, task_id, 0, conversation_id, "/tmp/wt")
+                .await
+                .expect("bind")
+        );
+        assert!(
+            close(&db.conn, task_id, 0, STATUS_SETTLED, None, None, None)
+                .await
+                .expect("close")
+        );
         let runs = list_for_task(&db.conn, task_id).await.expect("list");
         assert_eq!(runs[0].input_tokens, Some(18));
         assert_eq!(runs[0].output_tokens, None);
@@ -687,17 +678,11 @@ mod tests {
         input.conversation_id = Some(conversation_id);
         input.external_session_id = Some("session-a");
         assert!(open(&db.conn, input).await.expect("open"));
-        assert!(close(
-            &db.conn,
-            task_id,
-            0,
-            STATUS_SETTLED,
-            None,
-            None,
-            None
-        )
-        .await
-        .expect("close"));
+        assert!(
+            close(&db.conn, task_id, 0, STATUS_SETTLED, None, None, None)
+                .await
+                .expect("close")
+        );
 
         // The conversation has not reported the session yet: no anchor.
         assert_eq!(
@@ -747,15 +732,11 @@ mod tests {
         use crate::db::service::work_task_service;
         let db = fresh_in_memory_db().await;
         let (task_id, _) = seed_task(&db).await;
-        let run_seq = work_task_service::claim_for_run(
-            &db.conn,
-            task_id,
-            WorkTaskStatus::Todo,
-            "test",
-        )
-        .await
-        .expect("claim")
-        .expect("claimed");
+        let run_seq =
+            work_task_service::claim_for_run(&db.conn, task_id, WorkTaskStatus::Todo, "test")
+                .await
+                .expect("claim")
+                .expect("claimed");
         assert!(open(&db.conn, open_input(task_id, run_seq))
             .await
             .expect("open"));

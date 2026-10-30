@@ -16,7 +16,9 @@ use crate::commands::delegation::{
     get_delegation_performance_core, list_delegated_child_sessions_core, load_delegation_settings,
     set_delegation_settings_core, DelegationSettings,
 };
-use crate::db::service::delegation_task_service::{DelegatedChildSession, DelegationPerformanceReport};
+use crate::db::service::delegation_task_service::{
+    DelegatedChildSession, DelegationPerformanceReport,
+};
 
 pub async fn get_delegation_settings(
     Extension(state): Extension<Arc<AppState>>,

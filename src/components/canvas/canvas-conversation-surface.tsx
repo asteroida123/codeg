@@ -12,8 +12,13 @@ import { useTranslations } from "next-intl"
 import { AgentSelector } from "@/components/chat/agent-selector"
 import { ConversationShell } from "@/components/chat/conversation-shell"
 import type { ConversationFolderPickerOverride } from "@/components/chat/conversation-context-bar"
+import type { ComposerInjectContent } from "@/components/chat/message-input"
 import { MessageListView } from "@/components/message/message-list-view"
-import { useAcpActions } from "@/contexts/acp-connections-context"
+import {
+  getCachedSelectors,
+  useAcpActions,
+} from "@/contexts/acp-connections-context"
+import { useAcpAgents } from "@/hooks/use-acp-agents"
 import { useConnectionLifecycle } from "@/hooks/use-connection-lifecycle"
 import { useConversationDetail } from "@/hooks/use-conversation-detail"
 import {
@@ -73,7 +78,9 @@ import { useShallow } from "zustand/react/shallow"
  * What it deliberately leaves out: the message queue, live-feedback steering,
  * transcript export and the welcome-page quick actions. Those belong
  * to the full workspace surface, which the card's "open in workspace" menu
- * entry is one click away from.
+ * entry is one click away from. Without a queue, a message written while the
+ * agent is still answering stays in the composer (`MessageInput` holds it), and
+ * one that bounces off a turn the card hadn't heard of yet is handed back there.
  *
  * `contextKey` is the ACP connection key and must be STABLE for the card's
  * lifetime; when this conversation is also open in a workspace tab, the two
@@ -184,6 +191,7 @@ export function CanvasConversationSurface({
   const t = useTranslations("Canvas")
   const sharedT = useTranslations("Folder.chat.shared")
   const tAsyncTasks = useTranslations("Folder.chat.asyncTasks")
+  const tComposer = useTranslations("Folder.chat.messageInput")
   const acpActions = useAcpActions()
   const {
     appendOptimisticTurn,
@@ -263,6 +271,16 @@ export function CanvasConversationSurface({
 
   const [modeId, setModeId] = useState<string | null>(() =>
     getSavedModeId(agentType)
+  )
+  // Sends handed back to the composer, which cleared itself as each went out
+  // (see the bounce handler in `handleSend`). Oldest first, offered one at a
+  // time: a second can bounce before the composer has taken the first.
+  const [composerHandBacks, setComposerHandBacks] = useState<
+    ComposerInjectContent[]
+  >([])
+  const handleComposerHandBackConsumed = useCallback(
+    () => setComposerHandBacks((pending) => pending.slice(1)),
+    []
   )
   const [sendSignal, setSendSignal] = useState(0)
   const creatingRef = useRef(false)
@@ -388,6 +406,42 @@ export function CanvasConversationSurface({
   const connStatus = conn.status
   const connSessionId = conn.sessionId
 
+  // A draft card can switch agents, and `connect()` tears the previous agent's
+  // connection down only once the new pick gets past its preflight. Until then
+  // — and for good when the pick can't connect at all — the connection under
+  // this key still belongs to the agent the user just left, often already
+  // `connected`. Never present it as the selected agent's: its mode and config
+  // chips are not this agent's, and a send would reach the agent the user left
+  // while the conversation row is filed under the one they picked. Same rule as
+  // the tab view's `connIsForOtherAgent` (conversation-detail-panel.tsx).
+  const connIsForOtherAgent =
+    conn.agentType != null && conn.agentType !== agentType
+  // Enabled and platform-available, yet nothing installed: the preflight
+  // refuses such an agent before it tears anything down, so a switch to one
+  // never gets past the old connection.
+  const { agents: acpAgents } = useAcpAgents()
+  const selectedAgentNotInstalled = useMemo(() => {
+    const info = acpAgents.find((a) => a.agent_type === agentType)
+    return (
+      info != null && info.enabled && info.available && !info.installed_version
+    )
+  }, [acpAgents, agentType])
+  // What the composer shows. Only ever differs from `connStatus` while the
+  // connection belongs to another agent: still `connecting` while the switch
+  // can complete, `disconnected` when the selected agent can't connect at all.
+  const composerStatus = connIsForOtherAgent
+    ? selectedAgentNotInstalled
+      ? "disconnected"
+      : "connecting"
+    : connStatus
+  const effectiveModes = connIsForOtherAgent
+    ? (getCachedSelectors(agentType)?.modes ?? null)
+    : conn.modes
+  const effectiveConfigOptions = connIsForOtherAgent
+    ? (getCachedSelectors(agentType)?.configOptions ?? null)
+    : conn.configOptions
+  const connectionCommands = connIsForOtherAgent ? null : conn.availableCommands
+
   /**
    * Re-entry repair: let the database have the last word on a session this
    * card is coming back to.
@@ -506,15 +560,17 @@ export function CanvasConversationSurface({
     (nextModeId: string) => {
       setModeId(nextModeId)
       // The preference stores the whole mode SHAPE, not just the id, so it can
-      // be shipped to the backend at connect time.
-      if (conn.modes) {
+      // be shipped to the backend at connect time. Reconciled to the selected
+      // agent, so a change made mid-switch can't save the previous agent's
+      // mode list under this one.
+      if (effectiveModes) {
         saveModePreference(agentType, {
-          ...conn.modes,
+          ...effectiveModes,
           current_mode_id: nextModeId,
         })
       }
     },
-    [agentType, conn.modes]
+    [agentType, effectiveModes]
   )
 
   const handleSend = useCallback(
@@ -526,6 +582,9 @@ export function CanvasConversationSurface({
       // never rolled back.
       const alreadyPersisted = dbConversationIdRef.current != null
       if (!alreadyPersisted && (creatingRef.current || !draftTarget)) return
+      // The composer already reads as not ready while the connection belongs
+      // to another agent; this catches a submit that races the switch.
+      if (connIsForOtherAgent) return
 
       const optimisticTurn = buildOptimisticUserTurn(
         draft,
@@ -538,10 +597,6 @@ export function CanvasConversationSurface({
       )
       setSendSignal((prev) => prev + 1)
       setSyncState(effectiveConversationId, "awaiting_persist")
-      // No message queue on this surface: a send the backend bounces (a turn
-      // already in flight) rolls back and surfaces as a toast rather than
-      // silently parking the draft somewhere the card doesn't render.
-      //
       // Rolled back against BOTH ids the turn can be filed under. A rejection
       // is a round trip of its own, so it can land after the row has arrived
       // and the card that replaced this one has adopted the session onto the
@@ -558,6 +613,25 @@ export function CanvasConversationSurface({
           removeOptimisticTurn(persistedId, optimisticTurn.id)
         }
       }
+      // No message queue on this surface, so a send the backend bounces (a
+      // turn already in flight) has nowhere to wait. The composer holds one
+      // written while the card can SEE the agent answering; what lands here is
+      // a turn it hadn't heard of yet — started from another surface, or its
+      // `prompting` still on the way. Rolling the message back used to be all
+      // that happened, and the composer had cleared itself when it went out, so
+      // it was simply gone, with no notice either. Hand it back instead.
+      const onTurnInProgress = () => {
+        onSendFailed()
+        setComposerHandBacks((pending) => [
+          ...pending,
+          { handBack: draft.blocks },
+        ])
+        notify({
+          level: "info",
+          key: `held-while-responding:${contextKey}`,
+          title: tComposer("heldWhileResponding"),
+        })
+      }
 
       const persistedId = dbConversationIdRef.current
       if (persistedId) {
@@ -565,7 +639,7 @@ export function CanvasConversationSurface({
           folderId: boundFolderId ?? undefined,
           conversationId: persistedId,
           clientMessageId: optimisticTurn.id,
-          onTurnInProgress: onSendFailed,
+          onTurnInProgress,
           onSendFailed,
         })
         return
@@ -614,7 +688,7 @@ export function CanvasConversationSurface({
             folderId: sendFolderId,
             conversationId: newId,
             clientMessageId: optimisticTurn.id,
-            onTurnInProgress: onSendFailed,
+            onTurnInProgress,
             onSendFailed,
           })
         } catch (e) {
@@ -640,6 +714,7 @@ export function CanvasConversationSurface({
       agentType,
       appendOptimisticTurn,
       boundFolderId,
+      connIsForOtherAgent,
       connSessionId,
       contextKey,
       draftTarget,
@@ -653,6 +728,7 @@ export function CanvasConversationSurface({
       setSyncState,
       sharedT,
       t,
+      tComposer,
       upsertFolder,
     ]
   )
@@ -716,21 +792,31 @@ export function CanvasConversationSurface({
     [conn.connectionId, tAsyncTasks]
   )
 
+  /** Turn Claude Code's Remote Control off the way the user would: by sending
+   *  `/remote-control off`, which the adapter answers itself. */
+  const handleRemoteControlOff = useCallback(() => {
+    const command = "/remote-control off"
+    handleSend({
+      blocks: [{ type: "text", text: command }],
+      displayText: command,
+    })
+  }, [handleSend])
+
   const connectionModes = useMemo(
-    () => conn.modes?.available_modes ?? [],
-    [conn.modes]
+    () => effectiveModes?.available_modes ?? [],
+    [effectiveModes]
   )
   const connectionConfigOptions = useMemo(
-    () => conn.configOptions ?? [],
-    [conn.configOptions]
+    () => effectiveConfigOptions ?? [],
+    [effectiveConfigOptions]
   )
   const selectedModeId = useMemo(() => {
     if (connectionModes.length === 0) return null
     if (modeId && connectionModes.some((mode) => mode.id === modeId)) {
       return modeId
     }
-    return conn.modes?.current_mode_id ?? connectionModes[0]?.id ?? null
-  }, [conn.modes, connectionModes, modeId])
+    return effectiveModes?.current_mode_id ?? connectionModes[0]?.id ?? null
+  }, [effectiveModes, connectionModes, modeId])
 
   // Arrow-key history source, read lazily on the first Up/Down (see
   // `MessageInput.getSentHistory`) so streaming tokens cost nothing here.
@@ -753,7 +839,7 @@ export function CanvasConversationSurface({
           added here later. */}
       <div className="nowheel flex min-h-0 flex-1 flex-col">
         <ConversationShell
-          status={connStatus}
+          status={composerStatus}
           promptCapabilities={conn.promptCapabilities}
           defaultPath={workingDir}
           // The `@` panel's delegated-children group (§14.4) is scoped to this
@@ -765,6 +851,12 @@ export function CanvasConversationSurface({
           onSessionFailureDismiss={handleSessionFailureDismiss}
           asyncTasks={conn.asyncTasks}
           onStopAsyncTask={handleStopAsyncTask}
+          remoteControl={connIsForOtherAgent ? null : conn.remoteControl}
+          onRemoteControlOff={
+            conn.connectionId !== null && !conn.isViewer
+              ? handleRemoteControlOff
+              : undefined
+          }
           pendingPermission={conn.pendingPermission}
           pendingQuestion={conn.pendingQuestion}
           pendingAskQuestion={conn.pendingAskQuestion}
@@ -785,8 +877,11 @@ export function CanvasConversationSurface({
           onModeChange={handleModeChange}
           onConfigOptionChange={handleSetConfigOption}
           agentType={agentType}
-          availableCommands={conn.availableCommands ?? []}
+          availableCommands={connectionCommands ?? []}
+          promptSuggestion={connIsForOtherAgent ? null : conn.promptSuggestion}
           draftStorageKey={`canvas-draft:${contextKey}`}
+          injectContent={composerHandBacks[0] ?? null}
+          onInjectConsumed={handleComposerHandBackConsumed}
           getSentHistory={getSentHistory}
           // The card's own connection key doubles as its composer scope: the
           // context-usage ring and connection dot in the picker row read it as
@@ -802,7 +897,7 @@ export function CanvasConversationSurface({
                 defaultAgentType={agentType}
                 onSelect={onAgentTypeChange}
                 onFallback={onAgentTypeChange}
-                disabled={conn.status === "connecting"}
+                // Draft cards can change agents during connection startup.
               />
             </div>
           )}
@@ -815,6 +910,7 @@ export function CanvasConversationSurface({
             // wrong guess) leaves MessageListView's folder fallback in place.
             imageRoot={workingDir}
             agentType={agentType}
+            availableCommands={connectionCommands}
             connStatus={connStatus}
             isActive={isActive}
             sendSignal={sendSignal}
@@ -822,7 +918,6 @@ export function CanvasConversationSurface({
             detailError={detailError}
             acpLoadError={acpLoadError}
             hideEmptyState={isDraft}
-            showMessageNav={false}
             onSaveNoteSelection={onSaveSelectionAsNote}
           />
         </ConversationShell>

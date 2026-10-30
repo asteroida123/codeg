@@ -51,6 +51,17 @@ mod m20260926_000001_delegation_metrics;
 mod m20260926_000002_work_task_orchestration;
 mod m20260926_000003_work_task_run;
 mod m20260926_000004_delegation_work_task_link;
+mod m20260929_000001_canvas_board;
+mod m20260930_000001_agent_setting_drop_adapter_channel;
+mod m20261006_000001_conversation_tag;
+mod m20261015_000001_kiro_builtin_agent;
+mod m20261015_000001_work_task_deferred_at;
+mod m20261016_000001_assistant;
+mod m20261016_000002_conversation_assistant;
+mod m20261017_000002_conversation_source;
+mod m20261020_000001_folder_command_run_local;
+mod m20261022_000001_tool_approval;
+mod m20261022_000001_work_task_delivery;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -108,6 +119,67 @@ impl MigratorTrait for Migrator {
             Box::new(m20260926_000002_work_task_orchestration::Migration),
             Box::new(m20260926_000003_work_task_run::Migration),
             Box::new(m20260926_000004_delegation_work_task_link::Migration),
+            Box::new(m20260929_000001_canvas_board::Migration),
+            Box::new(m20260930_000001_agent_setting_drop_adapter_channel::Migration),
+            Box::new(m20261006_000001_conversation_tag::Migration),
+            Box::new(m20261015_000001_kiro_builtin_agent::Migration),
+            Box::new(m20261015_000001_work_task_deferred_at::Migration),
+            Box::new(m20261016_000001_assistant::Migration),
+            Box::new(m20261016_000002_conversation_assistant::Migration),
+            Box::new(m20261017_000002_conversation_source::Migration),
+            Box::new(m20261020_000001_folder_command_run_local::Migration),
+            Box::new(m20261022_000001_tool_approval::Migration),
+            Box::new(m20261022_000001_work_task_delivery::Migration),
         ]
+    }
+}
+
+/// Migration fixtures use today's ORM services to seed old selfhost rows.
+/// Keep the independent upstream schema current while withholding the local
+/// migrations under test, so adding an upstream column cannot break seeding.
+#[cfg(test)]
+pub(super) struct UpstreamSchemaFixture<const KEEP_LOCAL: usize>;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl<const KEEP_LOCAL: usize> MigratorTrait for UpstreamSchemaFixture<KEEP_LOCAL> {
+    fn migrations() -> Vec<Box<dyn MigrationTrait>> {
+        const LOCAL: [&str; 5] = [
+            "m20260908_000001_delegation_task_ledger",
+            "m20260926_000001_delegation_metrics",
+            "m20260926_000002_work_task_orchestration",
+            "m20260926_000003_work_task_run",
+            "m20260926_000004_delegation_work_task_link",
+        ];
+        Migrator::migrations().into_iter().filter(|m|
+            LOCAL.iter().position(|name| *name == m.name())
+                .is_none_or(|index| index < KEEP_LOCAL)
+        ).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm_migration::MigratorTrait;
+
+    use crate::db::migration::Migrator;
+
+    /// A backup records the last migration here as its schema version, and a
+    /// build refuses a backup naming a migration it does not know. A new
+    /// migration listed ahead of a released one (an easy slip when a rebase
+    /// conflicts on this list) leaves the released name last, so that release
+    /// accepts the newer backup and then cannot start on the migration the
+    /// restore brought in. Names are dated when written, so name order keeps
+    /// the newest migration last. A new migration whose name sorts before a
+    /// released one needs a later name, not an earlier place in the list.
+    #[test]
+    fn migrations_are_listed_in_name_order() {
+        let names: Vec<String> = Migrator::migrations()
+            .iter()
+            .map(|m| m.name().to_string())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
     }
 }

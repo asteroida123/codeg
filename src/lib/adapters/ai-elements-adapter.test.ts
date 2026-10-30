@@ -8,13 +8,14 @@ import {
   extractUserResourcesFromText,
   groupConsecutiveDelegationStatus,
   groupGoalRuns,
-  groupConsecutiveToolCalls,
   mergeAdjacentDelegationStatusGroups,
   type AdaptedContentPart,
   type AdaptedToolCallPart,
 } from "./ai-elements-adapter"
 import type { PageHandoffBlock } from "@/lib/browser/page-handoff-block"
+import type { ContentBlock } from "@/lib/types"
 import { CODEX_SEARCH_ACTION_META_KEY } from "@/lib/codex-command-action"
+import { buildStreamingTurnsFromLiveMessage } from "@/stores/conversation-runtime-store"
 
 /** What `usePageHandoffName` answers with the English messages. */
 function pageHandoffName(handoff: PageHandoffBlock): string {
@@ -126,88 +127,8 @@ describe("groupConsecutiveDelegationStatus", () => {
   })
 
   it("leaves a non-status part untouched", () => {
-    const toolGroup: AdaptedContentPart = {
-      type: "tool-group",
-      items: [],
-      isStreaming: false,
-    }
-    expect(groupConsecutiveDelegationStatus([toolGroup])).toEqual([toolGroup])
-  })
-})
-
-describe("groupConsecutiveToolCalls", () => {
-  it("leaves Codex goal calls standalone so they can render as cards", () => {
-    const out = groupConsecutiveToolCalls([
-      poll("create_goal"),
-      poll("exec_command"),
-      poll("update_goal"),
-    ])
-
-    expect(out.map((p) => p.type)).toEqual([
-      "tool-call",
-      "tool-group",
-      "tool-call",
-    ])
-  })
-
-  it("leaves plan-mode tools standalone (no '思考 N 次' tool-group)", () => {
-    const out = groupConsecutiveToolCalls([
-      poll("read"),
-      poll("EnterPlanMode"),
-      poll("read"),
-    ])
-
-    expect(out.map((p) => p.type)).toEqual([
-      "tool-group",
-      "tool-call",
-      "tool-group",
-    ])
-  })
-
-  it("does not wrap a lone plan-mode tool into a group", () => {
-    expect(
-      groupConsecutiveToolCalls([poll("EnterPlanMode")]).map((p) => p.type)
-    ).toEqual(["tool-call"])
-    expect(
-      groupConsecutiveToolCalls([poll("switch_mode")]).map((p) => p.type)
-    ).toEqual(["tool-call"])
-  })
-
-  it("leaves a context-compaction card standalone (no '调用 N 个工具' wrapper)", () => {
-    // codex `_meta.contextCompaction` and Grok's synthesized auto_compact card
-    // render through the dedicated subtle <ContextCompactionCard>; a lone one
-    // must break the run and render standalone, not fold into a single-item
-    // tool-group. Recognition is by meta, not tool name.
-    const compaction: AdaptedToolCallPart = {
-      type: "tool-call",
-      toolCallId: "compact-1",
-      toolName: "context_compaction",
-      input: null,
-      state: "output-available",
-      meta: { contextCompaction: true, tokensBefore: 51777, tokensAfter: 4616 },
-    }
-    expect(groupConsecutiveToolCalls([compaction]).map((p) => p.type)).toEqual([
-      "tool-call",
-    ])
-    // It also breaks a surrounding run instead of folding in.
-    expect(
-      groupConsecutiveToolCalls([poll("read"), compaction, poll("read")]).map(
-        (p) => p.type
-      )
-    ).toEqual(["tool-group", "tool-call", "tool-group"])
-    // codex-acp 1.3.0 (#396) replaced the boolean marker with the versioned
-    // `{version: 1}` object — the recognition (and therefore the standalone
-    // treatment) must hold for that shape too.
-    const versioned: AdaptedToolCallPart = {
-      ...compaction,
-      toolCallId: "compact-2",
-      meta: { contextCompaction: { version: 1 } },
-    }
-    expect(
-      groupConsecutiveToolCalls([poll("read"), versioned, poll("read")]).map(
-        (p) => p.type
-      )
-    ).toEqual(["tool-group", "tool-call", "tool-group"])
+    const read = poll("read")
+    expect(groupConsecutiveDelegationStatus([read])).toEqual([read])
   })
 })
 
@@ -261,33 +182,6 @@ describe("dropHiddenFeedbackChecks", () => {
       poll("read"),
     ]
     expect(dropHiddenFeedbackChecks(parts)).toEqual(parts)
-  })
-
-  it("collapses neighbours into one group once a no-op check is dropped", () => {
-    const grouped = groupConsecutiveToolCalls(
-      dropHiddenFeedbackChecks([
-        poll("exec_command"),
-        feedbackCheck(NO_FEEDBACK_OUT),
-        poll("read"),
-      ])
-    )
-    // Without the drop, the standalone check would split this into two groups.
-    expect(grouped.map((p) => p.type)).toEqual(["tool-group"])
-  })
-
-  it("breaks the run when a check carries feedback", () => {
-    const grouped = groupConsecutiveToolCalls(
-      dropHiddenFeedbackChecks([
-        poll("exec_command"),
-        feedbackCheck(FEEDBACK_OUT),
-        poll("read"),
-      ])
-    )
-    expect(grouped.map((p) => p.type)).toEqual([
-      "tool-group",
-      "tool-call",
-      "tool-group",
-    ])
   })
 })
 
@@ -394,7 +288,26 @@ describe("dropEmptyInFlightToolCalls", () => {
     expect(dropEmptyInFlightToolCalls(lanes)).toEqual(lanes)
   })
 
-  it("collapses the phantom scenario to a single one-command group", () => {
+  it("keeps a context compaction that is still running", () => {
+    // codex-acp 1.3.0 streams the compaction as an arg-less call, in_progress
+    // until it completes; it is the "compacting" divider, not an orphan.
+    const compacting = running("Compact conversation", {
+      input: null,
+      toolStatus: "in_progress",
+      meta: { contextCompaction: { version: 1 } },
+    })
+    const legacy = running("context_compaction", {
+      input: null,
+      toolStatus: "in_progress",
+      meta: { contextCompaction: true },
+    })
+    expect(dropEmptyInFlightToolCalls([compacting, legacy])).toEqual([
+      compacting,
+      legacy,
+    ])
+  })
+
+  it("leaves only the real command in the phantom scenario", () => {
     // Live turn: one real completed build + two orphaned arg-less bash blocks
     // left by an interrupted/retried attempt. Settled transcript has only the
     // real one, so the live count must converge to it.
@@ -406,18 +319,13 @@ describe("dropEmptyInFlightToolCalls", () => {
       state: "output-available",
       output: "Build succeeded",
     }
-    const grouped = groupConsecutiveToolCalls(
+    expect(
       dropEmptyInFlightToolCalls([
         real,
         running("bash", { input: "{}" }),
         running("bash", { input: "{}" }),
       ])
-    )
-    expect(grouped.map((p) => p.type)).toEqual(["tool-group"])
-    const group = grouped[0]
-    if (group.type !== "tool-group") throw new Error("expected a tool-group")
-    expect(group.items).toHaveLength(1)
-    expect(group.items[0].toolCallId).toBe("bash:real")
+    ).toEqual([real])
   })
 
   it("prunes a promoted orphan end-to-end via adaptMessageTurn (isStreaming=false)", () => {
@@ -425,7 +333,7 @@ describe("dropEmptyInFlightToolCalls", () => {
     // matching result) plus one interrupted arg-less orphan — status still
     // "pending", no result block. Adapted with isStreaming=false (promoted),
     // the orphan's state becomes output-available; only its forwarded status
-    // reveals it. The group must still converge to the single real command.
+    // reveals it. The reply must still converge to the single real command.
     const adapted = adaptMessageTurn(
       {
         id: "promoted-turn",
@@ -461,17 +369,157 @@ describe("dropEmptyInFlightToolCalls", () => {
       },
       false
     )
-    expect(adapted.content.map((p) => p.type)).toEqual(["tool-group"])
-    const group = adapted.content[0]
-    if (group.type !== "tool-group") throw new Error("expected a tool-group")
-    expect(group.items).toHaveLength(1)
-    expect(group.items[0].toolCallId).toBe("tc-real")
+    expect(adapted.content.map((p) => p.type)).toEqual(["tool-call"])
+    const call = adapted.content[0]
+    if (call.type !== "tool-call") throw new Error("expected a tool-call")
+    expect(call.toolCallId).toBe("tc-real")
+  })
+})
+
+describe("adaptMessageTurn — a running context compaction", () => {
+  it("keeps the compaction call while it is still in progress", () => {
+    const adapted = adaptMessageTurn(
+      {
+        id: "compacting-turn",
+        role: "assistant" as const,
+        timestamp: "2026-10-22T00:00:00.000Z",
+        blocks: [
+          {
+            type: "tool_use" as const,
+            tool_use_id: "compact-live",
+            tool_name: "Compact conversation",
+            input_preview: null,
+            status: "in_progress",
+            meta: { contextCompaction: { version: 1 } },
+          },
+        ],
+      },
+      {
+        attachedResources: "Attached resources",
+        toolCallFailed: "Tool failed",
+        pageHandoffName,
+      },
+      true,
+      new Set(["compact-live"])
+    )
+    expect(adapted.content).toHaveLength(1)
+    expect(adapted.content[0]).toMatchObject({
+      type: "tool-call",
+      toolCallId: "compact-live",
+      state: "input-available",
+    })
+  })
+})
+
+describe("adaptMessageTurn — agent timeline passthrough", () => {
+  type ToolResultBlock = Extract<ContentBlock, { type: "tool_result" }>
+  const adaptAgentTurn = (result: Partial<ToolResultBlock>) =>
+    adaptMessageTurn(
+      {
+        id: "agent-turn",
+        role: "assistant" as const,
+        timestamp: "2026-07-23T00:00:00.000Z",
+        blocks: [
+          {
+            type: "tool_use" as const,
+            tool_use_id: "tc-agent",
+            tool_name: "Agent",
+            input_preview: "{}",
+          },
+          {
+            type: "tool_result" as const,
+            tool_use_id: "tc-agent",
+            output_preview: null,
+            is_error: false,
+            ...result,
+          },
+        ],
+      },
+      {
+        attachedResources: "Attached resources",
+        toolCallFailed: "Tool failed",
+        pageHandoffName,
+      },
+      false
+    )
+
+  const timeline = [
+    { type: "thinking", text: "Reading first." },
+    { type: "tool_call", childIndex: 0 },
+    { type: "text", text: "Report" },
+  ] as const
+
+  it("falls back to agent_stats.timeline when no live transcript is attached", () => {
+    const adapted = adaptAgentTurn({
+      output_preview: "done",
+      is_error: false,
+      agent_stats: {
+        total_tokens: 42,
+        tool_calls: [{ tool_name: "Read", is_error: false }],
+        timeline: [...timeline],
+      },
+    })
+    const part = adapted.content[0]
+    expect(part.type).toBe("tool-call")
+    if (part.type !== "tool-call") throw new Error("expected a tool-call")
+    expect(part.agentTranscript).toEqual(timeline)
+  })
+
+  it("prefers the live transcript over the parsed historical timeline", () => {
+    const adapted = adaptAgentTurn({
+      output_preview: "done",
+      is_error: false,
+      agent_stats: {
+        tool_calls: [{ tool_name: "Read", is_error: false }],
+        timeline: [...timeline],
+      },
+      agent_transcript: [{ type: "text", text: "live entry" }],
+    })
+    const part = adapted.content[0]
+    if (part.type !== "tool-call") throw new Error("expected a tool-call")
+    expect(part.agentTranscript).toEqual([{ type: "text", text: "live entry" }])
+  })
+
+  it("keeps old stats without a timeline untouched", () => {
+    const adapted = adaptAgentTurn({
+      output_preview: "done",
+      is_error: false,
+      agent_stats: {
+        tool_calls: [{ tool_name: "Read", is_error: false }],
+      },
+    })
+    const part = adapted.content[0]
+    if (part.type !== "tool-call") throw new Error("expected a tool-call")
+    expect(part.agentTranscript).toBeUndefined()
+    expect(part.agentStats).toMatchObject({
+      tool_calls: [{ tool_name: "Read" }],
+    })
+  })
+
+  it("never fabricates a timeline for a result with neither transcript nor stats", () => {
+    const content = adaptAgentTurn({}).content
+    const part = content[0]
+    if (part.type !== "tool-call") throw new Error("expected a tool-call")
+    expect(part.agentTranscript).toBeUndefined()
+  })
+
+  it("carries an exit code the transcript kept as a field", () => {
+    const part = adaptAgentTurn({
+      output_preview: "boom",
+      is_error: true,
+      exit_code: 2,
+    }).content[0]
+    if (part.type !== "tool-call") throw new Error("expected a tool-call")
+    expect(part.exitCode).toBe(2)
+    const unknown = adaptAgentTurn({ output_preview: "ok" }).content[0]
+    if (unknown.type !== "tool-call") throw new Error("expected a tool-call")
+    expect(unknown.exitCode).toBeUndefined()
   })
 })
 
 describe("groupGoalRuns", () => {
   it("wraps create_goal through update_goal with intervening process parts", () => {
-    const grouped = groupConsecutiveToolCalls([
+    const out = groupGoalRuns([
       poll("create_goal"),
       text,
       poll("exec_command"),
@@ -479,13 +527,11 @@ describe("groupGoalRuns", () => {
       { type: "text", text: "final answer" },
     ])
 
-    const out = groupGoalRuns(grouped)
-
     expect(out.map((p) => p.type)).toEqual(["goal-run", "text"])
     const goalRun = goalRunOf(out[0])
     expect(goalRun.start.toolName).toBe("create_goal")
     expect(goalRun.end?.toolName).toBe("update_goal")
-    expect(goalRun.items.map((p) => p.type)).toEqual(["text", "tool-group"])
+    expect(goalRun.items.map((p) => p.type)).toEqual(["text", "tool-call"])
     expect(goalRun.isRunning).toBe(false)
   })
 
@@ -661,11 +707,7 @@ describe("groupGoalRuns", () => {
       type: "text",
       text: "started goal",
     }
-    const toolGroup: AdaptedContentPart = {
-      type: "tool-group",
-      items: [poll("exec_command")],
-      isStreaming: false,
-    }
+    const command: AdaptedContentPart = poll("exec_command")
     const finalText: AdaptedContentPart = {
       type: "text",
       text: "final answer",
@@ -681,14 +723,14 @@ describe("groupGoalRuns", () => {
       type: "goal-run",
       start: poll("create_goal"),
       end: poll("update_goal"),
-      items: [toolGroup],
+      items: [command],
       isRunning: false,
     }
 
     const out = groupGoalRuns([unfinished, completed, finalText])
 
     expect(out.map((p) => p.type)).toEqual(["goal-run", "text"])
-    expect(goalRunOf(out[0]).items).toEqual([firstText, toolGroup])
+    expect(goalRunOf(out[0]).items).toEqual([firstText, command])
     expect(out[1]).toEqual(finalText)
   })
 })
@@ -910,7 +952,7 @@ describe("adaptMessageTurn goal update text", () => {
     expect(goalRun.start.toolName).toBe("create_goal")
     expect(goalRun.end).toBeNull()
     expect(goalRun.isRunning).toBe(true)
-    expect(goalRun.items.map((p) => p.type)).toEqual(["tool-group"])
+    expect(goalRun.items.map((p) => p.type)).toEqual(["tool-call"])
     expect(JSON.parse(goalRun.start.input ?? "{}")).toEqual({
       objective: "分析 README 文件",
     })
@@ -1182,8 +1224,7 @@ describe("adaptMessageTurn plan handling", () => {
       false
     )
 
-    // Empty thinking is dropped; EnterPlanMode is a standalone tool-call (not a
-    // "思考 N 次" tool-group).
+    // Empty thinking is dropped; EnterPlanMode is a tool-call of its own.
     expect(adapted.content.map((p) => p.type)).toEqual(["text", "tool-call"])
     const tc = adapted.content[1]
     if (tc.type !== "tool-call") throw new Error("expected a tool-call")
@@ -1498,9 +1539,8 @@ describe("adaptMessageTurn plan handling", () => {
       )
 
       expect(adapted.content.every((p) => p.type !== "plan")).toBe(true)
-      // The non-write TodoList renders through the normal tool-card path
-      // (wrapped in a tool-group by groupConsecutiveToolCalls).
-      expect(adapted.content.some((p) => p.type === "tool-group")).toBe(true)
+      // The non-write TodoList stays a plain tool call.
+      expect(adapted.content.some((p) => p.type === "tool-call")).toBe(true)
     }
   )
 })
@@ -1556,11 +1596,9 @@ describe("adaptMessageTurn — Codex grep no-match results", () => {
       msgText,
       isStreaming
     )
-    const group = adapted.content[0]
-    if (group?.type !== "tool-group" || !group.items[0]) {
-      throw new Error("expected a grouped tool call")
-    }
-    return group.items[0]
+    const call = adapted.content[0]
+    if (call?.type !== "tool-call") throw new Error("expected a tool call")
+    return call
   }
 
   it.each([
@@ -1679,6 +1717,187 @@ describe("adaptMessageTurn — Codex grep no-match results", () => {
   )
 })
 
+// codex makes a grep card only of a command it reduces to ONE search action.
+// `rg --files … | rg …` is a list-files action plus a search action, so it
+// arrives as an ordinary shell call (#877): `bash`, `rawInput.command` wrapped
+// in the login shell, `failed` for rg's exit 1, and — having printed nothing —
+// no output but the exit line the backend appends. These are the records the
+// live store builds from what codex-acp 2.0.1 and 2.1.1 send.
+describe("adaptMessageTurn — a search pipeline on a shell card", () => {
+  const msgText = {
+    attachedResources: "Attached resources",
+    toolCallFailed: "Tool failed",
+    pageHandoffName,
+  }
+  const pipeline =
+    "rg --files scripts src/grapal/phonics tests | rg 'sequence_(nested|rerank_candidate)'"
+  const exitOne = "[terminal exited: exit code: 1]"
+  const shellInput = (script: string) =>
+    JSON.stringify({ command: `/bin/zsh -lc "${script}"`, cwd: "/repo" })
+
+  function onlyToolCall(content: AdaptedContentPart[]): AdaptedToolCallPart {
+    const calls = content.flatMap((part) =>
+      part.type === "tool-call" ? [part] : []
+    )
+    if (calls.length !== 1) throw new Error("expected one tool call")
+    return calls[0]
+  }
+
+  function adaptShellResult({
+    script = pipeline,
+    output = exitOne,
+    pairing = "id",
+  }: {
+    script?: string
+    output?: string
+    pairing?: "id" | "position"
+  } = {}): AdaptedToolCallPart {
+    const toolUseId = pairing === "id" ? "exec-1" : null
+    return onlyToolCall(
+      adaptMessageTurn(
+        {
+          id: `codex-shell-${pairing}`,
+          role: "assistant",
+          timestamp: "2026-10-02T00:00:00.000Z",
+          blocks: [
+            {
+              type: "tool_use",
+              tool_use_id: toolUseId,
+              tool_name: "bash",
+              input_preview: shellInput(script),
+              status: "failed",
+            },
+            {
+              type: "tool_result",
+              tool_use_id: toolUseId,
+              output_preview: output,
+              is_error: true,
+            },
+          ],
+        },
+        msgText
+      ).content
+    )
+  }
+
+  it.each([["id"], ["position"]] as const)(
+    "shows a search pipeline that matched nothing as completed (%s pairing)",
+    (pairing) => {
+      const part = adaptShellResult({ pairing })
+
+      expect(part.state).toBe("output-available")
+      expect(part.errorText).toBeUndefined()
+      // The raw exit code stays on the card.
+      expect(part.output).toBe(exitOne)
+    }
+  )
+
+  it("covers a read piped into grep", () => {
+    const part = adaptShellResult({
+      script: "cat README.md | grep -n '__definitely_absent_token__'",
+    })
+
+    expect(part.state).toBe("output-available")
+  })
+
+  it.each([
+    [
+      "a diagnostic from an earlier stage",
+      "rg --files no_such_dir | rg 'sequence_'",
+      `rg: no_such_dir: IO error for operation on no_such_dir: No such file or directory (os error 2)\n${exitOne}`,
+    ],
+    [
+      "a real rg error",
+      "rg 'unclosed(' README.md",
+      "rg: regex parse error:\n    (?:unclosed()\n    ^\nerror: unclosed group\n[terminal exited: exit code: 2]",
+    ],
+    ["a command that is not a search", "make test", exitOne],
+    [
+      "a status that may not be the search's",
+      "grep -q needle f && test -d out",
+      exitOne,
+    ],
+    // Each of these exits 1 printing nothing, and no search came up empty.
+    [
+      "a redirection the shell failed to open",
+      "cat /dev/null | grep needle 2>/dev/null </dev/null/codeg-877",
+      exitOne,
+    ],
+    [
+      "a command word that expands into another program",
+      "${IFS:+false$IFS}/grep needle",
+      exitOne,
+    ],
+    [
+      "git grep, whose status can be its pager's",
+      "git grep --no-index --open-files-in-pager=false x -- f",
+      exitOne,
+    ],
+  ])("keeps %s on the error path", (_label, script, output) => {
+    const part = adaptShellResult({ script, output })
+
+    expect(part.state).toBe("output-error")
+    expect(part.errorText).toBe(output)
+  })
+
+  it.each([
+    ["matched nothing", exitOne, "output-available"],
+    [
+      "failed on a missing path",
+      `rg: no_such_dir: IO error for operation on no_such_dir: No such file or directory (os error 2)\n${exitOne}`,
+      "output-error",
+    ],
+  ] as const)(
+    "reads the live tool call the store holds: a pipeline that %s",
+    (_label, output, state) => {
+      const built = buildStreamingTurnsFromLiveMessage(1, {
+        id: "lm-877",
+        role: "assistant",
+        startedAt: 0,
+        content: [
+          {
+            type: "tool_call",
+            info: {
+              tool_call_id: "call_c7147e5130a5",
+              title: `"${pipeline}"`,
+              kind: "execute",
+              status: "failed",
+              content: null,
+              raw_input: shellInput(pipeline),
+              raw_output_chunks: [output],
+              raw_output_total_bytes: output.length,
+              locations: null,
+              meta: {
+                terminal_info: {
+                  cwd: "/repo",
+                  terminal_id: "call_c7147e5130a5",
+                },
+                terminal_exit: {
+                  exit_code: 1,
+                  signal: null,
+                  terminal_id: "call_c7147e5130a5",
+                },
+              },
+              images: [],
+            },
+          },
+        ],
+      })
+      const part = onlyToolCall(
+        adaptMessageTurn(
+          built.turns[0],
+          msgText,
+          true,
+          built.inProgressToolCallIds
+        ).content
+      )
+
+      expect(part.toolName).toBe("bash")
+      expect(part.state).toBe(state)
+    }
+  )
+})
+
 describe("adaptMessageTurn — image tool results", () => {
   const msgText = {
     attachedResources: "Attached resources",
@@ -1714,7 +1933,7 @@ describe("adaptMessageTurn — image tool results", () => {
 
     expect(adapted.content.map((p) => p.type)).toEqual(["generated-image"])
     expect(adapted.content.some((p) => p.type === "tool-result")).toBe(false)
-    expect(adapted.content.some((p) => p.type === "tool-group")).toBe(false)
+    expect(adapted.content.some((p) => p.type === "tool-call")).toBe(false)
     const part = adapted.content[0]
     if (part.type !== "generated-image") {
       throw new Error("expected a generated-image part")
@@ -1828,11 +2047,9 @@ describe("adaptMessageTurn — image tool results", () => {
     expect(adapted.content.some((p) => p.type === "generated-image")).toBe(
       false
     )
-    // A lone tool call folds into a tool-group.
-    const group = adapted.content.find((p) => p.type === "tool-group")
-    expect(group).toBeDefined()
-    if (group?.type !== "tool-group") throw new Error("expected tool-group")
-    expect(group.items[0]?.toolName).toBe("Read")
+    const call = adapted.content.find((p) => p.type === "tool-call")
+    if (call?.type !== "tool-call") throw new Error("expected a tool call")
+    expect(call.toolName).toBe("Read")
   })
 
   it("keeps the running tool card (spinner) when the image result's tool is still in-flight", () => {
@@ -1865,9 +2082,9 @@ describe("adaptMessageTurn — image tool results", () => {
     expect(adapted.content.some((p) => p.type === "generated-image")).toBe(
       false
     )
-    const group = adapted.content.find((p) => p.type === "tool-group")
-    if (group?.type !== "tool-group") throw new Error("expected tool-group")
-    expect(group.items[0]?.state).toBe("input-available")
+    const call = adapted.content.find((p) => p.type === "tool-call")
+    if (call?.type !== "tool-call") throw new Error("expected a tool call")
+    expect(call.state).toBe("input-available")
   })
 })
 

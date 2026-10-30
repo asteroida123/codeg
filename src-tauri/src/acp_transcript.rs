@@ -52,9 +52,10 @@
 //! argues why the reader cannot tell the difference).
 //!
 //! Everything else is written the moment it arrives: prompts, turn ends and
-//! headers never wait, and neither does anything recorded outside a live turn
-//! (a `session/load` replay is stored verbatim — it is already merged, and
-//! merging it would need turn boundaries it does not have).
+//! headers never wait, and neither does anything recorded outside a live turn.
+//! A `session/load` replay is stored verbatim — it is already merged, and
+//! merging it would need turn boundaries it does not have — and so is a turn
+//! the agent runs on its own between prompts, which starts at its first chunk.
 //!
 //! Writes are pure appends: no record is ever rewritten or truncated once it
 //! has landed. A crash therefore costs at most the last unflushed window of an
@@ -153,6 +154,14 @@ pub struct TranscriptEntry {
     pub t: u64,
     pub k: EntryKind,
     pub p: serde_json::Value,
+    /// On a [`EntryKind::Prompt`]: codeg delivered it INTO the running turn
+    /// (a native steer) instead of starting a turn with it. The reader still
+    /// splits the turn there — the steer is a user message of its own — but
+    /// the turn did not start at it, so the turn end's whole-turn duration does
+    /// not belong to the part that follows. Absent (false) everywhere else; a
+    /// reader that predates it sees an ordinary prompt.
+    #[serde(rename = "s", default, skip_serializing_if = "std::ops::Not::not")]
+    pub steer: bool,
 }
 
 /// A parsed transcript: its header (when present and readable) plus every
@@ -196,7 +205,17 @@ pub fn transcript_path_in(root: &Path, agent_dir: &str, session_id: &str) -> Opt
     if !safe_component(agent_dir) || !safe_component(session_id) {
         return None;
     }
-    Some(root.join(agent_dir).join(format!("{session_id}.jsonl")))
+    let path = root.join(agent_dir).join(format!("{session_id}.jsonl"));
+    // The selfhost built-in used this directory before upstream reserved its
+    // own registry id. Continue only transcripts explicitly owned by ZCode;
+    // a custom adapter with the same old directory must stay separate.
+    if agent_dir == "codeg-zcode-acp"
+        && !path.exists()
+        && read_header_in(root, "zcode-acp", session_id).is_some_and(|h| h.agent == "zcode")
+    {
+        return Some(root.join("zcode-acp").join(format!("{session_id}.jsonl")));
+    }
+    Some(path)
 }
 
 /// Fires once a queued record is on disk, so the connection layer can
@@ -362,7 +381,8 @@ struct SessionWriter {
     /// Whether records arriving now belong to a live prompt turn — the only
     /// place merging streamed chunks is sound. Set by a written `Prompt`,
     /// cleared by a written `TurnEnd`, so a `session/load` replay (which has
-    /// neither) is always written verbatim.
+    /// neither) is always written verbatim, and so is whatever the agent does
+    /// between a turn end and the next prompt.
     compactable: bool,
     header_written: bool,
     /// The file can no longer be safely appended to: a partial write that could
@@ -645,9 +665,9 @@ fn mergeable_chunk_kind(payload: &serde_json::Value) -> Option<&'static str> {
 ///   a `TurnEnd` to overwrite it, which a turn flushed early by a mid-turn user
 ///   chunk never gets.
 /// * **Start of the turn.** That comes from the prompt's timestamp, and prompts
-///   are never merged. The one case where a turn starts from a chunk instead is
-///   a transcript with no prompts at all — a replay — which `compactable`
-///   excludes.
+///   are never merged. A turn starts from a chunk instead in a transcript with
+///   no prompts at all — a replay — and in a turn the agent runs on its own
+///   after a turn end; `compactable` excludes both.
 /// * **Everything else** (tool calls, plans, user chunks, images, resource
 ///   links) is written through unchanged.
 fn compact_batch(pending: &[Queued], compactable: bool) -> (String, bool) {
@@ -684,7 +704,9 @@ fn compact_batch(pending: &[Queued], compactable: bool) -> (String, bool) {
             // absent on both) is the only case where merging loses nothing.
             Some(kind)
                 if open.as_ref().is_some_and(|(open_kind, open_entry)| {
-                    *open_kind == kind && open_entry.p.get("_meta") == entry.p.get("_meta")
+                    *open_kind == kind
+                        && open_entry.p.get("_meta") == entry.p.get("_meta")
+                        && open_entry.p.get("messageId") == entry.p.get("messageId")
                 }) =>
             {
                 let (_, open_entry) = open.as_mut().expect("guard matched Some");
@@ -877,6 +899,39 @@ pub fn record_entry_in(
         t: now_epoch_ms(),
         k: kind,
         p: payload,
+        steer: false,
+    };
+    queue_for(root, agent_dir, session_id, PendingRecord::Entry(entry))
+}
+
+/// Record a message delivered into the running turn (a native steer): a
+/// [`EntryKind::Prompt`] carrying the ACP content blocks that were sent,
+/// marked [`TranscriptEntry::steer`].
+pub fn record_steer(
+    agent_dir: &str,
+    session_id: &str,
+    payload: serde_json::Value,
+) -> tokio::sync::oneshot::Receiver<()> {
+    record_steer_in(
+        &crate::paths::codeg_acp_transcripts_root(),
+        agent_dir,
+        session_id,
+        payload,
+    )
+}
+
+/// Root-injectable core of [`record_steer`].
+pub fn record_steer_in(
+    root: &Path,
+    agent_dir: &str,
+    session_id: &str,
+    payload: serde_json::Value,
+) -> tokio::sync::oneshot::Receiver<()> {
+    let entry = TranscriptEntry {
+        t: now_epoch_ms(),
+        k: EntryKind::Prompt,
+        p: payload,
+        steer: true,
     };
     queue_for(root, agent_dir, session_id, PendingRecord::Entry(entry))
 }
@@ -1221,17 +1276,26 @@ pub fn list_session_ids_in(root: &Path, agent_dir: &str) -> Vec<String> {
     if !safe_component(agent_dir) {
         return Vec::new();
     }
-    let Ok(entries) = std::fs::read_dir(root.join(agent_dir)) else {
-        return Vec::new();
-    };
-    let mut ids: Vec<String> = entries
+    let mut ids: Vec<String> = std::fs::read_dir(root.join(agent_dir))
+        .into_iter()
+        .flatten()
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
             name.strip_suffix(".jsonl").map(str::to_string)
         })
         .collect();
+    if agent_dir == "codeg-zcode-acp" {
+        ids.extend(
+            list_session_ids_in(root, "zcode-acp")
+                .into_iter()
+                .filter(|id| {
+                    read_header_in(root, "zcode-acp", id).is_some_and(|h| h.agent == "zcode")
+                }),
+        );
+    }
     ids.sort();
+    ids.dedup();
     ids
 }
 
@@ -1242,6 +1306,25 @@ pub fn remove_agent_transcripts_in(root: &Path, agent_dir: &str) -> std::io::Res
         return Ok(());
     }
     let dir = root.join(agent_dir);
+    if agent_dir == "zcode-acp"
+        && list_session_ids_in(root, agent_dir)
+            .iter()
+            .any(|id| read_header_in(root, agent_dir, id).is_some_and(|h| h.agent == "zcode"))
+    {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let keep = name
+                .to_str()
+                .and_then(|s| s.strip_suffix(".jsonl"))
+                .and_then(|id| read_header_in(root, agent_dir, id))
+                .is_some_and(|h| h.agent == "zcode");
+            if !keep && entry.file_type()?.is_file() {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+        return Ok(());
+    }
     match std::fs::remove_dir_all(&dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1256,6 +1339,42 @@ mod tests {
     // change what the user sees" is the only question that matters about it.
     use crate::models::message::{MessageTurn, TurnRole};
     use crate::parsers::acp_native::project_turns;
+
+    #[test]
+    fn builtin_zcode_retains_legacy_history_without_adopting_custom_history() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("zcode-acp");
+        std::fs::create_dir_all(&legacy).unwrap();
+        for (id, agent) in [("builtin", "zcode"), ("custom", "custom:zcode-acp")] {
+            let header = TranscriptHeader::new(agent, id, "/repo", 1);
+            std::fs::write(
+                legacy.join(format!("{id}.jsonl")),
+                format!("{}\n", serde_json::to_string(&header).unwrap()),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            list_session_ids_in(root.path(), "codeg-zcode-acp"),
+            vec!["builtin"]
+        );
+        assert_eq!(
+            read_header_in(root.path(), "codeg-zcode-acp", "builtin")
+                .unwrap()
+                .agent,
+            "zcode"
+        );
+        assert!(read_header_in(root.path(), "codeg-zcode-acp", "custom").is_none());
+        remove_agent_transcripts_in(root.path(), "zcode-acp").unwrap();
+        assert!(legacy.join("builtin.jsonl").exists());
+        assert!(!legacy.join("custom.jsonl").exists());
+        let current = root.path().join("codeg-zcode-acp");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::write(current.join("builtin.jsonl"), "").unwrap();
+        assert_eq!(
+            transcript_path_in(root.path(), "codeg-zcode-acp", "builtin"),
+            Some(current.join("builtin.jsonl"))
+        );
+    }
 
     fn temp_root() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1282,6 +1401,7 @@ mod tests {
         serde_json::to_string(&TranscriptEntry {
             t: 1_750_000_000_001,
             k: kind,
+            steer: false,
             p: payload,
         })
         .unwrap()
@@ -1760,6 +1880,7 @@ mod tests {
         PendingRecord::Entry(TranscriptEntry {
             t,
             k: EntryKind::Update,
+            steer: false,
             p: serde_json::json!({
                 "sessionUpdate": kind,
                 "content": { "type": "text", "text": text }
@@ -1771,6 +1892,7 @@ mod tests {
         PendingRecord::Entry(TranscriptEntry {
             t,
             k: EntryKind::Prompt,
+            steer: false,
             p: serde_json::json!([{ "type": "text", "text": text }]),
         })
     }
@@ -1779,6 +1901,7 @@ mod tests {
         PendingRecord::Entry(TranscriptEntry {
             t,
             k: EntryKind::TurnEnd,
+            steer: false,
             p: serde_json::json!({ "stopReason": "end_turn" }),
         })
     }
@@ -1801,6 +1924,7 @@ mod tests {
             PendingRecord::Entry(TranscriptEntry {
                 t,
                 k: EntryKind::Update,
+                steer: false,
                 p: serde_json::json!({
                     "sessionUpdate": "tool_call", "toolCallId": id,
                     "title": "Bash", "kind": "execute", "status": status
@@ -1811,6 +1935,7 @@ mod tests {
             PendingRecord::Entry(TranscriptEntry {
                 t,
                 k: EntryKind::Update,
+                steer: false,
                 p: serde_json::json!({
                     "sessionUpdate": "agent_message_chunk",
                     "content": {"type": "image", "data": "AAA", "mimeType": "image/png"}
@@ -1821,6 +1946,7 @@ mod tests {
             PendingRecord::Entry(TranscriptEntry {
                 t,
                 k: EntryKind::Update,
+                steer: false,
                 p: serde_json::json!({
                     "sessionUpdate": "agent_message_chunk",
                     "content": {"type": "resource_link", "uri": "file:///a", "name": "a"}
@@ -1978,6 +2104,34 @@ mod tests {
         assert_same_projection(records, &[], "replay");
     }
 
+    /// A turn the agent runs on its own between prompts (issue #903) has no
+    /// prompt to fix its start, so it starts at its FIRST chunk — and must land
+    /// unmerged like a replay: a merged record carries the run's last
+    /// timestamp, which would start the turn where it ended.
+    #[test]
+    fn a_turn_the_agent_runs_between_prompts_keeps_its_start_time() {
+        let records = || {
+            vec![
+                prompt_record(1_000, "start the job"),
+                chunk(1_100, "agent_message_chunk", "Started."),
+                turn_end(1_200),
+                chunk(5_000, "agent_message_chunk", "The job "),
+                chunk(5_400, "agent_message_chunk", "finished."),
+                prompt_record(9_000, "thanks"),
+                chunk(9_100, "agent_message_chunk", "Welcome."),
+                turn_end(9_200),
+            ]
+        };
+        // All in one flush window: the batch a merge could reach.
+        assert_same_projection(records(), &[], "a turn of the agent's own");
+
+        let (verbatim, _) = projected_both_ways(records(), &[]);
+        let own = &verbatim[2];
+        assert!(matches!(own.role, TurnRole::Assistant));
+        assert_eq!(own.timestamp.timestamp_millis(), 5_000);
+        assert_eq!(own.duration_ms, Some(400));
+    }
+
     /// Chunks carrying different `_meta` are opaque extension data; merging
     /// them would silently keep one and discard the rest.
     #[test]
@@ -1986,6 +2140,7 @@ mod tests {
             PendingRecord::Entry(TranscriptEntry {
                 t,
                 k: EntryKind::Update,
+                steer: false,
                 p: serde_json::json!({
                     "sessionUpdate": "agent_message_chunk",
                     "content": {"type": "text", "text": "x"},
@@ -2011,6 +2166,36 @@ mod tests {
         );
         assert_eq!(entries[1].p["_meta"], serde_json::json!({"a": 1}));
         assert_eq!(entries[2].p["_meta"], serde_json::json!({"a": 2}));
+    }
+
+    #[test]
+    fn typed_message_ids_survive_recording_and_separate_compacted_messages() {
+        use agent_client_protocol::schema::v1::SessionUpdate;
+        let message = |t, id| {
+            // Exercise the same typed decode/encode boundary as the live
+            // notification handler, not only hand-built transcript JSON.
+            let update: SessionUpdate = serde_json::from_value(serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "x"},
+                "messageId": id,
+            })).unwrap();
+            PendingRecord::Entry(TranscriptEntry {
+                t, k: EntryKind::Update, steer: false,
+                p: serde_json::to_value(update).unwrap(),
+            })
+        };
+        let pending: Vec<_> = vec![
+            prompt_record(1, "hi"),
+            message(2, "msg-first"), message(3, "msg-first"),
+            message(4, "msg-second"), message(5, "msg-second"),
+        ].into_iter().map(queued).collect();
+        let (lines, _) = compact_batch(&pending, false);
+        let entries = parse_transcript(&lines).entries;
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[1].p["messageId"], "msg-first");
+        assert_eq!(entries[2].p["messageId"], "msg-second");
+        assert_eq!(entries[1].p["content"]["text"], "xx");
+        assert_eq!(entries[2].p["content"]["text"], "xx");
     }
 
     /// The frontend refetches conversation detail the moment a turn completes,

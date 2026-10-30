@@ -460,7 +460,13 @@ fn project_child_sessions(
         let Some(child) = children
             .iter()
             .find(|child| child.id == child_id)
-            .map(|child| (child.title.clone(), child.git_branch.clone(), child.updated_at))
+            .map(|child| {
+                (
+                    child.title.clone(),
+                    child.git_branch.clone(),
+                    child.updated_at,
+                )
+            })
         else {
             // `list_for_parent` already filtered these out; skip defensively
             // rather than emit a row that cannot be opened.
@@ -509,10 +515,7 @@ fn project_child_status(status: TaskStatus) -> &'static str {
 fn continuation_eligible(entry: &TaskLedgerEntry) -> bool {
     matches!(
         entry.status,
-        TaskStatus::Completed
-            | TaskStatus::Failed
-            | TaskStatus::Canceled
-            | TaskStatus::Unknown
+        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Canceled | TaskStatus::Unknown
     ) && entry.released
 }
 
@@ -717,6 +720,9 @@ pub async fn boot_reconcile_interrupted(conn: &DatabaseConnection) -> Result<u64
                 token_usage: None,
                 blocked_on: None,
                 selectors: None,
+                assistant_id: None,
+                assistant_name: None,
+                progress: None,
             };
             active.status = Set(status_string(TaskStatus::Unknown));
             active.terminal_report = Set(Some(serde_json::to_string(&report).map_err(|e| {
@@ -1143,6 +1149,9 @@ fn running_report(
         token_usage: None,
         blocked_on: None,
         selectors: None,
+        assistant_id: None,
+        assistant_name: None,
+        progress: None,
     }
 }
 
@@ -1299,6 +1308,9 @@ mod tests {
             token_usage: None,
             blocked_on: None,
             selectors: None,
+            assistant_id: None,
+            assistant_name: None,
+            progress: None,
         }
     }
 
@@ -1807,11 +1819,7 @@ mod tests {
     /// A delegation child row linked to its parent the way the spawner does
     /// (`parent_id` set, `kind == delegate`), so the projection's
     /// conversation-side join matches production shape.
-    async fn linked_child(
-        db: &crate::db::AppDatabase,
-        parent: i32,
-        title: Option<&str>,
-    ) -> i32 {
+    async fn linked_child(db: &crate::db::AppDatabase, parent: i32, title: Option<&str>) -> i32 {
         let folder = conversation::Entity::find_by_id(parent)
             .one(&db.conn)
             .await
@@ -1825,6 +1833,7 @@ mod tests {
             title.map(str::to_owned),
             Some("feature/child".to_owned()),
             Some(DelegationLink {
+                assistant: None,
                 parent_conversation_id: parent,
                 parent_tool_use_id: format!("toolu_{parent}"),
                 delegation_call_id: format!("call_{parent}"),
@@ -1871,23 +1880,27 @@ mod tests {
         let linked = linked_child(&db, parent, Some("never ran")).await;
         assert_ne!(linked, _plain_child);
 
-        assert!(
-            list_child_sessions(&db.conn, parent)
-                .await
-                .expect("no ledger rows")
-                .is_empty()
-        );
+        assert!(list_child_sessions(&db.conn, parent)
+            .await
+            .expect("no ledger rows")
+            .is_empty());
 
         // A ledger row alone (child row not linked to this parent) is equally
         // invisible: the conversation-side join drops it.
-        settle(&db, parent, _plain_child, "t0", None, "task", TaskStatus::Completed)
-            .await;
-        assert!(
-            list_child_sessions(&db.conn, parent)
-                .await
-                .expect("unlinked child")
-                .is_empty()
-        );
+        settle(
+            &db,
+            parent,
+            _plain_child,
+            "t0",
+            None,
+            "task",
+            TaskStatus::Completed,
+        )
+        .await;
+        assert!(list_child_sessions(&db.conn, parent)
+            .await
+            .expect("unlinked child")
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1899,25 +1912,52 @@ mod tests {
         // chain derives round 3 from the row count, and the projection must
         // follow the LATEST round (running), not the settled ones.
         let chained = linked_child(&db, parent, Some("Chained child")).await;
-        settle(&db, parent, chained, "c0", None, "first", TaskStatus::Completed).await;
-        settle(&db, parent, chained, "c1", Some("c0"), "second", TaskStatus::Failed).await;
-        admit(
-            &db.conn,
-            input("c2", parent, chained, Some("c1"), "third"),
+        settle(
+            &db,
+            parent,
+            chained,
+            "c0",
+            None,
+            "first",
+            TaskStatus::Completed,
         )
-        .await
-        .expect("admit running round");
+        .await;
+        settle(
+            &db,
+            parent,
+            chained,
+            "c1",
+            Some("c0"),
+            "second",
+            TaskStatus::Failed,
+        )
+        .await;
+        admit(&db.conn, input("c2", parent, chained, Some("c1"), "third"))
+            .await
+            .expect("admit running round");
 
         // Single settled round: completed + released → continuable.
         let done = linked_child(&db, parent, Some("Done child")).await;
-        settle(&db, parent, done, "d0", None, "one shot", TaskStatus::Completed).await;
+        settle(
+            &db,
+            parent,
+            done,
+            "d0",
+            None,
+            "one shot",
+            TaskStatus::Completed,
+        )
+        .await;
 
         // Finished but NOT released: terminal, yet not continuable (the
         // continuation admission precondition fails on `released`).
         let unreleased = linked_child(&db, parent, None).await;
-        admit(&db.conn, input("u0", parent, unreleased, None, "pending release"))
-            .await
-            .expect("admit");
+        admit(
+            &db.conn,
+            input("u0", parent, unreleased, None, "pending release"),
+        )
+        .await
+        .expect("admit");
         finish(
             &db.conn,
             parent,
@@ -1974,7 +2014,9 @@ mod tests {
         // Simulate the process dying mid-run: boot reconcile freezes the
         // unreleased running row as `unknown` + released.
         assert_eq!(
-            boot_reconcile_interrupted(&db.conn).await.expect("reconcile"),
+            boot_reconcile_interrupted(&db.conn)
+                .await
+                .expect("reconcile"),
             1
         );
 
@@ -2009,9 +2051,21 @@ mod tests {
         let db = fresh_in_memory_db().await;
         let (parent, _unused) = conversations(&db).await;
         let child = linked_child(&db, parent, None).await;
-        settle(&db, parent, child, "v0", None, "task", TaskStatus::Completed).await;
+        settle(
+            &db,
+            parent,
+            child,
+            "v0",
+            None,
+            "task",
+            TaskStatus::Completed,
+        )
+        .await;
         assert_eq!(
-            list_child_sessions(&db.conn, parent).await.expect("visible").len(),
+            list_child_sessions(&db.conn, parent)
+                .await
+                .expect("visible")
+                .len(),
             1
         );
 
@@ -2019,17 +2073,24 @@ mod tests {
         conversation_service::soft_delete(&db.conn, child)
             .await
             .expect("delete child");
-        assert!(
-            list_child_sessions(&db.conn, parent)
-                .await
-                .expect("child deleted")
-                .is_empty()
-        );
+        assert!(list_child_sessions(&db.conn, parent)
+            .await
+            .expect("child deleted")
+            .is_empty());
 
         // Soft-deleted folder hides every row under it (parent included).
         let (parent2, _unused2) = conversations(&db).await;
         let child2 = linked_child(&db, parent2, None).await;
-        settle(&db, parent2, child2, "w0", None, "task", TaskStatus::Completed).await;
+        settle(
+            &db,
+            parent2,
+            child2,
+            "w0",
+            None,
+            "task",
+            TaskStatus::Completed,
+        )
+        .await;
         let folder_id = conversation::Entity::find_by_id(parent2)
             .one(&db.conn)
             .await
@@ -2039,12 +2100,10 @@ mod tests {
         folder_service::soft_delete_folder(&db.conn, folder_id)
             .await
             .expect("delete folder");
-        assert!(
-            list_child_sessions(&db.conn, parent2)
-                .await
-                .expect("folder deleted")
-                .is_empty()
-        );
+        assert!(list_child_sessions(&db.conn, parent2)
+            .await
+            .expect("folder deleted")
+            .is_empty());
     }
 
     #[tokio::test]
@@ -2063,8 +2122,26 @@ mod tests {
 
         let child_a = linked_child(&db, parent_a, None).await;
         let child_b = linked_child(&db, parent_b, None).await;
-        settle(&db, parent_a, child_a, "a0", None, "a task", TaskStatus::Completed).await;
-        settle(&db, parent_b, child_b, "b0", None, "b task", TaskStatus::Completed).await;
+        settle(
+            &db,
+            parent_a,
+            child_a,
+            "a0",
+            None,
+            "a task",
+            TaskStatus::Completed,
+        )
+        .await;
+        settle(
+            &db,
+            parent_b,
+            child_b,
+            "b0",
+            None,
+            "b task",
+            TaskStatus::Completed,
+        )
+        .await;
 
         let rows_a = list_child_sessions(&db.conn, parent_a)
             .await
@@ -2390,12 +2467,9 @@ mod tests {
 
         // A plain chat delegation stays unattributed.
         assert!(matches!(
-            admit(
-                &db.conn,
-                input("unattributed", parent, child, None, "chat")
-            )
-            .await
-            .expect("admit 3"),
+            admit(&db.conn, input("unattributed", parent, child, None, "chat"))
+                .await
+                .expect("admit 3"),
             AdmissionResult::New { .. }
         ));
 
@@ -2450,6 +2524,8 @@ mod tests {
         let now = chrono::Utc::now();
         let insert = |title: &str, conversation_id: Option<i32>, deleted: bool| {
             crate::db::entities::work_task::ActiveModel {
+                deferred_at: Set(None),
+                delivery: Set(None),
                 id: NotSet,
                 folder_id: Set(1),
                 title: Set(title.to_string()),

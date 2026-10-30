@@ -7,6 +7,7 @@ import {
   useWorkspaceFileTabs,
 } from "@/contexts/workspace-context"
 import { browserCapabilities } from "@/lib/browser/browser-api"
+import { browserDeviceKey } from "@/lib/browser/browser-device"
 import {
   DEFAULT_BROWSER_PROFILE_ID,
   browserProfileExists,
@@ -52,7 +53,8 @@ export function resetBrowserTabsPersistenceForTests(): void {
  */
 export function BrowserTabsPersistence() {
   const { restoreBrowserTabs } = useWorkspaceActions()
-  const { fileTabs } = useWorkspaceFileTabs()
+  const { fileTabs: visibleFileTabs, allFileTabs } = useWorkspaceFileTabs()
+  const fileTabs = allFileTabs ?? visibleFileTabs
   const [ready, setReady] = useState(false)
   // Latest-state mirror for the timers below (synced post-commit, like the
   // workspace provider does for its own action callbacks).
@@ -90,16 +92,16 @@ export function BrowserTabsPersistence() {
   }, [restoreBrowserTabs])
 
   // What the strip looks like as far as persistence is concerned: browser
-  // records, their order, and the three fields a record itself carries. File
-  // tab churn (keystrokes, reloads) does not change this string, so it does
-  // not schedule a write.
+  // records, their order, and the fields a record itself carries. File tab
+  // churn (keystrokes, reloads) does not change this string, so it does not
+  // schedule a write.
   const signature = useMemo(
     () =>
       fileTabs
         .filter((tab) => tab.kind === "browser")
         .map(
           (tab) =>
-            `${tab.id}\u0000${tab.browser.profile}\u0000${tab.browser.initialUrl}\u0000${tab.title}`
+            `${tab.id}\u0000${tab.browser.profile}\u0000${tab.browser.initialUrl}\u0000${tab.title}\u0000${browserDeviceKey(tab.browser.device)}`
         )
         .join("\u0001"),
     [fileTabs]

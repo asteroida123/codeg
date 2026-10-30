@@ -198,7 +198,7 @@ mod tests {
             .iter()
             .position(|migration| migration.name() == "m20260926_000001_delegation_metrics")
             .expect("metrics migration is registered");
-        Migrator::up(&conn, Some(metrics_idx as u32))
+        crate::db::migration::UpstreamSchemaFixture::<1>::up(&conn, None)
             .await
             .expect("apply pre-metrics schema");
 

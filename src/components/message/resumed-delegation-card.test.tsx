@@ -25,6 +25,7 @@ vi.mock("@/contexts/acp-connections-context", async () => {
       subscribeKey: () => () => {},
       getConnection: () => undefined,
       getConnectPending: () => undefined,
+      getConnectError: () => undefined,
       getActiveKey: () => null,
       subscribeActiveKey: () => () => {},
     }),
@@ -112,6 +113,37 @@ describe("ResumedDelegationCard", () => {
     expect(screen.queryByText("Resumed")).not.toBeInTheDocument()
   })
 
+  it("moves the resumed mark to the other corner on an assistant, clear of its agent badge", () => {
+    const { unmount } = renderWithIntl(
+      <ResumedDelegationCard
+        toolCallId="tu-resume"
+        input={RESUME_INPUT}
+        output={PERSISTED_ACK}
+        state="output-available"
+      />
+    )
+    // An agent's card keeps the mark where it always was.
+    expect(screen.getByTitle("Resumed").parentElement).toHaveClass("-right-0.5")
+    unmount()
+
+    const assistantAck = JSON.stringify({
+      ...JSON.parse(PERSISTED_ACK),
+      assistant_id: 3,
+      assistant_name: "Reviewer",
+    })
+    renderWithIntl(
+      <ResumedDelegationCard
+        toolCallId="tu-resume"
+        input={RESUME_INPUT}
+        output={assistantAck}
+        state="output-available"
+      />
+    )
+    const card = screen.getByTestId("resumed-delegation-card")
+    expect(card).toHaveTextContent("Reviewer · Codex")
+    expect(screen.getByTitle("Resumed").parentElement).toHaveClass("-left-0.5")
+  })
+
   it("prefers the live binding, looked up by the task id in its arguments", () => {
     const binding: DelegationBinding = {
       parentConnectionId: "p1",
@@ -123,6 +155,8 @@ describe("ResumedDelegationCard", () => {
       status: "ok",
       task: "Build the /test4 sandbox page",
       taskId: TASK_ID,
+      assistantId: null,
+      assistantName: null,
     }
     mockedSubSession.mockReturnValue({
       binding,
@@ -202,8 +236,11 @@ describe("ResumedDelegationCard", () => {
     expect(
       screen.queryByText("the app was killed mid-run")
     ).not.toBeInTheDocument()
-    fireEvent.click(screen.getByRole("button", { name: "Resume details" }))
+    // The row's left part is the card's one expander, as on every delegation
+    // card — a resume with no task text known still opens it for the reason.
+    fireEvent.click(screen.getByRole("button", { expanded: false }))
     expect(screen.getByText("the app was killed mid-run")).toBeInTheDocument()
+    expect(screen.getByText("Resume reason")).toBeInTheDocument()
     // The report text is addressed to the LLM ("Call get_delegation_status with
     // this id …") and the persisted form is the bare report JSON — every fact
     // in it is already on the row, so it must not be dumped under the reason.
@@ -212,7 +249,7 @@ describe("ResumedDelegationCard", () => {
     expect(screen.queryByText(/"agent_type"/)).not.toBeInTheDocument()
   })
 
-  it("offers no expander when the resume carried no reason", () => {
+  it("offers no expander when the resume carried no reason and no task is known", () => {
     renderWithIntl(
       <ResumedDelegationCard
         toolCallId="tu-resume"
@@ -222,8 +259,54 @@ describe("ResumedDelegationCard", () => {
       />
     )
     expect(screen.getByTestId("resumed-delegation-card")).toBeInTheDocument()
+    expect(screen.getAllByRole("button")).toEqual([
+      screen.getByRole("button", { name: "Open conversation" }),
+    ])
+  })
+
+  it("expands the task and the reason together, from one toggle", () => {
+    const task = "Build the /test4 sandbox page\nwith a seeded fixture"
+    renderWithIntl(
+      <ResumedDelegationCard
+        toolCallId="tu-resume"
+        input={RESUME_INPUT}
+        output={PERSISTED_ACK}
+        state="output-available"
+        meta={{
+          "codeg.delegation": {
+            status: "running",
+            child_conversation_id: 9,
+            agent_type: "codex",
+            task_id: TASK_ID,
+            task_preview: task,
+          },
+        }}
+      />
+    )
+    // One expander only: the separate reason chevron is gone.
+    const toggles = screen
+      .getAllByRole("button")
+      .filter((b) => b.hasAttribute("aria-expanded"))
+    expect(toggles).toHaveLength(1)
+
+    fireEvent.click(toggles[0])
+    const panel = screen.getByTestId("delegation-card-panel")
+    // The task in full first, then the labelled reason under it.
+    expect(panel.children).toHaveLength(2)
+    expect(panel.children[0].textContent).toBe(task)
+    expect(panel.children[1]).toHaveTextContent(
+      "Resume reasonthe app was killed mid-run"
+    )
+    // Both texts keep their own direction (see the delegate card's test).
+    expect(panel.children[0]).toHaveAttribute("dir", "auto")
+    expect(screen.getByText("the app was killed mid-run")).toHaveAttribute(
+      "dir",
+      "auto"
+    )
+
+    fireEvent.click(toggles[0])
     expect(
-      screen.queryByRole("button", { name: "Resume details" })
+      screen.queryByTestId("delegation-card-panel")
     ).not.toBeInTheDocument()
   })
 
@@ -295,6 +378,8 @@ describe("ResumedDelegationCard", () => {
           status: "running",
           task: "Build the /test4 sandbox page",
           taskId: TASK_ID,
+          assistantId: null,
+          assistantName: null,
         },
         detail: null,
         loading: false,
@@ -327,6 +412,8 @@ describe("ResumedDelegationCard", () => {
           status: "ok",
           task: "Somebody else's task",
           taskId: TASK_ID,
+          assistantId: null,
+          assistantName: null,
         },
         detail: null,
         loading: false,
@@ -360,6 +447,8 @@ describe("ResumedDelegationCard", () => {
         status: "ok",
         task: "Somebody else's task",
         taskId: TASK_ID,
+        assistantId: null,
+        assistantName: null,
       },
       detail: null,
       loading: false,

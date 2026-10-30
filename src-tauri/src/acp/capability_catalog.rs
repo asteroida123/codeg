@@ -694,7 +694,10 @@ mod tests {
         // The advertised projection also names the WIRE IDS the selector
         // preferences must be forwarded under.
         assert_eq!(caps.model_option_id.as_deref(), Some("model"));
-        assert_eq!(caps.reasoning_option_id.as_deref(), Some("reasoning_effort"));
+        assert_eq!(
+            caps.reasoning_option_id.as_deref(),
+            Some("reasoning_effort")
+        );
         assert_eq!(caps.source, CapabilitySource::Advertised);
         // Every advertised field was filled, so no gap notes.
         assert!(caps.notes.is_empty(), "notes: {:?}", caps.notes);
