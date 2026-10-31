@@ -553,6 +553,42 @@ pub async fn list_sync_candidates(
     Ok(rows)
 }
 
+/// [`list_sync_candidates`] narrowed to specific conversations.
+///
+/// The delegation ledger uses this to re-sync exactly the child it is about to
+/// freeze, without walking every conversation the dashboard pass would need.
+/// Same projection and the same live-row filter, so the per-conversation
+/// decision ("did the parse lose a readable source?") sees the same stamp the
+/// full pass would.
+pub async fn list_sync_candidates_by_ids(
+    conn: &DatabaseConnection,
+    conversation_ids: &[i32],
+) -> Result<Vec<SyncCandidate>, DbError> {
+    if conversation_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = conversation::Entity::find()
+        .select_only()
+        .column(conversation::Column::Id)
+        .column(conversation::Column::Title)
+        .column(conversation::Column::UpdatedAt)
+        .column_as(
+            token_usage_sync::Column::SourceUpdatedAt,
+            "synced_source_updated_at",
+        )
+        .column_as(token_usage_sync::Column::TurnCount, "synced_turn_count")
+        .join_rev(
+            JoinType::LeftJoin,
+            token_usage_sync::Relation::Conversation.def(),
+        )
+        .filter(conversation::Column::DeletedAt.is_null())
+        .filter(conversation::Column::Id.is_in(conversation_ids.to_vec()))
+        .into_model::<SyncCandidate>()
+        .all(conn)
+        .await?;
+    Ok(rows)
+}
+
 /// Drop facts and stamps whose conversation row is gone for good (hard delete,
 /// or a restore that rolled the DB back past an import).
 ///

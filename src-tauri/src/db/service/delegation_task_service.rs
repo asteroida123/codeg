@@ -708,8 +708,22 @@ fn report_metrics(report: &DelegationTaskReport) -> ReportMetrics {
 ///   * a value the report DID carry wins — the report is the more direct
 ///     observation of the child run.
 ///
-/// This path only reads what the dashboard pipeline has already materialized;
-/// it never parses a transcript itself.
+/// When nothing is known at all, the child is synced **on demand** first (see
+/// [`crate::commands::token_usage::sync_conversations`]) and the facts re-read.
+/// The dashboard's materialization only runs when the user opens the Token
+/// Usage page, so without this a task that just finished almost always froze
+/// NULL even though its transcript held the numbers. The sync is skipped
+/// entirely when any token column already has a value, keeping the common
+/// terminal path free of parsing work.
+///
+/// Transaction boundary: `finish` itself opens no transaction (its ledger write
+/// is one conditional UPDATE), and the sync commits the child's fact rows in
+/// its own short transaction. Doing the sync inside a ledger transaction would
+/// hold a SQLite write lock across a file parse, stalling every other writer
+/// and lengthening the critical section for data the ledger does not need to
+/// publish atomically with the task status. A failure at any step is logged and
+/// the ledger freezes with NULLs — the terminal record matters more than its
+/// token numbers.
 async fn fill_metrics_from_token_facts(
     conn: &DatabaseConnection,
     row: &TaskLedgerEntry,
@@ -719,12 +733,43 @@ async fn fill_metrics_from_token_facts(
         apply_task_facts(metrics, facts);
     }
 
+    if token_columns_are_all_unknown(metrics) {
+        // The parse path never calls back into the delegation ledger (it reads
+        // conversations, approvals and the ledger rows themselves), so this
+        // cannot recurse into `finish`.
+        if let Err(error) =
+            crate::commands::token_usage::sync_conversations(conn, &[row.child_conversation_id])
+                .await
+        {
+            tracing::warn!(
+                task_id = row.task_id,
+                conversation_id = row.child_conversation_id,
+                %error,
+                "[delegation] on-demand token sync failed; freezing unknown tokens"
+            );
+        }
+        // Re-read even after a failed sync attempt: a concurrent dashboard
+        // pass may have materialized the same child in the meantime.
+        if let Some(facts) = read_task_token_facts(conn, row).await {
+            apply_task_facts(metrics, facts);
+        }
+    }
+
     // The admission snapshot can be missing (a default-model call, an agent
     // that publishes no config options, a snapshot read failure). Fall back to
     // what the conversation row or its latest usage turn names, in that order.
     if metrics.effective_model.is_none() {
         metrics.effective_model = child_model_fallback(conn, row.child_conversation_id).await;
     }
+}
+
+/// True when the ledger would render `—` in all four token columns. Only then
+/// is an on-demand sync worth its parse.
+fn token_columns_are_all_unknown(metrics: &ReportMetrics) -> bool {
+    metrics.input_tokens.is_none()
+        && metrics.output_tokens.is_none()
+        && metrics.cache_creation_tokens.is_none()
+        && metrics.cache_read_tokens.is_none()
 }
 
 /// One conversation's facts for THIS task's window, or `None` on "unknown".
@@ -2572,6 +2617,277 @@ mod tests {
         assert_eq!(row.duration_ms, Some(90));
         assert_eq!(row.turn_count, None);
         assert_eq!(row.input_tokens, None);
+    }
+
+    // ── On-demand child sync at freeze time ───────────────────────────────
+
+    /// A Claude-shaped transcript holding one usage-bearing assistant turn.
+    fn claude_usage_transcript(
+        session_id: &str,
+        cwd: &str,
+        at: DateTime<Utc>,
+        input: u64,
+        output: u64,
+        cache_creation: u64,
+        cache_read: u64,
+    ) -> String {
+        let stamp = at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        [
+            serde_json::json!({
+                "type": "user",
+                "timestamp": stamp,
+                "uuid": "u1",
+                "cwd": cwd,
+                "sessionId": session_id,
+                "message": {"role": "user", "content": [{"type": "text", "text": "work"}]},
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": stamp,
+                "uuid": "a1",
+                "parentUuid": "u1",
+                "cwd": cwd,
+                "sessionId": session_id,
+                "message": {
+                    "id": "msg_01",
+                    "role": "assistant",
+                    "model": "claude-opus-5",
+                    "content": [{"type": "text", "text": "done"}],
+                    "usage": {
+                        "input_tokens": input,
+                        "output_tokens": output,
+                        "cache_creation_input_tokens": cache_creation,
+                        "cache_read_input_tokens": cache_read,
+                    },
+                },
+            })
+            .to_string(),
+        ]
+        .join("\n")
+            + "\n"
+    }
+
+    /// Point `agent_type`'s history reads at a tempdir, the way the settings
+    /// page stores a relocated home.
+    async fn save_agent_env_json(
+        db: &crate::db::AppDatabase,
+        agent_type: AgentType,
+        env_json: &str,
+    ) {
+        use crate::db::service::agent_setting_service;
+        agent_setting_service::ensure_defaults(
+            &db.conn,
+            &[agent_setting_service::AgentDefaultInput {
+                agent_type,
+                registry_id: agent_type.to_string(),
+                default_sort_order: 0,
+            }],
+        )
+        .await
+        .expect("seed agent setting");
+        agent_setting_service::update(
+            &db.conn,
+            agent_type,
+            agent_setting_service::AgentSettingsUpdate {
+                enabled: true,
+                env_json: Some(env_json.to_string()),
+                model_provider_id: None,
+            },
+        )
+        .await
+        .expect("save env_json");
+    }
+
+    /// Write `body` where Claude's parser looks for `session_id`, and create a
+    /// conversation bound to it.
+    async fn claude_child_with_transcript(
+        db: &crate::db::AppDatabase,
+        config_dir: &std::path::Path,
+        folder: i32,
+        session_id: &str,
+        body: &str,
+    ) -> i32 {
+        let project = config_dir.join("projects").join("-codeg-delegation-sync");
+        std::fs::create_dir_all(&project).expect("project dir");
+        std::fs::write(project.join(format!("{session_id}.jsonl")), body)
+            .expect("write transcript");
+        let child =
+            conversation_service::create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("child")
+                .id;
+        conversation_service::bind_external_id(&db.conn, child, session_id, &[])
+            .await
+            .expect("bind session");
+        child
+    }
+
+    /// Pull a task's admission stamp back so a turn written before the test
+    /// body runs falls inside the freeze window.
+    async fn widen_task_window(db: &crate::db::AppDatabase, task_id: &str, since: DateTime<Utc>) {
+        delegation_task::Entity::update_many()
+            .col_expr(
+                delegation_task::Column::CreatedAt,
+                sea_orm::sea_query::Expr::value(since),
+            )
+            .filter(delegation_task::Column::TaskId.eq(task_id))
+            .exec(&db.conn)
+            .await
+            .expect("widen task window");
+    }
+
+    /// The gap this closes: the token pipeline only materializes a child when
+    /// the dashboard is opened, so a task finishing before that froze NULL even
+    /// though its transcript held the numbers. `finish` must sync the child
+    /// itself and then re-read the facts.
+    #[tokio::test]
+    async fn finish_syncs_the_child_transcript_when_no_facts_exist() {
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        let db = fresh_in_memory_db().await;
+        save_agent_env_json(
+            &db,
+            AgentType::ClaudeCode,
+            &serde_json::json!({ "CLAUDE_CONFIG_DIR": config_dir.path() }).to_string(),
+        )
+        .await;
+
+        let cwd = "/tmp/codeg-delegation-sync";
+        let folder = folder_service::add_folder(&db.conn, cwd)
+            .await
+            .expect("folder")
+            .id;
+        let parent =
+            conversation_service::create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("parent")
+                .id;
+        let turn_at = Utc::now() - chrono::Duration::seconds(30);
+        let session = "d3f1c0de-0000-4000-8000-000000000001";
+        let child = claude_child_with_transcript(
+            &db,
+            config_dir.path(),
+            folder,
+            session,
+            &claude_usage_transcript(session, cwd, turn_at, 120, 7, 30, 40),
+        )
+        .await;
+
+        admit(&db.conn, input("t0", parent, child, None, "work"))
+            .await
+            .expect("admit");
+        widen_task_window(&db, "t0", turn_at - chrono::Duration::seconds(30)).await;
+
+        let done = report("t0", child, "done", TaskStatus::Completed);
+        assert!(finish(&db.conn, parent, "t0", &done).await.expect("finish"));
+
+        let row = metrics_row(&db.conn, "t0").await;
+        assert_eq!(row.input_tokens, Some(120));
+        assert_eq!(row.output_tokens, Some(7));
+        assert_eq!(row.cache_creation_tokens, Some(30));
+        assert_eq!(row.cache_read_tokens, Some(40));
+        assert_eq!(row.turn_count, Some(1));
+    }
+
+    /// Facts already in the table mean the transcript is never touched: the
+    /// seeded numbers survive and the transcript's much larger numbers never
+    /// land. This is the zero-extra-work guarantee for the common terminal
+    /// path.
+    #[tokio::test]
+    async fn finish_keeps_existing_facts_and_skips_the_sync() {
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        let db = fresh_in_memory_db().await;
+        save_agent_env_json(
+            &db,
+            AgentType::ClaudeCode,
+            &serde_json::json!({ "CLAUDE_CONFIG_DIR": config_dir.path() }).to_string(),
+        )
+        .await;
+
+        let cwd = "/tmp/codeg-delegation-sync";
+        let folder = folder_service::add_folder(&db.conn, cwd)
+            .await
+            .expect("folder")
+            .id;
+        let parent =
+            conversation_service::create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("parent")
+                .id;
+        let session = "d3f1c0de-0000-4000-8000-000000000002";
+        let child = claude_child_with_transcript(
+            &db,
+            config_dir.path(),
+            folder,
+            session,
+            &claude_usage_transcript(session, cwd, Utc::now(), 9_999, 999, 99, 99),
+        )
+        .await;
+
+        admit(&db.conn, input("t0", parent, child, None, "work"))
+            .await
+            .expect("admit");
+        seed_usage(
+            &db.conn,
+            child,
+            vec![usage_fact("turn-1", Utc::now(), Some("gpt-6"), 700, 11, 5, 3)],
+        )
+        .await;
+
+        let done = report("t0", child, "done", TaskStatus::Completed);
+        assert!(finish(&db.conn, parent, "t0", &done).await.expect("finish"));
+
+        let row = metrics_row(&db.conn, "t0").await;
+        assert_eq!(row.input_tokens, Some(700));
+        assert_eq!(row.output_tokens, Some(11));
+        assert_eq!(row.cache_creation_tokens, Some(5));
+        assert_eq!(row.cache_read_tokens, Some(3));
+
+        // The transcript's single 9 999-token turn never replaced the seeded
+        // row: the fact table still holds exactly the seeded facts.
+        let stored = crate::db::service::token_usage_service::fetch_facts(
+            &db.conn,
+            &crate::db::service::token_usage_service::FactQuery::default(),
+            100,
+        )
+        .await
+        .expect("stored facts");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].total_tokens, 700 + 11 + 5 + 3);
+    }
+
+    /// A sync that fails must not cost the terminal record: `finish` still
+    /// succeeds and the four columns stay NULL ("unknown", never 0).
+    #[tokio::test]
+    async fn a_failed_on_demand_sync_still_freezes_the_terminal_report() {
+        let db = fresh_in_memory_db().await;
+        let (parent, child) = conversations(&db).await;
+        admit(&db.conn, input("t0", parent, child, None, "work"))
+            .await
+            .expect("admit");
+
+        crate::commands::token_usage::fail_next_conversation_parse("synthetic parse failure");
+
+        let done = report("t0", child, "done", TaskStatus::Completed);
+        assert!(
+            finish(&db.conn, parent, "t0", &done).await.expect("finish"),
+            "the terminal write must win even when the sync fails"
+        );
+
+        let row = metrics_row(&db.conn, "t0").await;
+        assert_eq!(row.status, "completed");
+        assert_eq!(row.input_tokens, None);
+        assert_eq!(row.output_tokens, None);
+        assert_eq!(row.cache_creation_tokens, None);
+        assert_eq!(row.cache_read_tokens, None);
+
+        // If `finish` had skipped the sync entirely, the armed failure would
+        // still be pending — consuming it proves the on-demand path really ran
+        // and handled the error.
+        assert!(
+            !crate::commands::token_usage::parse_failure_is_pending(),
+            "the armed parse failure must have been consumed by finish"
+        );
     }
 
     fn completed_report(task_id: &str, child: i32, duration: u64) -> DelegationTaskReport {

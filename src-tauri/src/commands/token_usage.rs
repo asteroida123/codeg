@@ -82,6 +82,23 @@ const MAX_DENSE_BUCKETS: usize = 3_000;
 /// SQLite serializes writers anyway.
 const PARSE_CONCURRENCY: usize = 4;
 
+/// How long the on-demand single-conversation sync may take before it gives
+/// up. The delegation ledger calls it while freezing a terminal report, so a
+/// pathological transcript must not hold that write open indefinitely. Same
+/// bound as `commands::session_info`'s parse budget; a timed-out parse keeps
+/// running on the blocking pool but the caller stops waiting, and the ledger
+/// simply keeps NULL token columns.
+const ON_DEMAND_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// How long the on-demand sync waits for [`SYNC_GUARD`] before giving up.
+///
+/// A dashboard pass can legitimately hold the guard for minutes, so this is a
+/// bounded wait, not a queue: the ledger freezes a terminal report while the
+/// user may have the Token Usage page open, and "you may wait for one turn"
+/// is worth paying to avoid a permanent NULL. Waiting forever is not — the
+/// terminal write matters more than its token numbers.
+const ON_DEMAND_GUARD_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Minimum gap between progress events, so a 5 000-conversation sync doesn't
 /// push 5 000 messages through the event bus.
 const PROGRESS_INTERVAL_MS: i64 = 150;
@@ -169,9 +186,12 @@ const FACT_SCHEMA_VERSION: &str = "9";
 
 const FACT_SCHEMA_VERSION_KEY: &str = "token_usage_fact_schema_version";
 
-/// Serializes syncs. `try_lock` rather than queueing: a second sync racing the
-/// first would re-parse the same files for no benefit, and the caller can just
-/// be told one is already running.
+/// Serializes syncs. The full pass takes it with `try_lock`: a second sync
+/// racing the first would re-parse the same files for no benefit, and that
+/// caller (a user-initiated rebuild) can just be told one is already running.
+/// The on-demand sync takes it with a bounded wait instead — see
+/// [`ON_DEMAND_GUARD_WAIT`] and [`sync_conversations`] — because declining it
+/// costs a terminal ledger row its token columns for good.
 static SYNC_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Set while [`token_usage_sync_core`] is inside the guard, so
@@ -979,6 +999,272 @@ impl Drop for RunningFlag {
     }
 }
 
+// Test seam for [`parse_conversation`]'s failure path.
+#[cfg(test)]
+thread_local! {
+    /// One-shot failure injection for [`parse_conversation`]'s tests. The
+    /// delegation ledger's non-fatal-failure test cannot make a real parser
+    /// fail hermetically, so it arms this instead. Thread-local on purpose:
+    /// `#[tokio::test]` polls the whole future on the test's own thread, and a
+    /// process-global flag would let parallel tests consume each other's.
+    static TEST_PARSE_FAILURE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn take_test_parse_failure() -> Option<String> {
+    TEST_PARSE_FAILURE.with(|slot| slot.borrow_mut().take())
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_conversation_parse(message: &str) {
+    TEST_PARSE_FAILURE.with(|slot| *slot.borrow_mut() = Some(message.to_string()));
+}
+
+#[cfg(test)]
+pub(crate) fn parse_failure_is_pending() -> bool {
+    TEST_PARSE_FAILURE.with(|slot| slot.borrow().is_some())
+}
+
+/// Read one conversation's transcript through the shared conversation parser.
+///
+/// The single parse entry for BOTH the dashboard pass and the ledger's
+/// on-demand sync, so a fix to how a transcript is read reaches both.
+async fn parse_conversation(
+    conn: &sea_orm::DatabaseConnection,
+    conversation_id: i32,
+) -> Result<DbConversationDetail, AppCommandError> {
+    #[cfg(test)]
+    if let Some(message) = take_test_parse_failure() {
+        return Err(AppCommandError::task_execution_failed(message));
+    }
+    get_folder_conversation_core(conn, conversation_id)
+        .await
+        .map(|(detail, _parsed_title)| detail)
+}
+
+/// What one conversation's parsed transcript did to the fact table.
+enum StoreOutcome {
+    Synced { turns: u32, tokens: i64 },
+    /// The transcript is gone; recorded facts were kept and the stamp settled.
+    LostSource,
+    /// Nothing was parsed into facts, so nothing was written and no stamp
+    /// moved. Only [`StorePolicy::AdditiveOnly`] returns this.
+    NothingWritten,
+    Failed,
+}
+
+/// How much a store may change the table, chosen by which caller is asking.
+///
+/// The two paths answer different questions and must not share one rule:
+///
+///  * **Dashboard** ([`StorePolicy::Settle`]) is a convergence pass. It must
+///    be able to record "this conversation has no usage" (an empty write plus a
+///    stamp) or it would re-parse every usage-free conversation on every pass
+///    forever; and it must settle a lost source or the same walk repeats with
+///    no exit. Both are correct *because a pass is allowed to take minutes and
+///    comes back* — a wrong settlement is repaired on the next pass or a full
+///    rebuild.
+///  * **Ledger** ([`StorePolicy::AdditiveOnly`]) is a one-shot fill for a
+///    child that is being frozen right now. `finish` runs at TurnComplete,
+///    which can precede the agent's transcript flush; an empty parse there
+///    means "not on disk yet", not "no usage". Settling would advance the
+///    stamp with `turn_count = 0` and strand that child's tokens at unknown
+///    until `updated_at` moves again. So this path only ever ADDS facts: empty
+///    result, nothing written, no stamp, still stale — the next full pass
+///    (or the next `finish`) gets another look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorePolicy {
+    /// Dashboard pass: write empty results and settle lost sources.
+    Settle,
+    /// On-demand ledger sync: add facts, never settle, never advance a stamp.
+    AdditiveOnly,
+}
+
+/// Turn one parsed transcript into `token_usage_turn` rows and advance the
+/// sync stamp.
+///
+/// This is the ONLY write path from a parse into the fact table, shared by the
+/// dashboard pass and [`sync_conversations`]. `replace_conversation_facts`
+/// deletes-then-inserts inside its own transaction, so running this twice for
+/// the same conversation replaces rather than duplicates its rows.
+///
+/// `policy` decides whether an empty parse or a lost source may settle the
+/// stamp; see [`StorePolicy`] for why the two callers differ.
+async fn store_parsed_conversation(
+    conn: &sea_orm::DatabaseConnection,
+    candidate: &usage_service::SyncCandidate,
+    detail: &DbConversationDetail,
+    policy: StorePolicy,
+) -> StoreOutcome {
+    if parse_lost_a_readable_source(detail, candidate) {
+        if policy == StorePolicy::AdditiveOnly {
+            // A lost source is exactly the shape an on-demand sync must not
+            // act on: the child is being frozen, its transcript may simply not
+            // be flushed yet, and settling here would close the case for good.
+            // Leave the stamp alone so the dashboard pass can still re-read it.
+            tracing::debug!(
+                conversation_id = candidate.id,
+                kept_turns = candidate.synced_turn_count.unwrap_or(0),
+                "token usage sync: on-demand parse found no readable source — \
+                 keeping the stamp open"
+            );
+            return StoreOutcome::NothingWritten;
+        }
+        // `get_folder_conversation_core` reports a transcript it can no
+        // longer find as a *successful* parse with zero turns (see its
+        // `ConversationNotFound` arm). Writing that through would delete
+        // real recorded usage, so the fact rows are left alone.
+        //
+        // The stamp, though, is settled rather than held open. There is
+        // no third state to wait for: a transcript the agent's CLI
+        // deleted is not coming back, and nothing here can tell a first
+        // miss from a thousandth. Holding the conversation stale means
+        // re-walking the agent's whole transcript tree on every pass,
+        // failing identically each time, and reporting it — a loop with
+        // no exit that re-derives nothing. So keep the numbers, close
+        // the case, and say it at `debug` because a settled source is a
+        // resting state, not an incident. A re-import or a full rebuild
+        // is what puts the conversation back in scope.
+        tracing::debug!(
+            conversation_id = candidate.id,
+            kept_turns = candidate.synced_turn_count.unwrap_or(0),
+            "token usage sync: transcript is gone — keeping the recorded \
+             facts and settling the stamp"
+        );
+        return match usage_service::settle_lost_source(conn, candidate.id, candidate.updated_at)
+            .await
+        {
+            Ok(()) => StoreOutcome::LostSource,
+            Err(e) => {
+                // A write that fails is a real fault, not a lost
+                // source: report it and let the next pass retry.
+                tracing::warn!(
+                    conversation_id = candidate.id,
+                    error = %e,
+                    "token usage sync: failed to settle a lost transcript"
+                );
+                StoreOutcome::Failed
+            }
+        };
+    }
+
+    let facts = facts_from_detail(detail, candidate.updated_at);
+    if facts.is_empty() && policy == StorePolicy::AdditiveOnly {
+        // `replace_conversation_facts` with an empty slice would both erase any
+        // existing rows and stamp `turn_count = 0`. For a transcript that has
+        // not been flushed yet that turns "unknown" into "permanently empty",
+        // so the additive path writes nothing and leaves the conversation
+        // stale for a later pass.
+        tracing::debug!(
+            conversation_id = candidate.id,
+            "token usage sync: on-demand parse produced no facts — leaving the \
+             stamp open for a later pass"
+        );
+        return StoreOutcome::NothingWritten;
+    }
+    match usage_service::replace_conversation_facts(
+        conn,
+        candidate.id,
+        candidate.updated_at,
+        &facts,
+    )
+    .await
+    {
+        Ok((turns, tokens)) => StoreOutcome::Synced { turns, tokens },
+        Err(e) => {
+            tracing::warn!(
+                conversation_id = candidate.id,
+                error = %e,
+                "token usage sync: failed to write facts"
+            );
+            StoreOutcome::Failed
+        }
+    }
+}
+
+/// Materialize facts for exactly these conversations, now.
+///
+/// The delegation ledger calls this at terminal time for a child that has no
+/// fact rows yet: the pipeline otherwise only materializes on a dashboard sync,
+/// which a just-finished task has not had. It is deliberately NOT the dashboard
+/// pass: no staleness check (the caller already knows the data is missing, and
+/// the child's `updated_at` may not have moved yet), no progress events, and a
+/// per-conversation failure is logged rather than propagated — the ledger row
+/// matters more than its token numbers.
+///
+/// It takes [`SYNC_GUARD`] with a **bounded wait** ([`ON_DEMAND_GUARD_WAIT`])
+/// rather than the full pass's `try_lock`. The guard exists to stop two
+/// expensive passes from duplicating work, but declining a terminal freeze's
+/// sync because a user has the Token Usage page open would put the "no facts"
+/// hole right back — and NULL token columns are not backfilled later. So wait
+/// briefly for the pass to finish, and only give up past the deadline. The
+/// full pass keeps its non-blocking contract: it is a user-initiated action
+/// and must answer "already running" immediately, not queue behind minutes of
+/// parsing.
+///
+/// Once inside, the write is `AdditiveOnly` (see [`StorePolicy`]): a transcript
+/// the agent has not flushed yet parses to nothing, and that must not settle
+/// the child as "no usage forever".
+pub(crate) async fn sync_conversations(
+    conn: &sea_orm::DatabaseConnection,
+    conversation_ids: &[i32],
+) -> Result<(), AppCommandError> {
+    if conversation_ids.is_empty() {
+        return Ok(());
+    }
+
+    let candidates = usage_service::list_sync_candidates_by_ids(conn, conversation_ids)
+        .await
+        .map_err(AppCommandError::from)?;
+    if candidates.is_empty() {
+        // Nothing live to sync — a soft-deleted or unknown id is a no-op, not
+        // an error: the ledger may freeze a task whose child was removed.
+        return Ok(());
+    }
+
+    let _guard = match tokio::time::timeout(ON_DEMAND_GUARD_WAIT, SYNC_GUARD.lock()).await {
+        Ok(guard) => guard,
+        Err(_) => {
+            return Err(AppCommandError::invalid_input(
+                "A token usage sync is already running",
+            ))
+        }
+    };
+
+    for candidate in candidates {
+        let parsed =
+            tokio::time::timeout(ON_DEMAND_SYNC_TIMEOUT, parse_conversation(conn, candidate.id))
+                .await;
+        match parsed {
+            Ok(Ok(detail)) => {
+                // A sync, a lost source, or a failed write all end here: the
+                // caller re-reads the facts and keeps NULL for whatever is
+                // still missing. The helper logs its own failures. An empty
+                // parse writes nothing (AdditiveOnly), so the stamp stays open.
+                let _ =
+                    store_parsed_conversation(conn, &candidate, &detail, StorePolicy::AdditiveOnly)
+                        .await;
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    conversation_id = candidate.id,
+                    %error,
+                    "token usage sync: on-demand parse failed; the caller keeps unknown tokens"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    conversation_id = candidate.id,
+                    timeout_ms = ON_DEMAND_SYNC_TIMEOUT.as_millis() as u64,
+                    "token usage sync: on-demand parse timed out; the caller keeps unknown tokens"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn token_usage_sync_core(
     conn: &sea_orm::DatabaseConnection,
     emitter: &EventEmitter,
@@ -1051,7 +1337,7 @@ pub async fn token_usage_sync_core(
     // Parse concurrently (each `get_folder_conversation_core` hands the file
     // read to the blocking pool), consume in order, write sequentially.
     let mut parsed = stream::iter(stale.into_iter().map(|candidate| async move {
-        let detail = get_folder_conversation_core(conn, candidate.id).await;
+        let detail = parse_conversation(conn, candidate.id).await;
         (candidate, detail)
     }))
     .buffered(PARSE_CONCURRENCY);
@@ -1059,66 +1345,19 @@ pub async fn token_usage_sync_core(
     while let Some((candidate, detail)) = parsed.next().await {
         done += 1;
         match detail {
-            Ok((detail, _)) if parse_lost_a_readable_source(&detail, &candidate) => {
-                // `get_folder_conversation_core` reports a transcript it can no
-                // longer find as a *successful* parse with zero turns (see its
-                // `ConversationNotFound` arm). Writing that through would delete
-                // real recorded usage, so the fact rows are left alone.
-                //
-                // The stamp, though, is settled rather than held open. There is
-                // no third state to wait for: a transcript the agent's CLI
-                // deleted is not coming back, and nothing here can tell a first
-                // miss from a thousandth. Holding the conversation stale means
-                // re-walking the agent's whole transcript tree on every pass,
-                // failing identically each time, and reporting it — a loop with
-                // no exit that re-derives nothing. So keep the numbers, close
-                // the case, and say it at `debug` because a settled source is a
-                // resting state, not an incident. A re-import or a full rebuild
-                // is what puts the conversation back in scope.
-                tracing::debug!(
-                    conversation_id = candidate.id,
-                    kept_turns = candidate.synced_turn_count.unwrap_or(0),
-                    "token usage sync: transcript is gone — keeping the recorded \
-                     facts and settling the stamp"
-                );
-                match usage_service::settle_lost_source(conn, candidate.id, candidate.updated_at)
-                    .await
+            Ok(detail) => {
+                match store_parsed_conversation(conn, &candidate, &detail, StorePolicy::Settle).await
                 {
-                    Ok(()) => result.lost += 1,
-                    Err(e) => {
-                        // A write that fails is a real fault, not a lost
-                        // source: report it and let the next pass retry.
-                        tracing::warn!(
-                            conversation_id = candidate.id,
-                            error = %e,
-                            "token usage sync: failed to settle a lost transcript"
-                        );
-                        result.failed += 1;
-                        keep_eligible_for_rebuild(conn, schema_changed, candidate.id).await;
-                    }
-                }
-            }
-            Ok((detail, _)) => {
-                let facts = facts_from_detail(&detail, candidate.updated_at);
-                match usage_service::replace_conversation_facts(
-                    conn,
-                    candidate.id,
-                    candidate.updated_at,
-                    &facts,
-                )
-                .await
-                {
-                    Ok((turns, tokens)) => {
+                    StoreOutcome::Synced { turns, tokens } => {
                         result.synced += 1;
                         result.turns_written += turns as u64;
                         result.tokens_written += tokens.max(0) as u64;
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            conversation_id = candidate.id,
-                            error = %e,
-                            "token usage sync: failed to write facts"
-                        );
+                    StoreOutcome::LostSource => result.lost += 1,
+                    // `Settle` never withholds a write: an empty result is
+                    // recorded and stamped, and a lost source settles.
+                    StoreOutcome::NothingWritten => {}
+                    StoreOutcome::Failed => {
                         result.failed += 1;
                         keep_eligible_for_rebuild(conn, schema_changed, candidate.id).await;
                     }
@@ -2033,5 +2272,317 @@ mod tests {
             1,
             "the failed settle and its retry must both preserve recorded usage"
         );
+    }
+
+    // ── On-demand sync policy ─────────────────────────────────────────────
+
+    /// Point Claude's history reads at a temp config dir, the way the settings
+    /// page stores a relocated home.
+    async fn save_claude_config_dir(db: &crate::db::AppDatabase, path: &std::path::Path) {
+        use crate::db::service::agent_setting_service;
+        use crate::models::AgentType;
+
+        agent_setting_service::ensure_defaults(
+            &db.conn,
+            &[agent_setting_service::AgentDefaultInput {
+                agent_type: AgentType::ClaudeCode,
+                registry_id: AgentType::ClaudeCode.to_string(),
+                default_sort_order: 0,
+            }],
+        )
+        .await
+        .expect("seed agent setting");
+        agent_setting_service::update(
+            &db.conn,
+            AgentType::ClaudeCode,
+            agent_setting_service::AgentSettingsUpdate {
+                enabled: true,
+                env_json: Some(
+                    serde_json::json!({ "CLAUDE_CONFIG_DIR": path.to_string_lossy() })
+                        .to_string(),
+                ),
+                model_provider_id: None,
+            },
+        )
+        .await
+        .expect("save env_json");
+    }
+
+    /// A Claude transcript holding one usage-bearing assistant turn.
+    fn claude_usage_transcript(session_id: &str, cwd: &str, at: DateTime<Utc>) -> String {
+        let stamp = at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        [
+            serde_json::json!({
+                "type": "user",
+                "timestamp": stamp,
+                "uuid": "u1",
+                "cwd": cwd,
+                "sessionId": session_id,
+                "message": {"role": "user", "content": [{"type": "text", "text": "work"}]},
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": stamp,
+                "uuid": "a1",
+                "parentUuid": "u1",
+                "cwd": cwd,
+                "sessionId": session_id,
+                "message": {
+                    "id": "msg_01",
+                    "role": "assistant",
+                    "model": "claude-opus-5",
+                    "content": [{"type": "text", "text": "done"}],
+                    "usage": {
+                        "input_tokens": 120,
+                        "output_tokens": 7,
+                        "cache_creation_input_tokens": 30,
+                        "cache_read_input_tokens": 40,
+                    },
+                },
+            })
+            .to_string(),
+        ]
+        .join("\n")
+            + "\n"
+    }
+
+    fn write_claude_transcript(
+        config_dir: &std::path::Path,
+        session_id: &str,
+        body: &str,
+    ) {
+        let project = config_dir.join("projects").join("-codeg-on-demand-sync");
+        std::fs::create_dir_all(&project).expect("project dir");
+        std::fs::write(project.join(format!("{session_id}.jsonl")), body)
+            .expect("write transcript");
+    }
+
+    /// The regression this locks: `finish` syncs at TurnComplete, sometimes
+    /// before the agent has flushed its transcript. An empty parse must not
+    /// write an empty fact set (which stamps `turn_count = 0`), or the
+    /// conversation is never re-read again and its tokens stay unknown
+    /// forever.
+    #[tokio::test]
+    async fn on_demand_sync_does_not_settle_an_empty_result() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use crate::models::AgentType;
+
+        let _serial = SYNC_TESTS_SERIAL.lock().await;
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        let db = fresh_in_memory_db().await;
+        save_claude_config_dir(&db, config_dir.path()).await;
+
+        let cwd = "/tmp/codeg-on-demand-sync";
+        let folder = seed_folder(&db, cwd).await;
+        let session = "d3f1c0de-0000-4000-8000-0000000000aa";
+        let conv = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            None,
+            None,
+        )
+        .await
+        .expect("conversation")
+        .id;
+        conversation_service::bind_external_id(&db.conn, conv, session, &[])
+            .await
+            .expect("bind external id");
+
+        // No transcript on disk yet: exactly the TurnComplete race.
+        sync_conversations(&db.conn, &[conv])
+            .await
+            .expect("on-demand sync");
+
+        assert!(
+            usage_service::fetch_facts(&db.conn, &FactQuery::default(), 100)
+                .await
+                .expect("facts")
+                .is_empty(),
+            "an empty parse must not write facts"
+        );
+        let candidate = usage_service::list_sync_candidates_by_ids(&db.conn, &[conv])
+            .await
+            .expect("candidates")
+            .into_iter()
+            .next()
+            .expect("candidate");
+        assert!(
+            candidate.is_stale(),
+            "an empty parse must not advance the sync stamp"
+        );
+        assert_eq!(
+            candidate.synced_turn_count, None,
+            "no stamp row means no turn count either"
+        );
+
+        // The transcript lands after the freeze. The next full pass must still
+        // be eligible to read it: this is what the settlement would have cost.
+        write_claude_transcript(
+            config_dir.path(),
+            session,
+            &claude_usage_transcript(session, cwd, Utc::now()),
+        );
+        let pass = token_usage_sync_core(
+            &db.conn,
+            &EventEmitter::Noop,
+            TokenUsageSyncMode::Incremental,
+        )
+        .await
+        .expect("full pass");
+        assert_eq!(pass.synced, 1);
+
+        let facts = usage_service::fetch_facts(&db.conn, &FactQuery::default(), 100)
+            .await
+            .expect("facts");
+        assert_eq!(facts.len(), 1, "the transcript is materialized now");
+        assert_eq!(facts[0].total_tokens, 120 + 7 + 30 + 40);
+        assert!(!usage_service::list_sync_candidates_by_ids(&db.conn, &[conv])
+            .await
+            .expect("candidates")[0]
+            .is_stale());
+    }
+
+    /// A dashboard pass holding the guard must not make the terminal freeze
+    /// drop its numbers instantly — but the wait is bounded. Past the deadline
+    /// the call fails, and once the pass releases, a retry works.
+    #[tokio::test]
+    async fn on_demand_sync_is_refused_while_a_pass_holds_the_guard() {
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+        use crate::models::AgentType;
+
+        let _serial = SYNC_TESTS_SERIAL.lock().await;
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/tu-guard").await;
+        let conv = seed_conversation(&db, folder, AgentType::ClaudeCode).await;
+
+        let held = SYNC_GUARD.lock().await;
+        let started = std::time::Instant::now();
+        let refused = sync_conversations(&db.conn, &[conv]).await;
+        let waited = started.elapsed();
+        let error = refused.expect_err("a held guard must eventually refuse the sync");
+        assert!(
+            error.to_string().contains("already running"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(1_400),
+            "the call must wait its bounded budget, not fail instantly: {waited:?}"
+        );
+        assert!(
+            waited < ON_DEMAND_SYNC_TIMEOUT,
+            "and it must not wait for a whole parse budget: {waited:?}"
+        );
+
+        drop(held);
+        sync_conversations(&db.conn, &[conv])
+            .await
+            .expect("a released guard lets the sync through");
+    }
+
+    /// A soft-deleted child is invisible to the candidate query, so the sync is
+    /// a no-op rather than an error — `finish` may still run for a task whose
+    /// conversation was removed.
+    #[tokio::test]
+    async fn on_demand_sync_skips_deleted_conversation() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+        use crate::models::AgentType;
+
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/tu-deleted-sync").await;
+        let conv = seed_conversation(&db, folder, AgentType::ClaudeCode).await;
+        conversation_service::soft_delete(&db.conn, conv)
+            .await
+            .expect("soft delete");
+
+        sync_conversations(&db.conn, &[conv])
+            .await
+            .expect("deleted conversation is a no-op");
+
+        assert!(usage_service::list_sync_candidates_by_ids(&db.conn, &[conv])
+            .await
+            .expect("candidates")
+            .is_empty());
+        assert!(usage_service::fetch_facts(&db.conn, &FactQuery::default(), 100)
+            .await
+            .expect("facts")
+            .is_empty());
+        assert_eq!(token_usage_turn_rows(&db.conn, conv).await, 0);
+    }
+
+    /// The other half of the policy split: `Settle` (the dashboard pass) must
+    /// keep closing a lost source. `AdditiveOnly` changed nothing here.
+    #[tokio::test]
+    async fn full_pass_still_settles_a_lost_source() {
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+        use crate::models::AgentType;
+
+        let _serial = SYNC_TESTS_SERIAL.lock().await;
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/tu-full-lost").await;
+        let conv = seed_conversation(&db, folder, AgentType::ClaudeCode).await;
+        let updated_at = crate::db::entities::conversation::Entity::find_by_id(conv)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("row")
+            .updated_at;
+        usage_service::replace_conversation_facts(
+            &db.conn,
+            conv,
+            updated_at,
+            &[UsageFact {
+                turn_key: "t1".into(),
+                occurred_at: ts("2026-08-01T10:00:00Z"),
+                model: Some("claude-opus-5".into()),
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                duration_ms: 0,
+            }],
+        )
+        .await
+        .expect("seed facts");
+
+        // No transcript: the parse is empty but turn_count says we used to
+        // read usage here. The full pass must keep the rows and settle.
+        let pass = token_usage_sync_core(&db.conn, &EventEmitter::Noop, TokenUsageSyncMode::Full)
+            .await
+            .expect("full pass");
+        assert_eq!(pass.lost, 1);
+        assert_eq!(pass.synced, 0);
+        assert_eq!(
+            usage_service::fetch_facts(&db.conn, &FactQuery::default(), 100)
+                .await
+                .expect("facts")
+                .len(),
+            1,
+            "the recorded usage survives"
+        );
+        assert!(
+            !usage_service::list_sync_candidates(&db.conn)
+                .await
+                .expect("candidates")[0]
+                .is_stale(),
+            "the dashboard pass still settles a lost source"
+        );
+    }
+
+    /// Count the raw fact rows for one conversation, bypassing the live-row
+    /// join, so a soft-deleted row's absence is proven at the storage layer.
+    async fn token_usage_turn_rows(
+        conn: &sea_orm::DatabaseConnection,
+        conversation_id: i32,
+    ) -> u64 {
+        use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+        crate::db::entities::token_usage_turn::Entity::find()
+            .filter(crate::db::entities::token_usage_turn::Column::ConversationId.eq(conversation_id))
+            .count(conn)
+            .await
+            .expect("count fact rows")
     }
 }
