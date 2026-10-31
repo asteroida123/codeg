@@ -2008,7 +2008,12 @@ impl CliRunService {
         };
         let decided_by = match origin {
             None => DecidedBy::Withdrawn,
-            Some(PermissionAnswerOrigin::CliPolicy { .. }) => DecidedBy::Policy,
+            // The unattended grace timer answers a run's delegated children
+            // when the run's own `wait` policy would not — still a policy.
+            Some(
+                PermissionAnswerOrigin::CliPolicy { .. }
+                | PermissionAnswerOrigin::UnattendedPolicy,
+            ) => DecidedBy::Policy,
             Some(PermissionAnswerOrigin::User | PermissionAnswerOrigin::ChatChannel) => {
                 DecidedBy::User
             }

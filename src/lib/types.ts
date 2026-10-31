@@ -1626,6 +1626,7 @@ export type PermissionAnswerOrigin =
   | { kind: "user" }
   | { kind: "chat_channel" }
   | { kind: "cli_policy"; run_id: string }
+  | { kind: "unattended_policy" }
 
 /**
  * One answered permission request, as a record about its tool call (Rust

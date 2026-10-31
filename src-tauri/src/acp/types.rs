@@ -1427,6 +1427,11 @@ pub enum PermissionAnswerOrigin {
     ChatChannel,
     /// The permission policy of a headless `codeg-cli` run.
     CliPolicy { run_id: String },
+    /// The grace timer of an unattended connection (a delegated subagent or
+    /// a work-task run): nobody answered the card within the grace, so the
+    /// unattended policy did. Distinct from `CliPolicy` so a UI can show
+    /// "auto-denied after 120s" instead of attributing it to a run.
+    UnattendedPolicy,
 }
 
 impl PermissionAnswerOrigin {
@@ -1437,6 +1442,7 @@ impl PermissionAnswerOrigin {
             Self::User => "user",
             Self::ChatChannel => "chat_channel",
             Self::CliPolicy { .. } => "cli_policy",
+            Self::UnattendedPolicy => "unattended_policy",
         }
     }
 }

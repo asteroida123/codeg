@@ -2855,10 +2855,20 @@ pub async fn spawn_agent_connection(
     }
     // A `codeg-cli` run's root: marked before anything can look, the codeg-mcp
     // injection below included.
+    let is_cli_root = cli_root.is_some();
     if let Some(seed) = cli_root {
         initial_state.cli_run = Some(seed.tag);
         initial_state.cli_output_schema = seed.output_schema;
     }
+    // Unattended connections (broker-owned delegation children, work-task
+    // runs) get a grace-timed permission policy; everyone else — including a
+    // cli run, whose own policy answers — waits for a person as always.
+    initial_state.unattended_permissions = crate::acp::unattended::resolve(
+        &owner_window_label,
+        delegation_task_id.as_deref(),
+        is_cli_root,
+        &runtime_env,
+    );
     if agent_type == AgentType::Pi {
         initial_state.pi_enabled_model_patterns =
             crate::commands::acp::pi_enabled_model_patterns_for_env(&runtime_env, &launch_cwd);
@@ -3637,6 +3647,11 @@ async fn admit_permission(
     let cancellation = reply.cancellation();
     let (settled_tx, settled_rx) = oneshot::channel();
     let request_id = card.request_id.clone();
+    // An unattended connection (delegation child, work-task run) keeps the
+    // card — a person watching the session can still answer — but arms a
+    // grace timer: nobody answering within the grace resolves it by policy.
+    // Captured BEFORE the card is moved into the queue.
+    let unattended = watch_unattended_permission(perms, state, emitter, &card).await;
     admit_card(
         perms,
         state,
@@ -3658,6 +3673,68 @@ async fn admit_permission(
         emitter,
         request_id,
     );
+    if let Some((perms, state, emitter, request_id, option_id, grace)) = unattended {
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            // Idempotent: a person's answer, a policy answer, a withdrawal or
+            // a teardown that already resolved the card makes this a no-op.
+            resolve_permission(
+                &perms,
+                &state,
+                &emitter,
+                request_id,
+                option_id,
+                PermissionAnswerOrigin::UnattendedPolicy,
+            )
+            .await;
+        });
+    }
+}
+
+/// Arm the unattended grace timer for a card, if this connection is
+/// unattended and its policy can answer this request at all. Returns what
+/// the timer task needs: the clones, the request id, the option the policy
+/// would pick, and the grace. `None` = no timer (a person's connection, the
+/// policy leaves it to the card, or the request offers no option the policy
+/// may pick — never an `*_always` that writes a standing rule).
+async fn watch_unattended_permission(
+    perms: &PendingPermissions,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    card: &QueuedPermission,
+) -> Option<(
+    PendingPermissions,
+    Arc<RwLock<SessionState>>,
+    EventEmitter,
+    String,
+    String,
+    std::time::Duration,
+)> {
+    let policy = state.read().await.unattended_permissions.clone()?;
+    let tool_kind = card
+        .tool_call
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let answer = match crate::cli_run::policy::decide_permission(
+        policy.on_timeout,
+        &card.options,
+        tool_kind.as_deref(),
+    ) {
+        // Leave = the policy defers to the card for as long as it takes —
+        // exactly the hang this exists to end, so no policy here does.
+        crate::cli_run::policy::PermissionDecision::Answer { option_id, .. } => option_id,
+        crate::cli_run::policy::PermissionDecision::Leave
+        | crate::cli_run::policy::PermissionDecision::AnswerThenFail { .. } => return None,
+    };
+    Some((
+        Arc::clone(perms),
+        Arc::clone(state),
+        emitter.clone(),
+        card.request_id.clone(),
+        answer,
+        policy.grace,
+    ))
 }
 
 /// The queue half of [`admit_permission`]: admit, then publish the card or the
@@ -26650,6 +26727,225 @@ mod tests {
         assert_eq!(approval.option_name, "Deny");
         assert_eq!(approval.origin, "cli_policy");
         assert_eq!(guard.tool_approvals, vec![approval.clone()]);
+    }
+
+    /// Keep a harness client connected forever: the channel must outlive the
+    /// request being answered.
+    async fn park_client_forever(
+        _cx: ConnectionTo<Agent>,
+    ) -> Result<(), agent_client_protocol::Error> {
+        std::future::pending().await
+    }
+
+    /// The harness both unattended-policy tests share: a real ACP channel
+    /// whose agent raises one permission request with an allow-once and a
+    /// reject-once option, routed through `handle_permission_request` like
+    /// production. Returns the response future (resolve it with
+    /// `timeout(...)`), the shared state and the permission queue.
+    async fn unattended_permission_harness(
+        state: Arc<RwLock<SessionState>>,
+    ) -> (
+        tokio::task::JoinHandle<
+            Result<RequestPermissionResponse, agent_client_protocol::Error>,
+        >,
+        PendingPermissions,
+    ) {
+        use agent_client_protocol::schema::v1::{
+            PermissionOption, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        use agent_client_protocol::Channel;
+
+        let (client_end, agent_end) = Channel::duplex();
+        let perms = PendingPermissions::default();
+
+        let agent = tokio::spawn(Agent.builder().connect_with(
+            agent_end,
+            async |cx: ConnectionTo<Client>| {
+                let request = cx.send_request_to(
+                    Client,
+                    RequestPermissionRequest::new(
+                        SessionId::new("s1"),
+                        ToolCallUpdate::new(
+                            "call-1",
+                            ToolCallUpdateFields::new().title("Bash").kind(ToolKind::Execute),
+                        ),
+                        vec![
+                            PermissionOption::new(
+                                "allow",
+                                "Allow",
+                                PermissionOptionKind::AllowOnce,
+                            ),
+                            PermissionOption::new(
+                                "reject",
+                                "Deny",
+                                PermissionOptionKind::RejectOnce,
+                            ),
+                        ],
+                    ),
+                );
+                request.block_task().await
+            },
+        ));
+
+        let client = tokio::spawn({
+            let state = Arc::clone(&state);
+            let perms = perms.clone();
+            Client
+                .builder()
+                .on_receive_request(
+                    async move |req: RequestPermissionRequest,
+                                responder: Responder<RequestPermissionResponse>,
+                                cx: ConnectionTo<Agent>| {
+                        handle_permission_request(
+                            &cx,
+                            &state,
+                            &EventEmitter::Noop,
+                            &perms,
+                            "/tmp",
+                            AgentType::ClaudeCode,
+                            req,
+                            responder,
+                        )
+                        .await;
+                        Ok(())
+                    },
+                    on_receive_request!(),
+                )
+                .connect_with(client_end, park_client_forever)
+        });
+        // Only the agent task's result is awaited; the client keeps the
+        // channel alive until the caller is done with the queue.
+        tokio::spawn(async move {
+            client.await.ok();
+        });
+
+        (agent, perms)
+    }
+
+    fn unattended_state(grace: std::time::Duration) -> Arc<RwLock<SessionState>> {
+        let mut state = SessionState::new(
+            "conn-unattended".to_string(),
+            AgentType::ClaudeCode,
+            None,
+            "win".to_string(),
+            None,
+        );
+        state.unattended_permissions = Some(crate::acp::unattended::UnattendedPermissions {
+            on_timeout: crate::cli_run::policy::PermissionPolicy::Deny,
+            grace,
+        });
+        Arc::new(RwLock::new(state))
+    }
+
+    /// Nobody answers the card of an unattended connection: after the grace
+    /// the policy does, the agent gets its rejection, and the resolution is
+    /// attributed to `unattended_policy` — not to a person, not to a run.
+    #[tokio::test]
+    async fn an_unattended_permission_denies_itself_after_the_grace() {
+        let state = unattended_state(std::time::Duration::from_millis(100));
+        let (agent, perms) = unattended_permission_harness(Arc::clone(&state)).await;
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), agent)
+            .await
+            .expect("the policy answers without the user")
+            .expect("agent task")
+            .expect("a response, not an error");
+        match response.outcome {
+            RequestPermissionOutcome::Selected(selected) => {
+                assert_eq!(selected.option_id.to_string(), "reject");
+            }
+            other => panic!("expected the selected option, got {other:?}"),
+        }
+
+        let guard = state.read().await;
+        let events = guard.recent_events_after(0).expect("events recorded");
+        let resolved: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.payload {
+                AcpEvent::PermissionResolved {
+                    request_id: _,
+                    option_id,
+                    origin,
+                } => Some((option_id.clone(), origin.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            resolved,
+            vec![(
+                Some("reject".to_string()),
+                Some(PermissionAnswerOrigin::UnattendedPolicy),
+            )],
+            "one report, naming the policy's option and the policy as answerer"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.payload,
+                AcpEvent::ToolApproval { approval } if approval.origin == "unattended_policy"
+            )),
+            "the auto-deny is recorded like any other decision"
+        );
+        assert!(perms.lock().await.showing.is_none(), "the card is retired");
+    }
+
+    /// A person answering within the grace wins: the timer fires later and
+    /// must be a no-op — exactly one resolution, the person's.
+    #[tokio::test]
+    async fn a_person_answering_within_the_grace_beats_the_policy() {
+        let grace = std::time::Duration::from_millis(200);
+        let state = unattended_state(grace);
+        let (agent, perms) = unattended_permission_harness(Arc::clone(&state)).await;
+
+        let shown = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(id) = perms.lock().await.showing.clone() {
+                    break id;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the card is shown");
+
+        resolve_permission(
+            &perms,
+            &state,
+            &EventEmitter::Noop,
+            shown,
+            "allow".to_string(),
+            PermissionAnswerOrigin::User,
+        )
+        .await;
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), agent)
+            .await
+            .expect("the person's answer reaches the agent")
+            .expect("agent task")
+            .expect("a response, not an error");
+        match response.outcome {
+            RequestPermissionOutcome::Selected(selected) => {
+                assert_eq!(selected.option_id.to_string(), "allow");
+            }
+            other => panic!("expected the selected option, got {other:?}"),
+        }
+
+        // Let the grace timer fire well past its deadline: it must resolve
+        // nothing (the request is gone) and report nothing.
+        tokio::time::sleep(grace * 3).await;
+        let guard = state.read().await;
+        let events = guard.recent_events_after(0).expect("events recorded");
+        let resolved: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.payload {
+                AcpEvent::PermissionResolved { origin, .. } => Some(origin.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            resolved,
+            vec![Some(PermissionAnswerOrigin::User)],
+            "the person's answer is the only one that took effect"
+        );
     }
 
     fn minimax_tool_call(id: &str, status: &str, raw_input: &str) -> AcpEvent {

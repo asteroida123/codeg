@@ -809,6 +809,13 @@ pub struct SessionState {
     /// spawned. `None` for every other connection. Never on the snapshot.
     pub cli_run: Option<crate::cli_run::CliRunTag>,
 
+    /// How this connection answers a permission request nobody is watching:
+    /// broker-owned delegation children and work-task runs only, decided at
+    /// spawn (`crate::acp::unattended::resolve`). `None` = a person's
+    /// connection (or a cli run whose own policy answers) — cards wait as
+    /// long as they always did. Never on the snapshot.
+    pub unattended_permissions: Option<crate::acp::unattended::UnattendedPermissions>,
+
     /// The `--output-schema` of the run whose ROOT connection this is: what
     /// codeg-mcp's `submit_result` takes, and what the agent handed in. In
     /// place from the moment the connection exists (`RootSeed`), so the
@@ -950,6 +957,7 @@ impl SessionState {
             held_wire_title: None,
             wire_title_wake: Arc::new(tokio::sync::Notify::new()),
             cli_run: None,
+            unattended_permissions: None,
             cli_output_schema: None,
             turn_status_claim: None,
         }
