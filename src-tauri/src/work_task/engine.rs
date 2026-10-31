@@ -1580,10 +1580,19 @@ impl TaskEngine {
         }
 
         let resume_session_id = anchor.as_ref().map(|a| a.external_session_id.as_str());
-        let runtime_env =
+        let mut runtime_env =
             build_session_runtime_env(&self.db, agent_type, resume_session_id, &self.data_dir)
                 .await
                 .map_err(|e| e.to_string())?;
+        // The card's effective model rides the ACP session settings, but the
+        // process resolves its model from the launch env — which still names
+        // the provider default. Align them, or a retry that changed the model
+        // (or a task that prechecks the env) relaunches on the stale default.
+        crate::commands::acp::apply_requested_model_env(
+            agent_type,
+            config_values.get("model").map(String::as_str),
+            &mut runtime_env,
+        );
         verify_agent_installed(agent_type)
             .await
             .map_err(|e| e.to_string())?;

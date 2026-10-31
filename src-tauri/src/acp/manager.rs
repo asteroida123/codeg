@@ -4835,7 +4835,7 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         // user-initiated session — disabled check, settings overrides,
         // model provider creds, git helper. Without this, delegated
         // subagents would skip the user's configuration entirely.
-        let runtime_env = crate::commands::acp::build_session_runtime_env(
+        let mut runtime_env = crate::commands::acp::build_session_runtime_env(
             &self.db,
             agent_type,
             None,
@@ -4843,6 +4843,14 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         )
         .await
         .map_err(|e| SpawnerError::Spawn(e.to_string()))?;
+        // Same layering as the work-task engine: the requested model must
+        // reach the launch env, not just the ACP session settings, or the
+        // process resolves the provider default instead.
+        crate::commands::acp::apply_requested_model_env(
+            agent_type,
+            preferred_config_values.get("model").map(String::as_str),
+            &mut runtime_env,
+        );
 
         let connection_id = self
             .manager
@@ -4909,7 +4917,7 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                     })
             })
             .transpose()?;
-        let runtime_env = crate::commands::acp::build_session_runtime_env(
+        let mut runtime_env = crate::commands::acp::build_session_runtime_env(
             &self.db,
             agent_type,
             None,
@@ -4917,6 +4925,11 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         )
         .await
         .map_err(|e| SpawnerError::Spawn(e.to_string()))?;
+        crate::commands::acp::apply_requested_model_env(
+            agent_type,
+            preferred_config_values.get("model").map(String::as_str),
+            &mut runtime_env,
+        );
         let (session_id, policy) = match resume_binding.as_ref() {
             Some(binding) => (
                 Some(binding.external_session_id.clone()),
@@ -5238,7 +5251,7 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         };
         let effective_working_dir = working_dir.or(parent_working_dir);
 
-        let runtime_env = crate::commands::acp::build_session_runtime_env(
+        let mut runtime_env = crate::commands::acp::build_session_runtime_env(
             &self.db,
             agent_type,
             None,
@@ -5246,6 +5259,11 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         )
         .await
         .map_err(|e| SpawnerError::Spawn(e.to_string()))?;
+        crate::commands::acp::apply_requested_model_env(
+            agent_type,
+            preferred_config_values.get("model").map(String::as_str),
+            &mut runtime_env,
+        );
 
         // A legacy same-id resume is still broker-owned. Carry the immutable
         // task id through the connection so late lifecycle events cannot infer
