@@ -935,11 +935,14 @@ fn report_err(
 /// `selectors` is the call's requested-vs-effective report — the ack is where
 /// drift first becomes visible to the caller ("you asked for model X, the child
 /// launched with Y"), so it rides the immediate response, not only later polls.
+/// `continuation_note` (continuations only) appends the child session's prior
+/// load so the caller can weigh another round on the same context.
 fn running_ack(
     call_id: String,
     child_conversation_id: i32,
     agent_type: AgentType,
     selectors: Option<DelegationSelectorReport>,
+    continuation_note: Option<String>,
 ) -> DelegationTaskReport {
     // Embed the literal task_id in the message so it survives clients that only
     // surface the MCP `content` text (not `structuredContent`) — without it the
@@ -947,7 +950,11 @@ fn running_ack(
     let message = format!(
         "Delegation successful. task_id={call_id}. Call get_delegation_status \
          with this id in the task_ids array (optionally wait_ms) to collect the \
-         result, or cancel_delegation to stop it."
+         result, or cancel_delegation to stop it.{continuation_suffix}",
+        continuation_suffix = continuation_note
+            .as_deref()
+            .map(|note| format!(" {note}"))
+            .unwrap_or_default(),
     );
     DelegationTaskReport {
         task_id: Some(call_id),
@@ -994,6 +1001,58 @@ fn launch_preferences(
 /// instructions — the cap (shared with the task-preview budget) keeps it
 /// from smuggling a task-sized payload past the "no new iterations" contract.
 const RESUME_REASON_CAP: usize = 2 * 1024;
+
+/// Prior rounds on one child session at which the continuation advisory turns
+/// from informational to a recommendation. Observed in the wild
+/// (2026-10-31, R31): a qoder child hit its ~167k context ceiling EIGHT times
+/// across seven rounds while the parent kept continuing it blind — the ledger
+/// held the load, but nothing surfaced it to the deciding LLM. Around five
+/// rounds most agents have auto-compacted at least twice; a fresh child plus
+/// a handoff note in the task text carries more usable context than that.
+const HEAVY_CHILD_SESSION_ROUNDS: u32 = 5;
+
+impl DelegationBroker {
+    /// One-line prior-load summary of a CONTINUED child session, for the
+    /// delegation ack (`running_ack`'s message). `None` when there is no
+    /// ledger DB (test broker) or the lookup fails — the note is advisory and
+    /// must never block or slow a dispatch beyond the one indexed query.
+    async fn child_session_note(
+        &self,
+        child_conversation_id: i32,
+        exclude_task_id: &str,
+    ) -> Option<String> {
+        let db = self.ledger_db.as_ref()?;
+        let load = crate::db::service::delegation_task_service::child_session_load(
+            &db.conn,
+            child_conversation_id,
+            exclude_task_id,
+        )
+        .await
+        .ok()?;
+        if load.prior_rounds == 0 {
+            return None;
+        }
+        let mut note = format!(
+            "This continues child session {child_conversation_id}, which has already served \
+             {} round(s) ({:.0}m of child time{}).",
+            load.prior_rounds,
+            load.prior_duration_ms as f64 / 60_000.0,
+            match load.prior_output_tokens {
+                Some(tokens) => format!(", ~{tokens} recorded output tokens"),
+                None => String::new(),
+            },
+        );
+        if load.prior_rounds >= HEAVY_CHILD_SESSION_ROUNDS {
+            note.push_str(
+                " That is a lot of carried context — the child will have auto-compacted at \
+                 least once, which loses detail. For a new phase of work prefer a fresh \
+                 child plus a handoff note in the task text; keep continuing only for \
+                 narrowly scoped follow-ups.",
+            );
+        }
+        Some(note)
+    }
+}
 
 /// The wire-stable `error_code` on every refused `resume_delegation` report.
 /// Distinct from the task's own status so the caller can tell "this task is
@@ -3833,11 +3892,20 @@ impl DelegationBroker {
 
         // Registered and running in the background — return the ack. The child
         // resolves later via the lifecycle → `complete_call` (or a cancel path).
+        // For a continuation, append the child session's prior load so the
+        // caller's NEXT continue-vs-fresh decision is informed (see
+        // `child_session_note`).
+        let continuation_note = if req.continue_from_task_id.is_some() {
+            self.child_session_note(child_conversation_id, &call_id).await
+        } else {
+            None
+        };
         running_ack(
             call_id,
             child_conversation_id,
             req.agent_type,
             selector_report,
+            continuation_note,
         )
         .with_assistant(identity.as_ref())
     }
@@ -11429,13 +11497,45 @@ mod tests {
     /// can still call get_delegation_status / cancel_delegation.
     #[test]
     fn running_ack_message_embeds_task_id() {
-        let report = running_ack("task-xyz".into(), 42, AgentType::Codex, None);
+        let report = running_ack("task-xyz".into(), 42, AgentType::Codex, None, None);
         assert_eq!(report.task_id.as_deref(), Some("task-xyz"));
         assert!(
-            report.message.as_deref().unwrap().contains("task-xyz"),
+            report
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("task_id=task-xyz"),
             "ack message must embed the literal task_id, got {:?}",
             report.message
         );
+    }
+
+    /// A continuation ack appends its advisory AFTER the task_id sentence, so
+    /// a client that greps the content for `task_id=` still finds it first —
+    /// and a caller reading on sees the load the child session carries.
+    #[test]
+    fn running_ack_continuation_note_appends_after_task_id_sentence() {
+        let report = running_ack(
+            "task-xyz".into(),
+            42,
+            AgentType::Codex,
+            None,
+            Some(
+                "This continues child session 42, which has already served 7 round(s) \
+                 (166m of child time)."
+                    .into(),
+            ),
+        );
+        let message = report.message.as_deref().unwrap();
+        let task_id_at = message.find("task_id=task-xyz").expect("task_id sentence");
+        let note_at = message
+            .find("This continues child session 42")
+            .expect("continuation note");
+        assert!(
+            note_at > task_id_at,
+            "note must follow the task_id sentence, got {message:?}"
+        );
+        assert!(message.ends_with('.'), "note sentence terminates cleanly");
     }
 
     /// Previews and cached text must stay within their advertised BYTE caps

@@ -522,6 +522,60 @@ fn continuation_eligible(entry: &TaskLedgerEntry) -> bool {
     ) && entry.released
 }
 
+/// Prior-work load of a CONTINUED child session: the aggregate of the ledger
+/// rounds that conversation already served, excluding the round being
+/// admitted (`exclude_task_id`). Powers the continuation advisory on the
+/// delegation ack — a session that has served many rounds carries a context
+/// the child must compact before new work fits, and the caller deciding
+/// `continue_from_task_id` vs a fresh child should see that cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildSessionLoad {
+    /// Prior rounds on this child conversation (the excluded round is not
+    /// counted), terminal or not — a canceled round's context is just as
+    /// carried as a completed one's.
+    pub prior_rounds: u32,
+    /// Combined wall time of those rounds, milliseconds. Rounds whose
+    /// `duration_ms` is still NULL contribute zero here.
+    pub prior_duration_ms: u64,
+    /// Sum of the recorded output tokens. `None` when NO prior round
+    /// recorded any — absent spend, never zero spend.
+    pub prior_output_tokens: Option<u64>,
+}
+
+/// Aggregate the ledger rounds a child conversation has already served,
+/// minus the one named by `exclude_task_id` (the continuation being
+/// admitted). See [`ChildSessionLoad`].
+pub async fn child_session_load(
+    conn: &DatabaseConnection,
+    child_conversation_id: i32,
+    exclude_task_id: &str,
+) -> Result<ChildSessionLoad, DbError> {
+    let rows = delegation_task::Entity::find()
+        .filter(delegation_task::Column::ChildConversationId.eq(child_conversation_id))
+        .filter(delegation_task::Column::TaskId.ne(exclude_task_id))
+        .all(conn)
+        .await?;
+    let mut load = ChildSessionLoad {
+        prior_rounds: 0,
+        prior_duration_ms: 0,
+        prior_output_tokens: None,
+    };
+    let mut tokens_seen = false;
+    let mut tokens_sum = 0u64;
+    for row in rows {
+        load.prior_rounds += 1;
+        load.prior_duration_ms += row.duration_ms.unwrap_or_default().max(0) as u64;
+        if let Some(tokens) = row.output_tokens {
+            tokens_seen = true;
+            tokens_sum += tokens.max(0) as u64;
+        }
+    }
+    if tokens_seen {
+        load.prior_output_tokens = Some(tokens_sum);
+    }
+    Ok(load)
+}
+
 /// Return the one successor reserved by `source_task_id`, if it is visible to
 /// the authorized parent.
 pub async fn successor(
@@ -2911,6 +2965,74 @@ mod tests {
         mark_released(&db.conn, parent, id)
             .await
             .expect("release chain link");
+    }
+
+    #[tokio::test]
+    async fn child_session_load_counts_prior_rounds_excluding_the_admitted_one() {
+        let db = fresh_in_memory_db().await;
+        let (parent, child) = conversations(&db).await;
+
+        // A: terminal WITH tokens (the only token-bearing round).
+        admit(&db.conn, input("a", parent, child, None, "chain start"))
+            .await
+            .expect("admit a");
+        let mut done = completed_report("a", child, 1_000);
+        done.token_usage = Some(TokenUsage {
+            input: 1_200,
+            output: 340,
+        });
+        assert!(
+            finish(&db.conn, parent, "a", &done)
+                .await
+                .expect("finish a")
+        );
+        mark_released(&db.conn, parent, "a")
+            .await
+            .expect("release a");
+
+        // B: rework of A, terminal, no tokens recorded.
+        admit(&db.conn, input("b", parent, child, Some("a"), "rework"))
+            .await
+            .expect("admit b");
+        assert!(
+            finish(&db.conn, parent, "b", &completed_report("b", child, 2_500))
+                .await
+                .expect("finish b")
+        );
+        mark_released(&db.conn, parent, "b")
+            .await
+            .expect("release b");
+
+        // C: the continuation being admitted, still running. Its own row must
+        // NOT be counted — the load describes what the session carried BEFORE
+        // this round.
+        admit(
+            &db.conn,
+            input("c", parent, child, Some("b"), "rework again"),
+        )
+        .await
+        .expect("admit c");
+
+        let load = child_session_load(&db.conn, child, "c")
+            .await
+            .expect("load");
+        assert_eq!(load.prior_rounds, 2, "A and B, not the running C");
+        assert_eq!(
+            load.prior_duration_ms, 3_500,
+            "durations of the prior rounds combine"
+        );
+        assert_eq!(
+            load.prior_output_tokens,
+            Some(340),
+            "recorded tokens sum; the token-less round adds nothing but does not zero the sum"
+        );
+
+        // A round on a DIFFERENT child conversation must not leak in.
+        let other = child_session_load(&db.conn, child + 999, "c")
+            .await
+            .expect("load");
+        assert_eq!(other.prior_rounds, 0);
+        assert_eq!(other.prior_output_tokens, None);
     }
 
     #[tokio::test]
