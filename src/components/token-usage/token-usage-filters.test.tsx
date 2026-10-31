@@ -9,7 +9,7 @@ import { useState } from "react"
 import { render, screen, waitFor } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { NextIntlClientProvider } from "next-intl"
-import { describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import enMessages from "@/i18n/messages/en.json"
 import { toLocalDayValue } from "@/lib/token-usage"
 import { CustomRangeFields } from "./token-usage-filters"
@@ -57,6 +57,26 @@ function renderLive(from = "", to = "") {
 const pill = () => screen.getByRole("button", { name: "Pick a date range" })
 const calendarOpen = () =>
   document.querySelector("[data-slot=calendar]") != null
+
+/**
+ * Every assertion in this file is about calendar days, and the calendar only
+ * paints [last month, this month]. Read off the wall clock, "tomorrow" is off
+ * those panes on the last day of a month, and last month's 20th is a future —
+ * hence disabled — day in January: the same test would pass or fail depending
+ * on when it runs. Pinning the clock mid-month keeps today, tomorrow and all of
+ * last month on the visible panes, always.
+ */
+const NOW = new Date(2026, 2, 15, 12, 0, 0)
+
+beforeEach(() => {
+  // Only `Date` is faked: `waitFor` and user-event need real timers to advance.
+  vi.useFakeTimers({ toFake: ["Date"] })
+  vi.setSystemTime(NOW)
+})
+
+afterEach(() => {
+  vi.useRealTimers()
+})
 
 /**
  * A day cell of the open calendar, by `data-day` — `CalendarDayButton` stamps

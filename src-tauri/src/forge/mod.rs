@@ -1868,7 +1868,7 @@ pub(crate) fn http_client() -> Result<reqwest::Client, ForgeError> {
             }
         }
     }
-    let client = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
         // Redirects are followed only WITHIN one origin. reqwest strips
@@ -1887,7 +1887,19 @@ pub(crate) fn http_client() -> Result<reqwest::Client, ForgeError> {
             } else {
                 attempt.follow()
             }
-        }))
+        }));
+    // The client, and with it the connection pool, is process-wide — but every
+    // test drives its own short-lived runtime. An idle pooled connection is
+    // evicted by a timer owned by the runtime that opened it, so when that
+    // runtime is dropped (the end of every `#[tokio::test]`) the timer dies
+    // with it and the socket, plus the kqueue registered for it, stays open for
+    // the rest of the binary. A few hundred forge tests are then enough to walk
+    // the process past the platform fd limit (macOS: 256) and make unrelated
+    // tests fail spawning a process with EMFILE. No test can reuse one of these
+    // connections anyway: each points at a mock server that is already gone.
+    #[cfg(test)]
+    let builder = builder.pool_max_idle_per_host(0);
+    let client = builder
         .build()
         .map_err(|e| ForgeError::Network(format!("http client build failed: {e}")))?;
     if let Ok(mut guard) = HTTP_CLIENT.write() {
