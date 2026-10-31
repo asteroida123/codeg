@@ -34,6 +34,8 @@ function bucket(overrides: Record<string, unknown> = {}) {
     avg_duration_ms: null,
     input_tokens: 0,
     output_tokens: 0,
+    cache_creation_tokens: 0,
+    cache_read_tokens: 0,
     reworked: 0,
     rework_rate: 0,
     ...overrides,
@@ -98,6 +100,69 @@ describe("DelegationPerformancePanel", () => {
     // Model buckets keep their raw ids; the NULL bucket is labelled.
     expect(screen.getByText("gpt-6")).toBeInTheDocument()
     expect(screen.getByText("Not recorded")).toBeInTheDocument()
+  })
+
+  it("counts cache read/write tokens in the headline total", async () => {
+    mockGet.mockResolvedValue({
+      totals: bucket({
+        key: null,
+        task_count: 1,
+        completed: 1,
+        success_rate: 1,
+        avg_duration_ms: 1200,
+        cache_creation_tokens: 200,
+        cache_read_tokens: 300,
+      }),
+      by_agent: [
+        bucket({
+          key: "claude_code",
+          task_count: 1,
+          completed: 1,
+          success_rate: 1,
+          cache_creation_tokens: 200,
+          cache_read_tokens: 300,
+        }),
+      ],
+      by_model: [],
+    })
+    renderWithIntl()
+
+    await waitFor(() =>
+      expect(screen.getByText("By agent")).toBeInTheDocument()
+    )
+    // input/output are zero, but the cache split is real spend: 200 + 300 in
+    // both the totals strip and the agent row.
+    expect(screen.getAllByText("500")).toHaveLength(2)
+  })
+
+  it("shows — when all four token counters are zero", async () => {
+    mockGet.mockResolvedValue({
+      totals: bucket({
+        key: null,
+        task_count: 1,
+        completed: 1,
+        success_rate: 1,
+        avg_duration_ms: 1200,
+      }),
+      by_agent: [
+        bucket({
+          key: "codex",
+          task_count: 1,
+          completed: 1,
+          success_rate: 1,
+          avg_duration_ms: 1200,
+        }),
+      ],
+      by_model: [],
+    })
+    renderWithIntl()
+
+    await waitFor(() =>
+      expect(screen.getByText("By agent")).toBeInTheDocument()
+    )
+    // Totals + the one agent row; duration is known, so these are the only
+    // "unknown token" placeholders on screen.
+    expect(screen.getAllByText("—")).toHaveLength(2)
   })
 
   it("surfaces a load failure in place", async () => {

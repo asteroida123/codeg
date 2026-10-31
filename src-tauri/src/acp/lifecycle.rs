@@ -307,7 +307,7 @@ pub(crate) async fn handle_event(
             else {
                 return Ok(());
             };
-            let (conversation_id, last_text, claimed) = {
+            let (conversation_id, last_text, turns_completed, claimed) = {
                 let mut snap = state_arc.write().await;
                 // Re-entrant for this worker: a retry of this same envelope
                 // claims again and goes on. Only a CLI run's fallback that
@@ -316,6 +316,7 @@ pub(crate) async fn handle_event(
                 (
                     snap.conversation_id,
                     snap.last_assistant_text.clone(),
+                    snap.turns_completed,
                     claimed,
                 )
             };
@@ -367,6 +368,7 @@ pub(crate) async fn handle_event(
                     delegation_task_id.as_deref(),
                     stop_reason.as_str(),
                     last_text,
+                    turns_completed,
                 )
                 .await;
             }
@@ -482,6 +484,7 @@ async fn forward_turn_complete_to_broker(
     execution_task_id: Option<&str>,
     stop_reason: &str,
     last_text: Option<String>,
+    turns_completed: u64,
 ) {
     let row = match conversation_service::get_by_id(db_conn, conversation_id).await {
         Ok(r) => r,
@@ -511,7 +514,20 @@ async fn forward_turn_complete_to_broker(
             text: last_text.unwrap_or_default(),
             child_conversation_id: conversation_id,
             child_agent_type: agent_type,
-            turn_count: 1,
+            // Counted by `SessionState`, which increments on this same
+            // TurnComplete edge. A one-shot delegation child reports the turns
+            // it actually ran instead of the placeholder 1 (a zero here would
+            // mean the counter lagged the event, so keep a floor of one).
+            //
+            // CAVEAT: this is the count for the whole session state, which for
+            // a REUSED child can include turns from earlier tasks. The ledger's
+            // token columns are a different scope — facts inside this task's
+            // admission window (`delegation_task_service::fill_metrics_from_
+            // token_facts`). Do not read `turn_count` as "turns this task
+            // spent tokens in" on a resumed child; it can be larger, and the
+            // per-task usage-bearing count lives in `TaskTokenFacts::turn_count`
+            // when it is needed.
+            turn_count: turns_completed.max(1).min(u32::MAX as u64) as u32,
             duration_ms: 0,
             token_usage: None,
         }),

@@ -5662,6 +5662,9 @@ export interface DelegationDimensionStats {
   avg_duration_ms: number | null
   input_tokens: number
   output_tokens: number
+  /** Prompt-cache counters, same NULL/zero rule as the two above. */
+  cache_creation_tokens: number
+  cache_read_tokens: number
   /** Terminal tasks that a successor continued (rework rounds). */
   reworked: number
   /** reworked / terminal rows; 0 when nothing finished yet. */

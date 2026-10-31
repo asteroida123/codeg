@@ -870,6 +870,25 @@ async fn delegation_performance_reports_ledger_rows_over_http() {
     )
     .await
     .expect("admit");
+    // The terminal report carries no usage; the dashboard's numbers come from
+    // the child's materialized token facts, summed by the freeze path.
+    codeg_lib::db::service::token_usage_service::replace_conversation_facts(
+        &conn,
+        child.id,
+        chrono::Utc::now(),
+        &[codeg_lib::db::service::token_usage_service::UsageFact {
+            turn_key: "turn-1".into(),
+            occurred_at: chrono::Utc::now(),
+            model: Some("gpt-6-astra".into()),
+            input_tokens: 1_000,
+            output_tokens: 250,
+            cache_creation_tokens: 300,
+            cache_read_tokens: 400,
+            duration_ms: 10,
+        }],
+    )
+    .await
+    .expect("seed usage facts");
     let report = DelegationTaskReport {
         assistant_id: None,
         assistant_name: None,
@@ -885,7 +904,18 @@ async fn delegation_performance_reports_ledger_rows_over_http() {
         turn_count: Some(2),
         token_usage: None,
         blocked_on: None,
-        selectors: None,
+        // Default-model call: nothing requested, but the admission snapshot
+        // still names what ran.
+        selectors: Some(codeg_lib::acp::delegation::types::DelegationSelectorReport {
+            requested: Default::default(),
+            effective: Some(codeg_lib::acp::delegation::types::AppliedSelectors {
+                mode: Some("default".into()),
+                config_values: std::collections::BTreeMap::from([(
+                    "model".to_string(),
+                    "gpt-6-astra".to_string(),
+                )]),
+            }),
+        }),
     };
     assert!(
         delegation_task_service::finish(&conn, parent.id, "t0", &report)
@@ -905,8 +935,94 @@ async fn delegation_performance_reports_ledger_rows_over_http() {
     assert_eq!(body["totals"]["success_rate"], 1.0);
     assert_eq!(body["totals"]["rework_rate"], 0.0);
     assert_eq!(body["totals"]["avg_duration_ms"], 1_234.0);
+    // Tokens come from the child's usage facts (report carried none), cache
+    // split included.
+    assert_eq!(body["totals"]["input_tokens"], 1_000);
+    assert_eq!(body["totals"]["output_tokens"], 250);
+    assert_eq!(body["totals"]["cache_creation_tokens"], 300);
+    assert_eq!(body["totals"]["cache_read_tokens"], 400);
     assert_eq!(body["by_agent"][0]["key"], "codex");
     assert_eq!(body["by_agent"][0]["task_count"], 1);
+    // The default-model call recorded the effective model from its snapshot.
+    assert_eq!(body["by_model"][0]["key"], "gpt-6-astra");
+    assert_eq!(body["by_model"][0]["task_count"], 1);
+}
+
+/// No usage facts is UNKNOWN, not zero: the dashboard keeps its "not recorded"
+/// bucket and a zero total rather than inventing spend.
+#[tokio::test]
+async fn delegation_performance_without_usage_stays_unknown() {
+    use codeg_lib::acp::delegation::types::{DelegationTaskReport, TaskStatus};
+    use codeg_lib::db::service::{conversation_service, delegation_task_service, folder_service};
+    use codeg_lib::models::AgentType;
+
+    let (server, _data, _static, conn) = build_test_server_with_db().await;
+    let folder = folder_service::add_folder(&conn, "/workspace/no-usage")
+        .await
+        .expect("folder");
+    let parent = conversation_service::create(&conn, folder.id, AgentType::ClaudeCode, None, None)
+        .await
+        .expect("parent");
+    let child = conversation_service::create(&conn, folder.id, AgentType::Codex, None, None)
+        .await
+        .expect("child");
+    delegation_task_service::admit(
+        &conn,
+        delegation_task_service::AdmissionInput {
+            task_id: "n0".into(),
+            parent_conversation_id: parent.id,
+            child_conversation_id: child.id,
+            source_task_id: None,
+            task: "no usage".into(),
+            requested_working_dir: None,
+            resume_binding: delegation_task_service::ResumeBinding {
+                agent_type: AgentType::Codex,
+                external_session_id: "session-n".into(),
+                child_conversation_id: child.id,
+                working_dir: "/workspace/no-usage".into(),
+                preferred_mode_id: None,
+                preferred_config_values: Default::default(),
+                config_fingerprint: "fingerprint-n".into(),
+            },
+            work_task_id: None,
+        },
+    )
+    .await
+    .expect("admit");
+    let report = DelegationTaskReport {
+        assistant_id: None,
+        assistant_name: None,
+        progress: None,
+        task_id: Some("n0".into()),
+        status: TaskStatus::Completed,
+        child_conversation_id: Some(child.id),
+        agent_type: Some(AgentType::Codex),
+        text: Some("done".into()),
+        error_code: None,
+        message: None,
+        duration_ms: Some(10),
+        turn_count: Some(1),
+        token_usage: None,
+        blocked_on: None,
+        selectors: None,
+    };
+    assert!(
+        delegation_task_service::finish(&conn, parent.id, "n0", &report)
+            .await
+            .expect("finish")
+    );
+
+    let resp = server
+        .post("/api/get_delegation_performance")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({}))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: Value = resp.json();
+    assert_eq!(body["totals"]["input_tokens"], 0);
+    assert_eq!(body["totals"]["output_tokens"], 0);
+    assert_eq!(body["totals"]["cache_creation_tokens"], 0);
+    assert_eq!(body["totals"]["cache_read_tokens"], 0);
     assert_eq!(body["by_model"][0]["key"], Value::Null);
 }
 

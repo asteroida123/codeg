@@ -1909,8 +1909,10 @@ impl DelegationBroker {
 
     /// Validate one call's [`SelectorPreferences`] against the capability
     /// catalog and map the accepted values onto the launch-preference
-    /// pipeline. Empty preferences short-circuit to `Ok(None)` without
-    /// touching the catalog — the pre-feature path costs nothing.
+    /// pipeline. Empty preferences skip the catalog — the pre-feature path
+    /// costs nothing — but still return an EMPTY report: the spawner attaches
+    /// the child's effective snapshot to every report, and dropping the report
+    /// here is what used to lose the model for default-model calls.
     ///
     /// Three-state rule (mirrors [`check_selector`], which this applies per
     /// field): a KNOWN list accepts the value or hard-rejects it as a typo
@@ -1936,7 +1938,14 @@ impl DelegationBroker {
         preferred_config_values: &mut BTreeMap<String, String>,
     ) -> Result<Option<DelegationSelectorReport>, DelegationError> {
         if selectors.is_empty() {
-            return Ok(None);
+            // Nothing to validate or apply, but the report must survive: the
+            // caller always asks for the agent's default model, and the
+            // effective snapshot attached after spawn is how the ledger learns
+            // which model that default was.
+            return Ok(Some(DelegationSelectorReport {
+                requested: selectors.clone(),
+                effective: None,
+            }));
         }
         let slug = agent_type.as_wire().to_string();
         let report = self.capabilities.resolve(Some(&slug)).await;
@@ -7356,10 +7365,13 @@ mod tests {
         );
     }
 
-    /// Calls without selectors keep byte-identical reports: no `selectors`
-    /// field on the ack, the running entry, or the completed entry.
+    /// Calls without selectors still carry an EMPTY selector report: the
+    /// spawner attaches the child's effective snapshot after launch, and that
+    /// snapshot is what tells the ledger which default model ran. With no
+    /// snapshot the report is all-empty and serializes without an `effective`
+    /// half.
     #[tokio::test]
-    async fn selectorless_calls_report_no_selectors_field() {
+    async fn selectorless_calls_report_an_empty_requested_selector() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-plain".into())).await;
         mock.queue_send(Ok(7)).await;
@@ -7369,7 +7381,9 @@ mod tests {
         enable_delegation(&broker).await;
 
         let ack = broker.start_delegation(request(1, "pt-plain")).await;
-        assert!(ack.selectors.is_none());
+        let selectors = ack.selectors.as_ref().expect("empty report still travels");
+        assert!(selectors.requested.is_empty());
+        assert!(selectors.effective.is_none());
         let task_id = ack.task_id.clone().unwrap();
         broker
             .complete_call(
@@ -7387,9 +7401,49 @@ mod tests {
         let report = broker
             .get_task_status("parent-conn", Some(1), &task_id, StatusWait::Immediate)
             .await;
-        assert!(report.selectors.is_none());
+        let selectors = report.selectors.as_ref().expect("status keeps the report");
+        assert!(selectors.requested.is_empty());
+        assert!(selectors.effective.is_none());
         let rendered = serde_json::to_value(&report).unwrap();
-        assert!(rendered.get("selectors").is_none());
+        assert_eq!(rendered["selectors"]["requested"], serde_json::json!({}));
+        assert!(rendered["selectors"].get("effective").is_none());
+    }
+
+    /// The default-model case that used to lose the model entirely: the caller
+    /// requests nothing, but the spawner's admission snapshot names what
+    /// actually launched. The report must carry it, or `by_model` can never
+    /// leave the "not recorded" bucket.
+    #[tokio::test]
+    async fn default_model_call_still_carries_the_effective_snapshot() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-default".into())).await;
+        mock.queue_send_with_effective(
+            7,
+            Some(crate::acp::delegation::types::AppliedSelectors {
+                mode: Some("default".into()),
+                config_values: BTreeMap::from([(
+                    "model".to_string(),
+                    "claude-opus-4-6".to_string(),
+                )]),
+            }),
+        )
+        .await;
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup())
+                .with_capability_catalog(Arc::new(StubCapabilities(vec![claude_caps()])));
+        enable_delegation(&broker).await;
+
+        let ack = broker
+            .start_delegation(selector_request(SelectorPreferences::default()))
+            .await;
+        assert_eq!(ack.status, TaskStatus::Running);
+        let selectors = ack.selectors.as_ref().expect("report travels for defaults");
+        assert!(selectors.requested.is_empty());
+        let effective = selectors.effective.as_ref().expect("snapshot attached");
+        assert_eq!(
+            effective.config_values.get("model").map(String::as_str),
+            Some("claude-opus-4-6")
+        );
     }
 
     /// The ledger half of the feature: a continuation spawns with EXACTLY the

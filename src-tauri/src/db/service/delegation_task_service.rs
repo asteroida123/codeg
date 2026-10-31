@@ -17,6 +17,7 @@ use sea_orm::{
 use crate::acp::delegation::types::{DelegationTaskReport, TaskStatus};
 use crate::db::entities::{conversation, delegation_task, folder};
 use crate::db::error::DbError;
+use crate::db::service::token_usage_service;
 use crate::models::AgentType;
 
 /// The session identity and selector preferences captured for a child execution.
@@ -264,6 +265,8 @@ async fn admit_on<C: ConnectionTrait>(
         turn_count: Set(None),
         input_tokens: Set(None),
         output_tokens: Set(None),
+        cache_creation_tokens: Set(None),
+        cache_read_tokens: Set(None),
         effective_model: Set(None),
         effective_mode: Set(None),
         effective_reasoning_level: Set(None),
@@ -559,6 +562,8 @@ pub async fn source(
 /// The report's queryable metrics (`error_code`, `duration_ms`, `turn_count`,
 /// token counts, effective selectors) are extracted into columns by the SAME
 /// statement that writes the `terminal_report` JSON — one write, no drift.
+/// Metrics the report does not carry are filled from the child's usage facts on
+/// that same write (see [`fill_metrics_from_token_facts`]); unknown stays NULL.
 pub async fn finish(
     conn: &DatabaseConnection,
     parent_conversation_id: i32,
@@ -571,7 +576,8 @@ pub async fn finish(
     validate_terminal_report(task_id, report, &row)?;
     let terminal_report = serde_json::to_string(report)
         .map_err(|e| DbError::Validation(format!("cannot serialize terminal report: {e}")))?;
-    let extracted = report_metrics(report);
+    let mut extracted = report_metrics(report);
+    fill_metrics_from_token_facts(conn, &row, &mut extracted).await;
     let result = delegation_task::Entity::update_many()
         .col_expr(
             delegation_task::Column::Status,
@@ -602,6 +608,14 @@ pub async fn finish(
             sea_orm::sea_query::Expr::value(extracted.output_tokens),
         )
         .col_expr(
+            delegation_task::Column::CacheCreationTokens,
+            sea_orm::sea_query::Expr::value(extracted.cache_creation_tokens),
+        )
+        .col_expr(
+            delegation_task::Column::CacheReadTokens,
+            sea_orm::sea_query::Expr::value(extracted.cache_read_tokens),
+        )
+        .col_expr(
             delegation_task::Column::EffectiveModel,
             sea_orm::sea_query::Expr::value(extracted.effective_model),
         )
@@ -625,14 +639,17 @@ pub async fn finish(
     Ok(result.rows_affected == 1)
 }
 
-/// The dashboard's queryable projection of a terminal report. Field-for-field
-/// the same values the JSON blob carries — never anything the report doesn't.
+/// The dashboard's queryable projection of a terminal report, plus the facts
+/// the report cannot carry (cache split) and the model fallback. Report-carried
+/// values always win; see [`fill_metrics_from_token_facts`].
 struct ReportMetrics {
     error_code: Option<String>,
     duration_ms: Option<i64>,
     turn_count: Option<i32>,
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
+    cache_creation_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
     effective_model: Option<String>,
     effective_mode: Option<String>,
     effective_reasoning_level: Option<String>,
@@ -651,12 +668,137 @@ fn report_metrics(report: &DelegationTaskReport) -> ReportMetrics {
         error_code: report.error_code.clone(),
         duration_ms: report.duration_ms.map(|d| d as i64),
         turn_count: report.turn_count.map(|t| t as i32),
-        input_tokens: report.token_usage.as_ref().map(|u| u.input as i64),
-        output_tokens: report.token_usage.as_ref().map(|u| u.output as i64),
-        effective_model: effective.and_then(|e| e.config_values.get(MODEL_OPTION).cloned()),
+        // A zero here is "nothing observed", not a real count; let the token
+        // facts below fill it in. The dashboard treats NULL as unknown.
+        input_tokens: report
+            .token_usage
+            .as_ref()
+            .map(|u| u.input as i64)
+            .filter(|n| *n > 0),
+        output_tokens: report
+            .token_usage
+            .as_ref()
+            .map(|u| u.output as i64)
+            .filter(|n| *n > 0),
+        // The report itself carries no cache split yet; the ledger fills these
+        // from the token facts below.
+        cache_creation_tokens: None,
+        cache_read_tokens: None,
+        effective_model: effective
+            .and_then(|e| e.config_values.get(MODEL_OPTION).cloned())
+            .filter(|m| !m.trim().is_empty()),
         effective_mode: effective.and_then(|e| e.mode.clone()),
         effective_reasoning_level: effective
             .and_then(|e| e.config_values.get(REASONING_OPTION).cloned()),
+    }
+}
+
+/// Fill the metrics the terminal report could not supply, from the child's
+/// materialized token facts and conversation row.
+///
+/// The report is often thin: [`crate::acp::lifecycle`] has no per-turn usage at
+/// child TurnComplete, so `token_usage` stays absent. The token sync pipeline
+/// materializes the child's `token_usage_turn` rows separately; reading them
+/// here is the only way the ledger learns the real spend.
+///
+/// Rules that keep this honest:
+///   * the window starts at ADMISSION (`row.created_at`) — a reused child's
+///     previous tasks' turns must not be charged to this one;
+///   * a missing/empty/failed query leaves the column NULL, never 0;
+///   * a value the report DID carry wins — the report is the more direct
+///     observation of the child run.
+///
+/// This path only reads what the dashboard pipeline has already materialized;
+/// it never parses a transcript itself.
+async fn fill_metrics_from_token_facts(
+    conn: &DatabaseConnection,
+    row: &TaskLedgerEntry,
+    metrics: &mut ReportMetrics,
+) {
+    if let Some(facts) = read_task_token_facts(conn, row).await {
+        apply_task_facts(metrics, facts);
+    }
+
+    // The admission snapshot can be missing (a default-model call, an agent
+    // that publishes no config options, a snapshot read failure). Fall back to
+    // what the conversation row or its latest usage turn names, in that order.
+    if metrics.effective_model.is_none() {
+        metrics.effective_model = child_model_fallback(conn, row.child_conversation_id).await;
+    }
+}
+
+/// One conversation's facts for THIS task's window, or `None` on "unknown".
+async fn read_task_token_facts(
+    conn: &DatabaseConnection,
+    row: &TaskLedgerEntry,
+) -> Option<token_usage_service::TaskTokenFacts> {
+    match token_usage_service::task_token_facts(
+        conn,
+        row.child_conversation_id,
+        row.created_at,
+        Utc::now(),
+    )
+    .await
+    {
+        Ok(facts) => facts,
+        Err(error) => {
+            tracing::warn!(
+                task_id = row.task_id,
+                conversation_id = row.child_conversation_id,
+                %error,
+                "[delegation] token facts unavailable when freezing metrics"
+            );
+            None
+        }
+    }
+}
+
+/// Fold the facts in without overwriting anything the report already observed.
+fn apply_task_facts(
+    metrics: &mut ReportMetrics,
+    facts: token_usage_service::TaskTokenFacts,
+) {
+    metrics.input_tokens = metrics.input_tokens.or(Some(facts.input_tokens));
+    metrics.output_tokens = metrics.output_tokens.or(Some(facts.output_tokens));
+    metrics.cache_creation_tokens = Some(facts.cache_creation_tokens);
+    metrics.cache_read_tokens = Some(facts.cache_read_tokens);
+    // A failed/canceled report has no turn count; the usage-bearing turns are
+    // still a truthful lower bound.
+    //
+    // Scope note: a report-carried value (the normal path) comes from
+    // `SessionState.turns_completed` and counts the whole session state — on a
+    // REUSED child that includes earlier tasks' turns, while the token columns
+    // beside it are windowed to this task. The two are therefore not the same
+    // unit on a resumed child, and the report value is deliberately left
+    // untouched (it is what the run itself observed). Only this fallback, used
+    // when the report carried none, is already window-scoped.
+    metrics.turn_count = metrics
+        .turn_count
+        .or_else(|| i32::try_from(facts.turn_count).ok());
+}
+
+async fn child_model_fallback(conn: &DatabaseConnection, conversation_id: i32) -> Option<String> {
+    let from_row = conversation::Entity::find_by_id(conversation_id)
+        .one(conn)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| row.model)
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty());
+    if from_row.is_some() {
+        return from_row;
+    }
+    match token_usage_service::latest_model_for_conversation(conn, conversation_id).await {
+        Ok(model) => model,
+        Err(error) => {
+            tracing::warn!(
+                conversation_id,
+                %error,
+                "[delegation] model fallback from token facts failed"
+            );
+            None
+        }
     }
 }
 
@@ -785,6 +927,10 @@ pub struct DelegationDimensionStats {
     /// contribute nothing rather than zero.
     pub input_tokens: i64,
     pub output_tokens: i64,
+    /// Cache split, same NULL/zero rule as the two counters above. Without
+    /// these a Claude/CodeBuddy task's total would miss most of its real cost.
+    pub cache_creation_tokens: i64,
+    pub cache_read_tokens: i64,
     /// Terminal tasks in the bucket that a successor continued.
     pub reworked: u64,
     pub rework_rate: f64,
@@ -815,6 +961,8 @@ struct MetricsRow {
     duration_ms: Option<i64>,
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
+    cache_creation_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
     effective_model: Option<String>,
 }
 
@@ -832,6 +980,8 @@ struct Bucket {
     duration_count: u64,
     input_tokens: i64,
     output_tokens: i64,
+    cache_creation_tokens: i64,
+    cache_read_tokens: i64,
     reworked: u64,
 }
 
@@ -851,6 +1001,8 @@ impl Bucket {
         }
         self.input_tokens += row.input_tokens.unwrap_or(0);
         self.output_tokens += row.output_tokens.unwrap_or(0);
+        self.cache_creation_tokens += row.cache_creation_tokens.unwrap_or(0);
+        self.cache_read_tokens += row.cache_read_tokens.unwrap_or(0);
         if terminal && reworked {
             self.reworked += 1;
         }
@@ -871,6 +1023,8 @@ impl Bucket {
                 .then(|| self.duration_sum / self.duration_count as f64),
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
+            cache_read_tokens: self.cache_read_tokens,
             reworked: self.reworked,
             rework_rate: rate(self.reworked, terminal),
         }
@@ -902,6 +1056,8 @@ pub async fn performance_report(
         .column(delegation_task::Column::DurationMs)
         .column(delegation_task::Column::InputTokens)
         .column(delegation_task::Column::OutputTokens)
+        .column(delegation_task::Column::CacheCreationTokens)
+        .column(delegation_task::Column::CacheReadTokens)
         .column(delegation_task::Column::EffectiveModel)
         .into_model::<MetricsRow>()
         .all(conn)
@@ -2172,6 +2328,45 @@ mod tests {
             .expect("row exists")
     }
 
+    /// Materialize one turn in `token_usage_turn` exactly as the token sync
+    /// pipeline would (same service call, same stamp), so the freeze path sees
+    /// production-shaped facts.
+    async fn seed_usage(
+        conn: &DatabaseConnection,
+        conversation_id: i32,
+        facts: Vec<crate::db::service::token_usage_service::UsageFact>,
+    ) {
+        crate::db::service::token_usage_service::replace_conversation_facts(
+            conn,
+            conversation_id,
+            Utc::now(),
+            &facts,
+        )
+        .await
+        .expect("seed token facts");
+    }
+
+    fn usage_fact(
+        turn_key: &str,
+        occurred_at: DateTime<Utc>,
+        model: Option<&str>,
+        input: i64,
+        output: i64,
+        cache_creation: i64,
+        cache_read: i64,
+    ) -> crate::db::service::token_usage_service::UsageFact {
+        crate::db::service::token_usage_service::UsageFact {
+            turn_key: turn_key.into(),
+            occurred_at,
+            model: model.map(str::to_owned),
+            input_tokens: input,
+            output_tokens: output,
+            cache_creation_tokens: cache_creation,
+            cache_read_tokens: cache_read,
+            duration_ms: 0,
+        }
+    }
+
     /// `finish` must extract every queryable metric from the report in the
     /// same statement that freezes the JSON — the columns and the blob can
     /// never disagree.
@@ -2187,6 +2382,23 @@ mod tests {
         let admitted = metrics_row(&db.conn, "t0").await;
         assert_eq!(admitted.agent_type.as_deref(), Some("codex"));
         assert!(admitted.duration_ms.is_none());
+
+        // The report has no cache split; the child's materialized facts do.
+        // Report-carried input/output keep precedence over the facts.
+        seed_usage(
+            &db.conn,
+            child,
+            vec![usage_fact(
+                "turn-1",
+                Utc::now(),
+                Some("gpt-6-astra"),
+                999,
+                111,
+                222,
+                333,
+            )],
+        )
+        .await;
 
         let mut done = report("t0", child, "done", TaskStatus::Completed);
         done.duration_ms = Some(1_500);
@@ -2217,9 +2429,127 @@ mod tests {
         assert_eq!(row.turn_count, Some(4));
         assert_eq!(row.input_tokens, Some(1_200));
         assert_eq!(row.output_tokens, Some(340));
+        assert_eq!(row.cache_creation_tokens, Some(222));
+        assert_eq!(row.cache_read_tokens, Some(333));
         assert_eq!(row.effective_model.as_deref(), Some("gpt-6-astra"));
         assert_eq!(row.effective_mode.as_deref(), Some("full-auto"));
         assert_eq!(row.effective_reasoning_level.as_deref(), Some("high"));
+    }
+
+    /// The token pipeline is where a delegation's real spend lives; the
+    /// terminal report carries none. The freeze path must sum the child's
+    /// facts INSIDE the task window only — a reused child's earlier turns are
+    /// a different task's cost.
+    #[tokio::test]
+    async fn finish_fills_tokens_and_cache_from_child_facts_inside_the_task_window() {
+        let db = fresh_in_memory_db().await;
+        let (parent, child) = conversations(&db).await;
+        admit(&db.conn, input("t0", parent, child, None, "work"))
+            .await
+            .expect("admit");
+
+        let now = Utc::now();
+        seed_usage(
+            &db.conn,
+            child,
+            vec![
+                // Pre-admission history of a reused child: must not count.
+                usage_fact("old", now - chrono::Duration::hours(1), Some("old"), 5_000, 500, 0, 0),
+                usage_fact("turn-1", now, Some("gpt-6"), 700, 100, 200, 300),
+                usage_fact("turn-2", now, Some("gpt-6"), 300, 100, 100, 100),
+            ],
+        )
+        .await;
+
+        let done = report("t0", child, "done", TaskStatus::Completed);
+        assert!(finish(&db.conn, parent, "t0", &done).await.expect("finish"));
+
+        let row = metrics_row(&db.conn, "t0").await;
+        assert_eq!(row.input_tokens, Some(1_000));
+        assert_eq!(row.output_tokens, Some(200));
+        assert_eq!(row.cache_creation_tokens, Some(300));
+        assert_eq!(row.cache_read_tokens, Some(400));
+        assert_eq!(row.turn_count, Some(2), "usage-bearing turns in the window");
+    }
+
+    /// No facts (or a zero-only row) is UNKNOWN, not zero: the dashboard must
+    /// keep rendering "—" rather than a confident 0.
+    #[tokio::test]
+    async fn finish_keeps_tokens_null_when_child_facts_are_empty() {
+        let db = fresh_in_memory_db().await;
+        let (parent, child) = conversations(&db).await;
+        admit(&db.conn, input("t0", parent, child, None, "work"))
+            .await
+            .expect("admit");
+        seed_usage(
+            &db.conn,
+            child,
+            vec![usage_fact("zero", Utc::now(), None, 0, 0, 0, 0)],
+        )
+        .await;
+
+        let done = report("t0", child, "done", TaskStatus::Completed);
+        assert!(finish(&db.conn, parent, "t0", &done).await.expect("finish"));
+
+        let row = metrics_row(&db.conn, "t0").await;
+        assert_eq!(row.input_tokens, None);
+        assert_eq!(row.output_tokens, None);
+        assert_eq!(row.cache_creation_tokens, None);
+        assert_eq!(row.cache_read_tokens, None);
+    }
+
+    /// Default-model calls carry no effective selectors; the conversation row
+    /// is the first fallback, the latest usage turn the second.
+    #[tokio::test]
+    async fn finish_falls_back_to_conversation_then_usage_model() {
+        let db = fresh_in_memory_db().await;
+        let (parent, child) = conversations(&db).await;
+        admit(&db.conn, input("row-model", parent, child, None, "work"))
+            .await
+            .expect("admit");
+        conversation_service::seed_model_if_empty(&db.conn, child, "claude-opus-4-6")
+            .await
+            .expect("seed conversation model");
+        seed_usage(
+            &db.conn,
+            child,
+            vec![usage_fact("turn-1", Utc::now(), Some("claude-sonnet-4-5"), 10, 1, 0, 0)],
+        )
+        .await;
+
+        let done = report("row-model", child, "done", TaskStatus::Completed);
+        assert!(finish(&db.conn, parent, "row-model", &done)
+            .await
+            .expect("finish"));
+        assert_eq!(
+            metrics_row(&db.conn, "row-model").await.effective_model.as_deref(),
+            Some("claude-opus-4-6"),
+            "the conversation row wins over per-turn models"
+        );
+
+        // A second task on a child whose row has no model falls through to the
+        // latest usage turn.
+        let (parent2, child2) = conversations(&db).await;
+        admit(&db.conn, input("turn-model", parent2, child2, None, "work"))
+            .await
+            .expect("admit");
+        seed_usage(
+            &db.conn,
+            child2,
+            vec![usage_fact("turn-1", Utc::now(), Some("gpt-6-astra"), 10, 1, 0, 0)],
+        )
+        .await;
+        let done = report("turn-model", child2, "done", TaskStatus::Completed);
+        assert!(finish(&db.conn, parent2, "turn-model", &done)
+            .await
+            .expect("finish"));
+        assert_eq!(
+            metrics_row(&db.conn, "turn-model")
+                .await
+                .effective_model
+                .as_deref(),
+            Some("gpt-6-astra")
+        );
     }
 
     /// A failure freezes its `error_code` and nothing it doesn't know.

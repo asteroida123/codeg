@@ -235,6 +235,106 @@ pub async fn total_tokens_for_conversations<C: ConnectionTrait>(
     Ok(total)
 }
 
+/// One task's token facts, split the four ways the dashboard reports them.
+///
+/// Unlike [`total_tokens_for_conversations`], this is a WINDOW over one
+/// conversation: a resumed child carries its previous tasks' turns too, and
+/// attributing that history to the new task would overstate every rework round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskTokenFacts {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub cache_read_tokens: i64,
+    /// Usage-bearing turns in the window — not necessarily every turn the agent
+    /// ran, but the only turn count this table can honestly provide.
+    pub turn_count: u64,
+}
+
+impl TaskTokenFacts {
+    /// All-zero means "nothing recorded", the same NULL-vs-zero distinction the
+    /// ledger columns keep. Zero is never a real spend, so it is not reported.
+    pub fn is_empty(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_creation_tokens == 0
+            && self.cache_read_tokens == 0
+    }
+}
+
+/// Sum one conversation's token facts from `since` through `until` (exclusive),
+/// for freezing a delegation task's cost at terminal time.
+///
+/// `None` means NO FACTS — the sync pipeline has not materialized this child's
+/// turns yet, the agent reports no usage, or the query failed in the caller.
+/// Callers must store NULL for that, never 0: the dashboard renders NULL as
+/// "unknown" and 0 as a real (impossible) spend. The pipeline is best-effort
+/// and lags a live run, so a brand-new task can legitimately land here with no
+/// facts; a later sync does not rewrite the frozen ledger.
+pub async fn task_token_facts<C: ConnectionTrait>(
+    conn: &C,
+    conversation_id: i32,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+) -> Result<Option<TaskTokenFacts>, DbError> {
+    use sea_orm::sea_query::Expr;
+
+    let sums = token_usage_turn::Entity::find()
+        .select_only()
+        .column_as(Expr::col(token_usage_turn::Column::InputTokens).sum(), "input")
+        .column_as(
+            Expr::col(token_usage_turn::Column::OutputTokens).sum(),
+            "output",
+        )
+        .column_as(
+            Expr::col(token_usage_turn::Column::CacheCreationTokens).sum(),
+            "cache_creation",
+        )
+        .column_as(
+            Expr::col(token_usage_turn::Column::CacheReadTokens).sum(),
+            "cache_read",
+        )
+        .column_as(Expr::col(token_usage_turn::Column::Id).count(), "turns")
+        .filter(token_usage_turn::Column::ConversationId.eq(conversation_id))
+        .filter(token_usage_turn::Column::OccurredAt.gte(since))
+        .filter(token_usage_turn::Column::OccurredAt.lt(until))
+        .into_tuple::<(Option<i64>, Option<i64>, Option<i64>, Option<i64>, i64)>()
+        .one(conn)
+        .await?;
+
+    let Some((input, output, cache_creation, cache_read, turns)) = sums else {
+        return Ok(None);
+    };
+    let facts = TaskTokenFacts {
+        input_tokens: input.unwrap_or(0),
+        output_tokens: output.unwrap_or(0),
+        cache_creation_tokens: cache_creation.unwrap_or(0),
+        cache_read_tokens: cache_read.unwrap_or(0),
+        turn_count: turns.max(0) as u64,
+    };
+    Ok((!facts.is_empty()).then_some(facts))
+}
+
+/// The model on the most recent usage-bearing turn, for the delegation
+/// ledger's model fallback when the admission snapshot carried none.
+pub async fn latest_model_for_conversation<C: ConnectionTrait>(
+    conn: &C,
+    conversation_id: i32,
+) -> Result<Option<String>, DbError> {
+    let model = token_usage_turn::Entity::find()
+        .select_only()
+        .column(token_usage_turn::Column::Model)
+        .filter(token_usage_turn::Column::ConversationId.eq(conversation_id))
+        .filter(token_usage_turn::Column::Model.is_not_null())
+        .order_by_desc(token_usage_turn::Column::OccurredAt)
+        .into_tuple::<Option<String>>()
+        .one(conn)
+        .await?
+        .flatten()
+        .filter(|m| !m.trim().is_empty());
+    Ok(model)
+}
+
 /// Count the sessions the workspace list would show for this window — the
 /// number the status bar's session counter also reports when the window is
 /// unbounded.

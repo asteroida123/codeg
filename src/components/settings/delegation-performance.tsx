@@ -35,6 +35,18 @@ function formatCount(n: number): string {
   return n.toLocaleString()
 }
 
+/** All four token counters, because an agent's cache read/write is real spend
+ *  and often the larger half — a task with no non-cached tokens still cost
+ *  money. Zero means "nothing recorded" (all columns were NULL). */
+function totalTokens(row: DelegationDimensionStats): number {
+  return (
+    row.input_tokens +
+    row.output_tokens +
+    row.cache_creation_tokens +
+    row.cache_read_tokens
+  )
+}
+
 function formatDuration(ms: number | null): string {
   if (ms == null) return "—"
   if (ms < 1000) return `${Math.round(ms)}ms`
@@ -100,9 +112,7 @@ function StatsTable({
               {formatDuration(row.avg_duration_ms)}
             </td>
             <td className="px-2 py-1.5 text-right tabular-nums">
-              {row.input_tokens + row.output_tokens > 0
-                ? formatCount(row.input_tokens + row.output_tokens)
-                : "—"}
+              {totalTokens(row) > 0 ? formatCount(totalTokens(row)) : "—"}
             </td>
             <td className="px-2 py-1.5 text-right tabular-nums">
               {percent(row.rework_rate)}
@@ -162,9 +172,7 @@ export function DelegationPerformancePanel() {
             ["totalAvgDuration", formatDuration(totals.avg_duration_ms)],
             [
               "totalTokens",
-              totals.input_tokens + totals.output_tokens > 0
-                ? formatCount(totals.input_tokens + totals.output_tokens)
-                : "—",
+              totalTokens(totals) > 0 ? formatCount(totalTokens(totals)) : "—",
             ],
             ["totalRunning", formatCount(totals.running)],
           ] as const

@@ -34,12 +34,14 @@ pub struct Model {
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
     // ── Performance dashboard projections (upstream #724) ─────────────────
-    // Each column below is extracted from a JSON blob the row already stores,
-    // in the SAME statement that writes the blob — never updated separately,
-    // never a second source of truth. NULL means "not known": pre-metrics
-    // rows, failures before admission snapshots, or agents that don't report
-    // the value. The dashboard's grouping keys (`agent_type`,
-    // `effective_model`) are indexed.
+    // Each column below is written by the SAME statement that freezes the
+    // terminal report — never updated separately. Most values are extracted
+    // from that report or the admission `resume_binding`; the token counters
+    // are additionally filled from the child's materialized `token_usage_turn`
+    // facts when the report carries none (it has no cache split at all). NULL
+    // means "not known": pre-metrics rows, failures before admission
+    // snapshots, or agents that don't report the value. The dashboard's
+    // grouping keys (`agent_type`, `effective_model`) are indexed.
     /// Child agent slug (`resume_binding.agent_type`), set at admission so
     /// still-running rows group correctly.
     pub agent_type: Option<String>,
@@ -53,8 +55,13 @@ pub struct Model {
     pub input_tokens: Option<i64>,
     /// Output tokens the child reported for the run, if any.
     pub output_tokens: Option<i64>,
+    /// Prompt-cache creation tokens; NULL when the agent/report did not say.
+    pub cache_creation_tokens: Option<i64>,
+    /// Prompt-cache read tokens; NULL when the agent/report did not say.
+    pub cache_read_tokens: Option<i64>,
     /// Effective selectors the child launched with (from the terminal
-    /// report's `selectors.effective`); NULL when the call asked for none.
+    /// report's `selectors.effective`, or the conversation / latest usage
+    /// turn when the snapshot is missing); NULL when genuinely unknown.
     pub effective_model: Option<String>,
     pub effective_mode: Option<String>,
     pub effective_reasoning_level: Option<String>,

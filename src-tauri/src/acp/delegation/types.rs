@@ -81,10 +81,11 @@ pub struct AppliedSelectors {
     pub config_values: BTreeMap<String, String>,
 }
 
-/// What one delegation asked for selector-wise and what it got. Carried on
-/// [`DelegationTaskReport`] only when the caller asked for selectors;
-/// `effective` is `None` on paths that never read a child snapshot (mock
-/// spawners, failures before admission).
+/// What one delegation asked for selector-wise and what it got. Always carried
+/// on a launch report, even when `requested` is empty: the child's effective
+/// snapshot is the only record of which default model actually ran, and
+/// `effective` is `None` only on paths that never read one (mock spawners,
+/// failures before admission).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegationSelectorReport {
     pub requested: SelectorPreferences,
@@ -546,9 +547,10 @@ pub struct DelegationTaskReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_on: Option<BlockedOn>,
     /// Per-call selector preferences this call requested and what the child
-    /// actually launched with. Present only when the caller asked for
-    /// `model` / `mode` / `reasoning_level`; absent fields are ignored by
-    /// every consumer that predates them.
+    /// actually launched with. Present for every launch report; `requested`
+    /// may be empty (the caller asked for the agent's defaults), while
+    /// `effective` still records the model that ran. Absent fields are ignored
+    /// by every consumer that predates them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selectors: Option<DelegationSelectorReport>,
     /// The assistant the task runs as, beside its `agent_type`; absent for a

@@ -62,6 +62,7 @@ mod m20261017_000002_conversation_source;
 mod m20261020_000001_folder_command_run_local;
 mod m20261022_000001_tool_approval;
 mod m20261022_000001_work_task_delivery;
+mod m20261023_000001_delegation_cache_tokens;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -130,6 +131,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261020_000001_folder_command_run_local::Migration),
             Box::new(m20261022_000001_tool_approval::Migration),
             Box::new(m20261022_000001_work_task_delivery::Migration),
+            Box::new(m20261023_000001_delegation_cache_tokens::Migration),
         ]
     }
 }
@@ -144,12 +146,13 @@ pub(super) struct UpstreamSchemaFixture<const KEEP_LOCAL: usize>;
 #[async_trait::async_trait]
 impl<const KEEP_LOCAL: usize> MigratorTrait for UpstreamSchemaFixture<KEEP_LOCAL> {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        const LOCAL: [&str; 5] = [
+        const LOCAL: [&str; 6] = [
             "m20260908_000001_delegation_task_ledger",
             "m20260926_000001_delegation_metrics",
             "m20260926_000002_work_task_orchestration",
             "m20260926_000003_work_task_run",
             "m20260926_000004_delegation_work_task_link",
+            "m20261023_000001_delegation_cache_tokens",
         ];
         Migrator::migrations().into_iter().filter(|m|
             LOCAL.iter().position(|name| *name == m.name())
