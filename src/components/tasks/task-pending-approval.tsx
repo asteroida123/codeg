@@ -85,7 +85,7 @@ export function TaskPendingApproval({
   )
 
   // The card lives inside a clickable row/card; answering is not opening.
-  const keepLocal = (e: React.MouseEvent) => e.stopPropagation()
+  const keepLocal = (e: React.SyntheticEvent) => e.stopPropagation()
 
   const respond = (optionId: string) => {
     if (busy || task.connection_id == null) return
