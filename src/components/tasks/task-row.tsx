@@ -22,6 +22,10 @@ import {
 } from "./task-card"
 import { isDeferred } from "./task-acceptance"
 import {
+  TaskPendingApproval,
+  useWorkTaskPendingApproval,
+} from "./task-pending-approval"
+import {
   buildTaskActions,
   type TaskActionHandlers,
   type TaskActionItem,
@@ -114,6 +118,10 @@ export function TaskRow({
     ? task.last_error
     : (liveNote(task, t) ??
       (task.status === "review" ? task.result_summary : null))
+  // What an `awaiting_input` task is actually asking, pulled from the run
+  // conversation's live state — rendered below the note so the row can answer
+  // a permission without opening the child conversation nobody is watching.
+  const pendingApproval = useWorkTaskPendingApproval(task)
 
   const when = formatRelative(
     task.finished_at ?? task.settled_at ?? task.started_at ?? task.created_at,
@@ -189,6 +197,9 @@ export function TaskRow({
               ) : null}
               <span className="truncate">{note}</span>
             </span>
+          ) : null}
+          {pendingApproval ? (
+            <TaskPendingApproval task={task} pending={pendingApproval} />
           ) : null}
         </div>
       </div>

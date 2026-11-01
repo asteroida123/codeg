@@ -26,6 +26,10 @@ import {
 } from "./task-acceptance"
 import { buildTaskActions, type TaskActionItem } from "./task-actions"
 import type { TaskActionHandlers } from "./task-actions"
+import {
+  TaskPendingApproval,
+  useWorkTaskPendingApproval,
+} from "./task-pending-approval"
 import type { WorkTask } from "@/lib/types"
 
 type StatusLabelKey =
@@ -404,6 +408,9 @@ export function TaskCard({
   const t = useTranslations("Tasks")
   const archived = task.archived_at != null
   const note = liveNote(task, t)
+  // What the run is blocked on, live from its conversation — see the card's
+  // rendering below. Polled only while `awaiting_input`.
+  const pendingApproval = useWorkTaskPendingApproval(task)
 
   const stat =
     task.files_changed != null && task.files_changed > 0 ? (
@@ -552,6 +559,14 @@ export function TaskCard({
         <p className="mt-1.5 line-clamp-2 text-[0.6875rem] leading-snug text-muted-foreground italic">
           {note}
         </p>
+      ) : null}
+      {/* What an `awaiting_input` run is asking, live from its conversation —
+          answerable right here, without opening a child session nobody is
+          watching. */}
+      {pendingApproval ? (
+        <div className="mt-2">
+          <TaskPendingApproval task={task} pending={pendingApproval} />
+        </div>
       ) : null}
 
       {/* mt-3 / pt-3 = the card's own p-3: the divider clears the content above
