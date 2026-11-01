@@ -1593,6 +1593,22 @@ impl TaskEngine {
             config_values.get("model").map(String::as_str),
             &mut runtime_env,
         );
+        // Pre-flight the resolved model against the gateway that will serve
+        // it — before the worktree process is spawned and the run's opening
+        // request 404s fifteen seconds in (2026-10-31, R31-09: config.toml's
+        // `gpt-6-astra` against a gateway that never served it). Blocks only
+        // on the gateway's own positive "not listed" answer; a missing
+        // /models endpoint or a timeout proceeds as before.
+        if agent_type == AgentType::Codex {
+            if let crate::acp::codex_model_probe::ProbeOutcome::Unlisted { model, base_url } =
+                crate::acp::codex_model_probe::check_codex_model_available(&runtime_env).await
+            {
+                return Err(format!(
+                    "Codex model \"{model}\" is not listed by its model gateway {base_url} — \
+                     pick a model on this card, or fix the default in ~/.codex/config.toml"
+                ));
+            }
+        }
         verify_agent_installed(agent_type)
             .await
             .map_err(|e| e.to_string())?;
@@ -3518,6 +3534,13 @@ impl TaskEngine {
             .as_ref()
             .filter(|t| t.run_seq == run_seq)
             .and_then(|t| t.verdict.clone());
+        // Set by the arms below when THIS generation failed the task as an
+        // agent error (#538's empty-error path, or a non-`end_turn` stop), so
+        // the run row's own mapping below cannot settle a generation whose
+        // task just failed. The 2026-10-31 R31-09 first run died on a model
+        // 404 the adapter reported as `end_turn`: the task row carried the 404
+        // but the run row settled with no error, masking the failure.
+        let mut failed_as_agent_error = false;
         let changed = match stop_reason {
             "end_turn" => {
                 // A `task_complete` report from this generation decides the
@@ -3560,6 +3583,7 @@ impl TaskEngine {
                         && signal.as_ref().is_some_and(|s| s.error.is_some());
                     if empty_error {
                         let error = signal.and_then(|s| s.error);
+                        failed_as_agent_error = true;
                         work_task_service::fail(
                             &self.db.conn,
                             task_id,
@@ -3598,20 +3622,23 @@ impl TaskEngine {
             // What the agent reported for this turn (a rejected prompt's own
             // message, codeg's reading of an empty turn) says more than the
             // bare stop reason, which is all a turn that reported nothing has.
-            other => work_task_service::fail(
-                &self.db.conn,
-                task_id,
-                &[WorkTaskStatus::Running, WorkTaskStatus::AwaitingInput],
-                Some(run_seq),
-                "agent_error",
-                Some(
-                    signal
-                        .and_then(|s| s.error)
-                        .unwrap_or_else(|| format!("agent stopped: {other}")),
-                ),
-            )
-            .await
-            .unwrap_or(false),
+            other => {
+                failed_as_agent_error = true;
+                work_task_service::fail(
+                    &self.db.conn,
+                    task_id,
+                    &[WorkTaskStatus::Running, WorkTaskStatus::AwaitingInput],
+                    Some(run_seq),
+                    "agent_error",
+                    Some(
+                        signal
+                            .and_then(|s| s.error)
+                            .unwrap_or_else(|| format!("agent stopped: {other}")),
+                    ),
+                )
+                .await
+                .unwrap_or(false)
+            }
         };
         // The generation's own outcome, recorded whatever the task-level CAS
         // decided: a late event for a generation the task has already moved
@@ -3621,6 +3648,13 @@ impl TaskEngine {
             "end_turn" if verdict.as_deref() == Some("blocked") => (
                 work_task_run_service::STATUS_FAILED,
                 Some(work_task_run_service::ERROR_VERDICT_BLOCKED),
+            ),
+            // The task arm above failed this generation as an agent error even
+            // though the adapter ended the turn "cleanly" — the run row must
+            // carry the failure too, or the ledger reads as a silent success.
+            "end_turn" if failed_as_agent_error => (
+                work_task_run_service::STATUS_FAILED,
+                Some(work_task_run_service::ERROR_AGENT_ERROR),
             ),
             "end_turn" => (work_task_run_service::STATUS_SETTLED, None),
             "cancelled" => (work_task_run_service::STATUS_CANCELED, None),

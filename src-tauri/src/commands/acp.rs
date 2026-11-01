@@ -3595,7 +3595,7 @@ fn load_codex_auth_json_raw() -> Option<String> {
     fs::read_to_string(codex_auth_json_path()).ok()
 }
 
-fn load_codex_config_toml_raw() -> Option<String> {
+pub(crate) fn load_codex_config_toml_raw() -> Option<String> {
     fs::read_to_string(codex_config_toml_path()).ok()
 }
 
