@@ -998,6 +998,40 @@ fn launch_preferences(
     }
 }
 
+fn repair_legacy_codebuddy_permission_mode(
+    agent_type: AgentType,
+    assistant: Option<&DelegationAssistant>,
+    current_defaults: Option<&AgentDelegationDefaults>,
+    binding: &mut crate::db::service::delegation_task_service::ResumeBinding,
+) {
+    // The old launcher could snapshot CodeBuddy's pre-preference `default`
+    // after applying the configured value. Only the user's explicit current
+    // default disambiguates that legacy binding from a genuine default choice.
+    if agent_type != AgentType::CodeBuddy
+        || assistant.is_some()
+        || binding.agent_type != agent_type
+    {
+        return;
+    }
+    if current_defaults
+        .and_then(|defaults| defaults.config_values.get("mode"))
+        .map(String::as_str)
+        != Some("fullAccess")
+    {
+        return;
+    }
+    if binding
+        .preferred_config_values
+        .get("mode")
+        .map(String::as_str)
+        == Some("default")
+    {
+        binding
+            .preferred_config_values
+            .insert("mode".into(), "fullAccess".into());
+    }
+}
+
 /// Cap on the free-form `reason` a `resume_delegation` call may carry into the
 /// child's continuation prompt. The reason is interruption CONTEXT, not new
 /// instructions — the cap (shared with the task-preview budget) keeps it
@@ -3262,7 +3296,7 @@ impl DelegationBroker {
                     None,
                 );
             }
-            let binding = source.resume_binding;
+            let mut binding = source.resume_binding;
             if binding.agent_type != req.agent_type
                 || !same_effective_working_dir(req.working_dir.as_deref(), &binding.working_dir)
             {
@@ -3312,6 +3346,12 @@ impl DelegationBroker {
             }
             req.assistant = frozen_assistant;
             identity = req.assistant.as_ref().map(DelegationAssistant::identity);
+            repair_legacy_codebuddy_permission_mode(
+                req.agent_type,
+                req.assistant.as_ref(),
+                cfg.agent_defaults.get(&req.agent_type),
+                &mut binding,
+            );
             req.working_dir = Some(binding.working_dir.clone());
             preferred_mode_id = binding.preferred_mode_id.clone();
             preferred_config_values = binding.preferred_config_values.clone();
@@ -7639,6 +7679,248 @@ mod tests {
                 ("model".to_string(), "gpt-6-sol".to_string()),
                 ("reasoning_effort".to_string(), "high".to_string()),
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn codebuddy_continuation_upgrades_legacy_default_when_full_access_is_configured() {
+        use crate::db::service::{
+            conversation_service, delegation_task_service as ledger, folder_service,
+        };
+
+        let db = Arc::new(crate::db::test_helpers::fresh_in_memory_db().await);
+        let folder = folder_service::add_folder(&db.conn, "/tmp/broker-codebuddy-cont")
+            .await
+            .unwrap();
+        let parent =
+            conversation_service::create(&db.conn, folder.id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        let child = conversation_service::create(
+            &db.conn,
+            folder.id,
+            AgentType::CodeBuddy,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let binding = ledger::ResumeBinding {
+            agent_type: AgentType::CodeBuddy,
+            external_session_id: "codebuddy-session".into(),
+            child_conversation_id: child.id,
+            working_dir: "/tmp/broker-codebuddy-cont".into(),
+            preferred_mode_id: Some("default".into()),
+            preferred_config_values: BTreeMap::from([
+                ("mode".into(), "default".into()),
+                ("model".into(), "deepseek-v4.1-flash".into()),
+            ]),
+            config_fingerprint: "cfg".into(),
+        };
+        ledger::admit(
+            &db.conn,
+            ledger::AdmissionInput {
+                task_id: "source-codebuddy".into(),
+                parent_conversation_id: parent.id,
+                child_conversation_id: child.id,
+                source_task_id: None,
+                task: "first round".into(),
+                requested_working_dir: None,
+                resume_binding: binding,
+                work_task_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        ledger::finish(
+            &db.conn,
+            parent.id,
+            "source-codebuddy",
+            &DelegationTaskReport {
+                assistant_id: None,
+                assistant_name: None,
+                progress: None,
+                task_id: Some("source-codebuddy".into()),
+                status: TaskStatus::Completed,
+                child_conversation_id: Some(child.id),
+                agent_type: Some(AgentType::CodeBuddy),
+                text: Some("done".into()),
+                error_code: None,
+                message: None,
+                duration_ms: Some(1),
+                turn_count: None,
+                token_usage: None,
+                blocked_on: None,
+                selectors: None,
+            },
+        )
+        .await
+        .unwrap();
+        ledger::mark_released(&db.conn, parent.id, "source-codebuddy")
+            .await
+            .unwrap();
+
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("codebuddy-child-cont".into())).await;
+        mock.queue_send(Ok(child.id)).await;
+        let broker = DelegationBroker::new(
+            mock.clone() as Arc<dyn ConnectionSpawner>,
+            Arc::new(MockDepth(vec![(parent.id, None)])) as Arc<dyn ConversationDepthLookup>,
+        )
+        .with_ledger(db.clone());
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                depth_limit: 8,
+                agent_defaults: BTreeMap::from([(
+                    AgentType::CodeBuddy,
+                    AgentDelegationDefaults {
+                        mode_id: None,
+                        config_values: BTreeMap::from([
+                            ("mode".into(), "fullAccess".into()),
+                            ("model".into(), "deepseek-v4.1-flash".into()),
+                        ]),
+                    },
+                )]),
+                ..DelegationConfig::default()
+            })
+            .await;
+
+        let ack = broker
+            .start_delegation(DelegationRequest {
+                assistant: None,
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "pt-codebuddy-cont".into(),
+                agent_type: AgentType::CodeBuddy,
+                task: "second round".into(),
+                working_dir: Some("/tmp/broker-codebuddy-cont".into()),
+                requested_working_dir: None,
+                continue_from_task_id: Some("source-codebuddy".into()),
+                external_handle: None,
+                selectors: SelectorPreferences::default(),
+            })
+            .await;
+        assert_eq!(ack.status, TaskStatus::Running, "{ack:?}");
+
+        let spawn_args = mock.spawn_args.lock().await;
+        assert_eq!(spawn_args.len(), 1);
+        assert_eq!(
+            spawn_args[0]
+                .preferred_config_values
+                .get("mode")
+                .map(String::as_str),
+            Some("fullAccess")
+        );
+        assert_eq!(
+            spawn_args[0]
+                .preferred_config_values
+                .get("model")
+                .map(String::as_str),
+            Some("deepseek-v4.1-flash")
+        );
+        drop(spawn_args);
+
+        let successor_id = ack.task_id.as_deref().expect("successor task id");
+        let admission = mock
+            .send_args
+            .lock()
+            .await
+            .first()
+            .and_then(|args| args.link.admission.clone())
+            .expect("durable continuation admission");
+        assert!(matches!(
+            ledger::admit_continuation(
+                &db.conn,
+                ledger::AdmissionInput {
+                    task_id: successor_id.to_string(),
+                    parent_conversation_id: parent.id,
+                    child_conversation_id: child.id,
+                    source_task_id: admission.source_task_id,
+                    task: admission.task,
+                    requested_working_dir: admission.requested_working_dir,
+                    resume_binding: admission
+                        .resume_binding
+                        .expect("source binding is forwarded"),
+                    work_task_id: None,
+                },
+            )
+            .await
+            .unwrap(),
+            ledger::AdmissionResult::New { .. }
+        ));
+        let successor = ledger::lookup(&db.conn, parent.id, successor_id)
+            .await
+            .unwrap()
+            .expect("successor was admitted");
+        assert_eq!(
+            successor
+                .resume_binding
+                .preferred_config_values
+                .get("mode")
+                .map(String::as_str),
+            Some("fullAccess")
+        );
+        let source = ledger::lookup(&db.conn, parent.id, "source-codebuddy")
+            .await
+            .unwrap()
+            .expect("source task remains available");
+        assert_eq!(
+            source
+                .resume_binding
+                .preferred_config_values
+                .get("mode")
+                .map(String::as_str),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn legacy_codebuddy_mode_repair_leaves_assistant_and_unconfigured_defaults_alone() {
+        let mut binding = crate::db::service::delegation_task_service::ResumeBinding {
+            agent_type: AgentType::CodeBuddy,
+            external_session_id: "codebuddy-session".into(),
+            child_conversation_id: 1,
+            working_dir: "/workspace/project".into(),
+            preferred_mode_id: Some("default".into()),
+            preferred_config_values: BTreeMap::from([("mode".into(), "default".into())]),
+            config_fingerprint: "cfg".into(),
+        };
+        let full_access_defaults = AgentDelegationDefaults {
+            mode_id: None,
+            config_values: BTreeMap::from([("mode".into(), "fullAccess".into())]),
+        };
+        let assistant = DelegationAssistant {
+            id: 1,
+            name: "CodeBuddy reviewer".into(),
+            agent_options: AgentDelegationDefaults {
+                mode_id: None,
+                config_values: BTreeMap::from([("mode".into(), "default".into())]),
+            },
+            instructions: "Review the change.".into(),
+        };
+
+        repair_legacy_codebuddy_permission_mode(
+            AgentType::CodeBuddy,
+            Some(&assistant),
+            Some(&full_access_defaults),
+            &mut binding,
+        );
+        assert_eq!(
+            binding
+                .preferred_config_values
+                .get("mode")
+                .map(String::as_str),
+            Some("default")
+        );
+
+        repair_legacy_codebuddy_permission_mode(AgentType::CodeBuddy, None, None, &mut binding);
+        assert_eq!(
+            binding
+                .preferred_config_values
+                .get("mode")
+                .map(String::as_str),
+            Some("default")
         );
     }
 

@@ -221,7 +221,10 @@ async fn admit_on<C: ConnectionTrait>(
                     "invalid resume binding for source {source_task_id}: {e}"
                 ))
             })?;
-        if source_binding != input.resume_binding {
+        if !same_resume_binding_or_codebuddy_permission_compat(
+            &source_binding,
+            &input.resume_binding,
+        ) {
             return Err(DbError::Conflict(format!(
                 "source task {source_task_id} binding does not match the requested child session"
             )));
@@ -1468,7 +1471,48 @@ fn same_admission_key(
     let binding: ResumeBinding = serde_json::from_str(&row.resume_binding).map_err(|e| {
         DbError::Migration(format!("invalid resume binding for {}: {e}", row.task_id))
     })?;
-    Ok(row.task == input.task && binding == input.resume_binding)
+    Ok(row.task == input.task
+        && same_resume_binding_or_codebuddy_permission_compat(&binding, &input.resume_binding))
+}
+
+/// Preserve idempotent continuation admission across the one legacy CodeBuddy
+/// permission-mode repair. Every session identity and selector must still
+/// match; only `mode: default` ↔ `mode: fullAccess` is compatible.
+fn same_resume_binding_or_codebuddy_permission_compat(
+    existing: &ResumeBinding,
+    requested: &ResumeBinding,
+) -> bool {
+    if existing == requested {
+        return true;
+    }
+    if existing.agent_type != AgentType::CodeBuddy
+        || requested.agent_type != AgentType::CodeBuddy
+        || !matches!(
+            (
+                existing
+                    .preferred_config_values
+                    .get("mode")
+                    .map(String::as_str),
+                requested
+                    .preferred_config_values
+                    .get("mode")
+                    .map(String::as_str),
+            ),
+            (Some("default"), Some("fullAccess")) | (Some("fullAccess"), Some("default"))
+        )
+    {
+        return false;
+    }
+
+    let mut normalized_existing = existing.clone();
+    normalized_existing
+        .preferred_config_values
+        .insert("mode".into(), "default".into());
+    let mut normalized_requested = requested.clone();
+    normalized_requested
+        .preferred_config_values
+        .insert("mode".into(), "default".into());
+    normalized_existing == normalized_requested
 }
 
 fn is_terminal(status: TaskStatus) -> bool {
@@ -1530,6 +1574,44 @@ mod tests {
             resume_binding: binding(child),
             work_task_id: None,
         }
+    }
+
+    #[test]
+    fn codebuddy_mode_compatibility_allows_only_default_full_access_difference() {
+        let mut existing = binding(1);
+        existing.agent_type = AgentType::CodeBuddy;
+        existing
+            .preferred_config_values
+            .insert("mode".into(), "default".into());
+        let mut requested = existing.clone();
+        requested
+            .preferred_config_values
+            .insert("mode".into(), "fullAccess".into());
+
+        assert!(same_resume_binding_or_codebuddy_permission_compat(
+            &existing, &requested
+        ));
+        assert!(same_resume_binding_or_codebuddy_permission_compat(
+            &requested, &existing
+        ));
+
+        let mut different_session = requested.clone();
+        different_session.external_session_id = "other-session".into();
+        assert!(!same_resume_binding_or_codebuddy_permission_compat(
+            &existing,
+            &different_session
+        ));
+
+        let mut other_agent = existing.clone();
+        other_agent.agent_type = AgentType::Codex;
+        let mut other_agent_full_access = other_agent.clone();
+        other_agent_full_access
+            .preferred_config_values
+            .insert("mode".into(), "fullAccess".into());
+        assert!(!same_resume_binding_or_codebuddy_permission_compat(
+            &other_agent,
+            &other_agent_full_access
+        ));
     }
 
     async fn conversations(db: &crate::db::AppDatabase) -> (i32, i32) {

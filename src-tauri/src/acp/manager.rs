@@ -3262,6 +3262,19 @@ impl ConnectionManager {
         }
     }
 
+    async fn wait_for_delegation_selectors(
+        &self,
+        conn_id: &str,
+    ) -> Result<AgentOptionsSnapshot, crate::acp::delegation::spawner::SpawnerError> {
+        self.wait_for_session_options(conn_id, Duration::from_secs(60))
+            .await
+            .map_err(|error| {
+                crate::acp::delegation::spawner::SpawnerError::Send(format!(
+                    "child selectors were not ready: {error}"
+                ))
+            })
+    }
+
     /// The modes + config options a live connection of `agent_type` has
     /// ALREADY advertised, read straight out of its `SessionState`. This is a
     /// cache read, never a probe: it answers only from connections that exist
@@ -3402,10 +3415,18 @@ impl ConnectionManager {
                             boolean.current_value == (expected == "true")
                         }
                     };
+                    let actual = match &option.kind {
+                        SessionConfigKindInfo::Select(select) => select.current_value.clone(),
+                        SessionConfigKindInfo::Boolean(boolean) => {
+                            boolean.current_value.to_string()
+                        }
+                    };
                     if !matches {
                         tracing::warn!(
                             label,
                             config_id = id,
+                            expected = expected,
+                            actual = actual,
                             "[delegation] continuation resumed with a different config value"
                         );
                     }
@@ -5031,6 +5052,8 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                     SpawnerError::Send("delegation did not bind a conversation".into())
                 });
         };
+
+        self.manager.wait_for_delegation_selectors(conn_id).await?;
 
         let (agent_type, state, fingerprint) = {
             let conns = self.manager.connections.lock().await;
@@ -10735,6 +10758,60 @@ mod tests {
         );
         assert_eq!(snapshot.config_options.len(), 1);
         assert!(snapshot.modes.is_some());
+    }
+
+    #[tokio::test]
+    async fn delegation_selector_snapshot_includes_late_codebuddy_permission_mode() {
+        let mgr = ConnectionManager::new();
+        mgr.insert_test_connection(
+            "codebuddy-child",
+            crate::models::agent::AgentType::CodeBuddy,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        let state = mgr.get_state("codebuddy-child").await.expect("state");
+        {
+            let mut s = state.write().await;
+            let mut options = sample_config_options();
+            options[0].id = "mode".into();
+            let SessionConfigKindInfo::Select(mode) = &mut options[0].kind else {
+                panic!("CodeBuddy mode is a select option");
+            };
+            mode.current_value = "default".into();
+            s.config_options = Some(options);
+            s.selectors_ready = false;
+        }
+
+        let late_update = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let mut s = state.write().await;
+                s.selectors_ready = true;
+                drop(s);
+
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let mut s = state.write().await;
+                let options = s.config_options.as_mut().expect("initial options");
+                let SessionConfigKindInfo::Select(mode) = &mut options[0].kind else {
+                    panic!("CodeBuddy mode is a select option");
+                };
+                mode.current_value = "fullAccess".into();
+            })
+        };
+
+        let snapshot = mgr
+            .wait_for_delegation_selectors("codebuddy-child")
+            .await
+            .expect("delegation waits for selectors to settle");
+        late_update.await.expect("late selector update");
+
+        assert_eq!(snapshot.config_options[0].id, "mode");
+        let SessionConfigKindInfo::Select(mode) = &snapshot.config_options[0].kind else {
+            panic!("CodeBuddy mode is a select option");
+        };
+        assert_eq!(mode.current_value, "fullAccess");
     }
 
     #[tokio::test]
