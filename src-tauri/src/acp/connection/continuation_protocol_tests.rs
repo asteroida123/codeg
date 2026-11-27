@@ -91,6 +91,7 @@ async fn run_driver(
             FsAccessPolicy::from_env(&cwd, AgentType::ClaudeCode, &BTreeMap::new()),
             HostToolsPolicy::Default,
             cwd.join("claude-projects"),
+            crate::parsers::AgentEnv::default(),
             Arc::new(StderrTail::new()),
             SessionRecoveryPolicy::Strict,
         )
@@ -191,6 +192,7 @@ impl ConnectionSpawner for FixtureContinuationSpawner {
                 FsAccessPolicy::from_env(&cwd, agent_type, &BTreeMap::new()),
                 HostToolsPolicy::Default,
                 cwd.join("claude-projects"),
+                crate::parsers::AgentEnv::default(),
                 Arc::new(StderrTail::new()),
                 SessionRecoveryPolicy::Strict,
             )
@@ -269,6 +271,8 @@ impl ConnectionSpawner for FixtureContinuationSpawner {
             internal_suffix: Vec::new(),
             blocks: vec![PromptInputBlock::Text { text: task }],
             user_message: None,
+            reply_token: None,
+            receipt: None,
         })
         .await
         .map_err(|error| SpawnerError::Send(error.to_string()))?;
@@ -419,6 +423,8 @@ fn immediate_text_is_reduced_before_prompt_response_every_time() {
                     text: format!("turn {turn}"),
                 }],
                 user_message: None,
+                reply_token: None,
+                receipt: None,
             })
             .await
             .unwrap();
@@ -542,6 +548,7 @@ fn durable_continuation_reopens_the_source_session_and_admits_one_successor() {
         let source_report = DelegationTaskReport {
             assistant_id: None,
             assistant_name: None,
+            bot: None,
             progress: None,
             task_id: Some(source_task_id.into()),
             status: TaskStatus::Completed,
@@ -600,6 +607,7 @@ fn durable_continuation_reopens_the_source_session_and_admits_one_successor() {
         let ack = broker
             .start_delegation(DelegationRequest {
                 assistant: None,
+                asked: None,
                 parent_connection_id: "parent-after-reopen".into(),
                 parent_conversation_id: parent.id,
                 parent_tool_use_id: "follow-up-tool".into(),

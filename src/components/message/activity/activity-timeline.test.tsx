@@ -12,6 +12,7 @@ import {
   StaticConnectionStoreProvider,
   type ConnectionStoreApi,
 } from "@/contexts/acp-connections-context"
+import { EMPTY_ATTENTION_INDEX } from "@/lib/conversation-attention"
 import {
   StaticDelegationProvider,
   type DelegationContextValue,
@@ -45,11 +46,14 @@ const STORE: ConnectionStoreApi = {
   getActiveKey: () => null,
   subscribeKey: () => () => {},
   subscribeActiveKey: () => () => {},
+  getAttention: () => EMPTY_ATTENTION_INDEX,
+  subscribeAttention: () => () => {},
 }
 const DELEGATION: DelegationContextValue = {
   findByParentToolUseId: () => undefined,
   findByChildConversationId: () => undefined,
   findByTaskId: () => undefined,
+  bindingsForParent: () => [],
 }
 const WORKSPACE = new Proxy(
   {},
@@ -318,8 +322,9 @@ describe("activity timeline: the reference turn", () => {
     expect(within(explored).getByText("84 lines")).toBeTruthy()
     expect(within(explored).getByText("212 lines")).toBeTruthy()
     expect(within(explored).getByText("4 hits")).toBeTruthy()
-    expect(within(explored).getAllByText("read")).toHaveLength(3)
-    expect(within(explored).getByText("grep")).toBeTruthy()
+    // Each member leads with its verb, in words, as a command row does.
+    expect(within(explored).getAllByText("Read")).toHaveLength(3)
+    expect(within(explored).getByText("Searched")).toHaveClass("font-medium")
   })
 
   it("folds the first two commands and reports that they passed", () => {
@@ -641,13 +646,13 @@ describe("activity timeline: the reference turn", () => {
     const name = screen.getByText("query_tasks.py")
     expect(name).not.toHaveClass("text-foreground")
     expect(name.closest(".text-activity-secondary")).toBe(name.parentElement)
-    // A group's members: the verb column and the file it read.
+    // A group's members: the verb and the file it read.
     fireEvent.click(within(rowOf("Explored")).getAllByRole("button")[0]!)
     const member = rowOf(/\/Makefile$/)
     expect(within(member).getByText(/\/Makefile$/)).toHaveClass(
       "text-activity-secondary"
     )
-    expect(within(member).getByText("read")).toHaveClass(
+    expect(within(member).getByText("Read")).toHaveClass(
       "text-activity-secondary"
     )
     // The fold at the foot of the open list reads the same.

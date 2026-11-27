@@ -8,6 +8,11 @@ pub mod conversation;
 pub mod folder;
 pub mod message;
 pub mod model_provider;
+pub mod personal_agent;
+pub mod personal_agent_bots;
+pub mod personal_agent_overview;
+pub mod personal_agent_prefs;
+pub mod personal_agent_roster;
 pub mod pet;
 pub mod quick_message;
 pub mod remote_workspace_connection;
@@ -29,6 +34,7 @@ pub use canvas::{CanvasBoard, CanvasBoardSummary, CanvasMutation, CanvasNode, Ca
 pub use chat_channel::{ChannelStatusInfo, ChatChannelInfo, ChatChannelMessageLogInfo};
 pub use conversation::{
     AgentConversationCount, AgentStats, ConversationBranchTag, ConversationDetail,
+    ConversationSelection,
     ConversationOutline, ConversationSummary, ConversationTagDetail, ConversationTurnsPage,
     DbConversationDetail, DbConversationSummary, FolderInfo, ImportFolderOutcome, ImportResult,
     ImportSelectedResult, ScanFolder, ScanResult, ScanSession, ScanSessionStatus,
@@ -53,11 +59,12 @@ pub use token_usage::{
     TokenUsageSyncStatus, TokenUsageTotals,
 };
 pub use work_task::{
-    FollowUpIntent, WorkTaskBlocked, WorkTaskChangedFile, WorkTaskConfig, WorkTaskDependencyRef,
-    WorkTaskDelegationInfo, WorkTaskDraft, WorkTaskEventInfo, WorkTaskFolderSettings,
-    WorkTaskInfo, WorkTaskMergeOp, WorkTaskMergeState, WorkTaskPreflight, WorkTaskQueuedMerge,
-    WorkTaskRunInfo, WorkTaskSource, WorkTaskStatus,
-    WorkTaskTemplateDraft, WorkTaskTemplateInfo, DELIVERABLE_REPORT, STAGE_PROMPT_ALL,
+    FollowUpIntent, WorkTaskBackgroundWait, WorkTaskBlocked, WorkTaskChangedFile,
+    WorkTaskConfig, WorkTaskDependencyRef, WorkTaskDelegationInfo, WorkTaskDraft,
+    WorkTaskEventInfo, WorkTaskFolderSettings, WorkTaskInfo, WorkTaskMergeOp, WorkTaskMergeState,
+    WorkTaskPreflight, WorkTaskQueuedMerge, WorkTaskRunInfo, WorkTaskSource, WorkTaskStatus,
+    WorkTaskTemplateDraft, WorkTaskTemplateInfo, WorkTaskUncommittedFile, DELIVERABLE_REPORT,
+    STAGE_PROMPT_ALL,
 };
 #[cfg(feature = "tauri-runtime")]
 pub use system::{

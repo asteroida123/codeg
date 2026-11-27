@@ -24,7 +24,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react"
 import { useTranslations } from "next-intl"
-import { AlertTriangle, Bubbles, Gauge, HardDrive, Power } from "lucide-react"
+import {
+  AlertTriangle,
+  Bubbles,
+  Gauge,
+  HardDrive,
+  Power,
+  Users,
+} from "lucide-react"
 import { toast } from "sonner"
 
 import { SettingCard, SettingRow } from "@/components/shared/setting-card"
@@ -33,6 +40,7 @@ import {
   SettingsSaveBar,
   SettingsSection,
 } from "@/components/shared/settings-section"
+import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Switch } from "@/components/ui/switch"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
@@ -46,11 +54,11 @@ import { toErrorMessage } from "@/lib/app-error"
 import { subscribe } from "@/lib/platform"
 import { DELEGATION_SETTINGS_CHANGED_EVENT } from "@/lib/types"
 import type { AgentDelegationDefaults, AgentType } from "@/lib/types"
-import { AssistantsPanel } from "./assistants-panel"
+import { openPersonalAgentPage } from "@/lib/personal-agent-open"
 import { DelegationAgentDefaultsPanel } from "./delegation-agent-defaults"
 import { DelegationPerformancePanel } from "./delegation-performance"
 
-type DelegationTab = "general" | "agentDefaults" | "assistants"
+type DelegationTab = "general" | "agentDefaults"
 
 function sameDefaults(
   a: Partial<Record<AgentType, AgentDelegationDefaults>>,
@@ -276,10 +284,6 @@ export function DelegationSettingsSection() {
   const defaultsDirty =
     persisted !== null &&
     !sameDefaults(agentDefaults, persisted.agent_defaults ?? {})
-  const unsavedTabs = [
-    ...(generalDirty ? [t("tabGeneral")] : []),
-    ...(defaultsDirty ? [t("tabAgentDefaults")] : []),
-  ]
   const unsavedDot = (
     <span
       role="img"
@@ -310,7 +314,6 @@ export function DelegationSettingsSection() {
             {defaultsDirty ? unsavedDot : null}
           </TabsTrigger>
           <TabsTrigger value="performance">{t("tabPerformance")}</TabsTrigger>
-          <TabsTrigger value="assistants">{t("tabAssistants")}</TabsTrigger>
         </TabsList>
 
         {/* The kill switch and the two valves it gates are one decision, so
@@ -389,6 +392,29 @@ export function DelegationSettingsSection() {
               }
             />
           </SettingCard>
+          {/* The assistants @ hands work to are the owner's assistants,
+              managed in the sidebar's group of them. */}
+          <SettingCard className="mt-3">
+            <SettingRow
+              icon={Users}
+              title={t("assistantsMoved")}
+              description={t("assistantsMovedHint")}
+              control={
+                <Button
+                  size="sm"
+                  variant="outline"
+                  data-assistants-moved
+                  onClick={() =>
+                    void openPersonalAgentPage("assistants").catch((err) =>
+                      toast.error(toErrorMessage(err))
+                    )
+                  }
+                >
+                  {t("assistantsMovedOpen")}
+                </Button>
+              }
+            />
+          </SettingCard>
         </TabsContent>
 
         <TabsContent value="agentDefaults" className="pt-2">
@@ -401,17 +427,6 @@ export function DelegationSettingsSection() {
           />
         </TabsContent>
 
-        <TabsContent value="assistants" className="pt-2">
-          <AssistantsPanel
-            delegationEnabled={persisted ? persisted.enabled : null}
-            unsavedTabs={unsavedTabs}
-            onShowUnsaved={() =>
-              setTab(generalDirty ? "general" : "agentDefaults")
-            }
-            onShowGeneral={() => setTab("general")}
-          />
-        </TabsContent>
-
         {/* Read-only stats: delegation can be off while its history stays
             meaningful, so this tab is not gated on the kill switch. */}
         <TabsContent value="performance" className="pt-2">
@@ -419,15 +434,13 @@ export function DelegationSettingsSection() {
         </TabsContent>
       </Tabs>
 
-      {tab !== "assistants" ? (
-        <SettingsSaveBar
-          onSave={() => void save()}
-          saving={saving}
-          disabled={loading}
-          label={t("save")}
-          savingLabel={t("saving")}
-        />
-      ) : null}
+      <SettingsSaveBar
+        onSave={() => void save()}
+        saving={saving}
+        disabled={loading}
+        label={t("save")}
+        savingLabel={t("saving")}
+      />
     </SettingsSection>
   )
 }

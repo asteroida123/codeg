@@ -1,6 +1,7 @@
 "use client"
 
 import { useCallback, useMemo, useRef, useSyncExternalStore } from "react"
+import type { PromptRewindTarget } from "@/lib/api"
 import {
   useAcpActions,
   useConnectionStore,
@@ -24,6 +25,7 @@ import type {
   RemoteControlInfo,
   SessionConfigOptionInfo,
   AsyncTaskRecord,
+  BackgroundOutstandingTask,
   SessionFailureRecord,
   SessionModeStateInfo,
   PromptInputBlock,
@@ -45,6 +47,8 @@ const EMPTY_STEERED_MESSAGE_IDS: string[] = []
 // Stable empty reference: a new [] on every render would break the memo below
 // for every connection that has no async tasks — i.e. almost all of them.
 const EMPTY_ASYNC_TASKS: AsyncTaskRecord[] = []
+const EMPTY_DELEGATED_CHILDREN: string[] = []
+const EMPTY_BACKGROUND_TASKS: readonly BackgroundOutstandingTask[] = []
 
 export interface UseConnectionReturn {
   connectionId: string | null
@@ -70,7 +74,14 @@ export interface UseConnectionReturn {
   connectError: ConnectErrorInfo | null
   promptCapabilities: PromptCapabilitiesInfo
   supportsFork: boolean
+  /** See `ConnectionState.supportsRewind`. */
+  supportsRewind: boolean
   selectorsReady: boolean
+  /** The composer's pending mode pick recorded on this connection (see
+   *  `ConnectionState.composerModeId`), or `null`. */
+  composerModeId: string | null
+  /** True while a draft's first send is being admitted: selectors disabled. */
+  selectorsLocked: boolean
   hasCachedSelectors: boolean
   sessionId: string | null
   /** The working directory the live connection was established with (null when
@@ -129,13 +140,22 @@ export interface UseConnectionReturn {
    *  teardown (`shouldDisconnectOnUnmount`) spares a connection whose agent CLI
    *  still has background work to finish. */
   backgroundOutstanding: number
+  /** Those tasks one by one — the background sub-agents the composer's
+   *  running list shows after their turn ended. See
+   *  `ConnectionState.backgroundTasks`. */
+  backgroundTasks: readonly BackgroundOutstandingTask[]
+  /** The codeg delegations this connection still has running (their child
+   *  connection ids). Never rendered from here either — a busy signal, because
+   *  ending the parent cancels them. See
+   *  `ConnectionState.delegatedChildren`. */
+  delegatedChildren: string[]
   connect: (
     agentType: AgentType,
     workingDir?: string,
     sessionId?: string,
     conversationId?: number
   ) => Promise<void>
-  disconnect: () => Promise<void>
+  disconnect: (onlyIfIdle?: boolean) => Promise<void>
   /** Restart the session (disconnect + resume same sessionId) so it picks up
    *  current agent/model settings. Returns `true` if it actually restarted,
    *  `false` on a no-op (viewer / delegation child / no connection). */
@@ -148,10 +168,21 @@ export interface UseConnectionReturn {
       folderId?: number | null
       conversationId?: number | null
       clientMessageId?: string | null
+      rewind?: PromptRewindTarget | null
     }
-  ) => Promise<void>
+  ) => Promise<boolean>
   setMode: (modeId: string) => Promise<void>
-  setConfigOption: (configId: string, valueId: string) => Promise<void>
+  setConfigOption: (
+    configId: string,
+    valueId: string,
+    opts?: { saveAsDefault?: boolean }
+  ) => Promise<void>
+  setComposerMode: (
+    modeId: string | null,
+    opts?: { initial?: boolean }
+  ) => Promise<boolean>
+  beginFirstSend: () => number
+  releaseFirstSend: (token: number) => void
   cancel: () => Promise<void>
   respondPermission: (requestId: string, optionId: string) => Promise<void>
   answerQuestion: (questionId: string, answer: QuestionAnswer) => Promise<void>
@@ -281,7 +312,10 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   const promptCapabilities =
     connection?.promptCapabilities ?? DEFAULT_PROMPT_CAPABILITIES
   const supportsFork = connection?.supportsFork ?? false
+  const supportsRewind = connection?.supportsRewind ?? false
   const selectorsReady = connection?.selectorsReady ?? false
+  const composerModeId = connection?.composerModeId ?? null
+  const selectorsLocked = connection?.selectorsLocked ?? false
   const sessionId = connection?.sessionId ?? null
   const cached = connection?.agentType
     ? getCachedSelectors(connection.agentType)
@@ -313,6 +347,9 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   const configStaleDismissed = connection?.configStaleDismissed ?? false
   const isDelegationChild = connection?.isDelegationChild ?? false
   const backgroundOutstanding = connection?.backgroundOutstanding ?? 0
+  const backgroundTasks = connection?.backgroundTasks ?? EMPTY_BACKGROUND_TASKS
+  const delegatedChildren =
+    connection?.delegatedChildren ?? EMPTY_DELEGATED_CHILDREN
 
   const connect = useCallback(
     (
@@ -334,9 +371,13 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   // Drops `actions.disconnect`'s teardown-confirmed flag: this hook's callers
   // are closing a surface, and only a caller that reports a restart back to the
   // user (see `reapplyConfig`) has anything to do with that answer.
-  const disconnect = useCallback(async () => {
-    await actions.disconnect(contextKey)
-  }, [actions, contextKey])
+  const disconnect = useCallback(
+    async (onlyIfIdle?: boolean) => {
+      if (onlyIfIdle) await actions.disconnectIfIdle(contextKey)
+      else await actions.disconnect(contextKey)
+    },
+    [actions, contextKey]
+  )
 
   const sendPrompt = useCallback(
     (
@@ -345,6 +386,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
         folderId?: number | null
         conversationId?: number | null
         clientMessageId?: string | null
+        rewind?: PromptRewindTarget | null
       }
     ) => actions.sendPrompt(contextKey, blocks, opts),
     [actions, contextKey]
@@ -356,8 +398,24 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   )
 
   const setConfigOption = useCallback(
-    (configId: string, valueId: string) =>
-      actions.setConfigOption(contextKey, configId, valueId),
+    (configId: string, valueId: string, opts?: { saveAsDefault?: boolean }) =>
+      actions.setConfigOption(contextKey, configId, valueId, opts),
+    [actions, contextKey]
+  )
+
+  const setComposerMode = useCallback(
+    (modeId: string | null, opts?: { initial?: boolean }) =>
+      actions.setComposerMode(contextKey, modeId, opts),
+    [actions, contextKey]
+  )
+
+  const beginFirstSend = useCallback(
+    () => actions.beginFirstSend(contextKey),
+    [actions, contextKey]
+  )
+
+  const releaseFirstSend = useCallback(
+    (token: number) => actions.releaseFirstSend(contextKey, token),
     [actions, contextKey]
   )
 
@@ -397,7 +455,10 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       connectError,
       promptCapabilities,
       supportsFork,
+      supportsRewind,
       selectorsReady,
+      composerModeId,
+      selectorsLocked,
       hasCachedSelectors,
       sessionId,
       connectedWorkingDir,
@@ -424,6 +485,8 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       configStaleDismissed,
       isDelegationChild,
       backgroundOutstanding,
+      backgroundTasks,
+      delegatedChildren,
       connect,
       disconnect,
       reapplyConfig,
@@ -431,6 +494,9 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       sendPrompt,
       setMode,
       setConfigOption,
+      setComposerMode,
+      beginFirstSend,
+      releaseFirstSend,
       cancel,
       respondPermission,
       answerQuestion,
@@ -443,7 +509,10 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       connectError,
       promptCapabilities,
       supportsFork,
+      supportsRewind,
       selectorsReady,
+      composerModeId,
+      selectorsLocked,
       hasCachedSelectors,
       sessionId,
       connectedWorkingDir,
@@ -470,6 +539,8 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       configStaleDismissed,
       isDelegationChild,
       backgroundOutstanding,
+      backgroundTasks,
+      delegatedChildren,
       connect,
       disconnect,
       reapplyConfig,
@@ -477,6 +548,9 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       sendPrompt,
       setMode,
       setConfigOption,
+      setComposerMode,
+      beginFirstSend,
+      releaseFirstSend,
       cancel,
       respondPermission,
       answerQuestion,

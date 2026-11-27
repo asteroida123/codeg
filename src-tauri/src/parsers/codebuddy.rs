@@ -142,7 +142,7 @@ impl CodeBuddyParser {
                     // `_` arm — `parse_detail` applies the SAME exclusion, and
                     // the two paths MUST agree or the auto-title backfill would
                     // oscillate between them.
-                    "user" if !is_injected_user_record(&value) => {
+                    "user" if !is_injected_user_record(&value) && !is_compaction_record(&value) => {
                         message_count += 1;
                         if first_user_text.is_none() {
                             let text = shown_user_text(collect_text(&value, "input_text"));
@@ -151,7 +151,7 @@ impl CodeBuddyParser {
                             }
                         }
                     }
-                    "assistant" => message_count += 1,
+                    "assistant" if !is_compaction_record(&value) => message_count += 1,
                     _ => {}
                 },
                 _ => {}
@@ -249,6 +249,14 @@ impl CodeBuddyParser {
             match record_type {
                 "custom-title" | "ai-title" | "topic" => titles.feed(record_type, &value),
                 "message" => match value.get("role").and_then(|r| r.as_str()).unwrap_or("") {
+                    "user" if is_compaction_record(&value) => {
+                        // Never a prompt either (see `is_compaction_record`):
+                        // the boundary becomes the compaction divider, and the
+                        // rest of the compaction is dropped.
+                        if let Some(divider) = compaction_divider(&value, idx, ts) {
+                            messages.push(divider);
+                        }
+                    }
                     "user" => {
                         let text = collect_text(&value, "input_text");
                         if is_injected_user_record(&value) {
@@ -285,6 +293,7 @@ impl CodeBuddyParser {
                             }
                         }
                     }
+                    "assistant" if is_compaction_record(&value) => {}
                     "assistant" => {
                         message_count += 1;
                         let text = collect_text(&value, "output_text");
@@ -902,6 +911,45 @@ fn deferred_result_envelope(value: &Value) -> Option<String> {
     .ok()
 }
 
+/// `text` without the line-range hint CodeBuddy (2.184.0 on) appends to a Read
+/// result, or `text` itself when it has none.
+///
+/// The hint is one line addressed to the model, after the numbered lines and
+/// the empty `N→` line that ends them:
+/// `\n<system-reminder data-role="tool-hint">Read lines 1-2 of 2.</system-reminder>`
+/// (a partial read gets a `[Truncated: …]` notice naming the next offset, a
+/// read past the end "Read 0 lines from line N"). It reaches codeg live, in a
+/// `session/load` replay and in the transcript's `output.text`, and left in
+/// place it would become the last line of the file card's text. Only a hint
+/// that closes the text, right after a numbered line, is taken off, so any
+/// other result keeps its text as sent; what is left is exactly what 2.183.0
+/// sent for the same read.
+pub(crate) fn strip_read_range_hint(text: &str) -> &str {
+    const OPEN: &str = "\n<system-reminder data-role=\"tool-hint\">";
+    const CLOSE: &str = "</system-reminder>";
+    let Some(body) = text.strip_suffix(CLOSE) else {
+        return text;
+    };
+    let Some(at) = body.rfind(OPEN) else {
+        return text;
+    };
+    let hint = &body[at + OPEN.len()..];
+    if hint.contains('\n') || hint.contains("<system-reminder") {
+        return text;
+    }
+    let kept = &text[..at];
+    let last_line = kept.rsplit('\n').next().unwrap_or(kept);
+    let is_numbered = last_line
+        .trim_start()
+        .split_once('→')
+        .is_some_and(|(num, _)| !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()));
+    if is_numbered {
+        kept
+    } else {
+        text
+    }
+}
+
 /// `function_call_result.output` is `{type:"text", text}`; fall back to the raw
 /// string or `providerData.toolResult.content`. Deferred MCP tools first surface
 /// their structured `mcpMeta` envelope (see `deferred_result_envelope`).
@@ -912,10 +960,10 @@ fn tool_output_preview(value: &Value) -> Option<String> {
     if let Some(output) = value.get("output") {
         if let Some(text) = output.as_str() {
             if !text.is_empty() {
-                return Some(text.to_string());
+                return Some(strip_read_range_hint(text).to_string());
             }
         } else if let Some(text) = output.get("text").and_then(|t| t.as_str()) {
-            return Some(text.to_string());
+            return Some(strip_read_range_hint(text).to_string());
         }
     }
     let content = value.get("providerData")?.get("toolResult")?.get("content")?;
@@ -998,6 +1046,115 @@ fn is_injected_user_record(value: &Value) -> bool {
         .and_then(|p| p.get("isMeta"))
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+/// Whether a `message` record is CodeBuddy's compaction bookkeeping rather
+/// than something the person or the agent said.
+///
+/// The flags are the ones CodeBuddy's own `isNonUserUserRoleItem` and
+/// `convertHistoryItemContentToAcp` read: the compaction boundary that holds
+/// the kept summary (`isCompacted` / `isSummary`, with a `compactType`), the
+/// "Please continue with the conversation based on the summarized context
+/// above" prompt that resumes the turn (`isCompactInternal`), and, up to
+/// 2.185.0, the compact agent's instruction prompt and its reply (`agent:
+/// "compact"`). Rendered as messages they put the raw summary XML in a user
+/// bubble and counted as prompts.
+fn is_compaction_record(value: &Value) -> bool {
+    let Some(data) = value.get("providerData") else {
+        return false;
+    };
+    let flag = |key: &str| data.get(key).and_then(Value::as_bool) == Some(true);
+    flag("isCompactInternal")
+        || flag("isCompacted")
+        || flag("isSummary")
+        || data.get("compactType").is_some_and(Value::is_string)
+        || data.get("agent").and_then(Value::as_str) == Some("compact")
+}
+
+/// The compaction divider for a compaction boundary record, carrying the
+/// summary it kept, or `None` for any other compaction record.
+///
+/// A boundary is CodeBuddy's `isCompactBoundaryMessage`: a user record flagged
+/// `isCompacted` or `isSummary` that is not a prompt-too-long or media-body
+/// recovery. Its text wraps the summary in `<cb_summary>` (a `/compact`) or
+/// `<conversation_history_summary>` (an automatic compaction). The divider is
+/// the `_meta.contextCompaction` call the live session draws from the same
+/// compaction (`acp::connection::codebuddy_compaction_divider`).
+fn compaction_divider(value: &Value, idx: usize, ts: DateTime<Utc>) -> Option<UnifiedMessage> {
+    let data = value.get("providerData")?;
+    let flag = |key: &str| data.get(key).and_then(Value::as_bool) == Some(true);
+    if !(flag("isCompacted") || flag("isSummary"))
+        || flag("isPtlRecovery")
+        || flag("isMediaBodyRecovery")
+    {
+        return None;
+    }
+    let tool_use_id = data
+        .get("compactionId")
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("cb-compaction-{idx}"));
+    let mut marker = serde_json::Map::new();
+    marker.insert("version".to_string(), 1.into());
+    let trigger = match data.get("compactType").and_then(Value::as_str) {
+        Some("user-command") => Some("manual"),
+        Some("pre-message-auto" | "emergency-auto" | "model-request") => Some("auto"),
+        _ => None,
+    };
+    if let Some(trigger) = trigger {
+        marker.insert("trigger".to_string(), trigger.into());
+    }
+    let mut content = vec![
+        ContentBlock::ToolUse {
+            tool_use_id: Some(tool_use_id.clone()),
+            tool_name: "context_compaction".to_string(),
+            input_preview: None,
+            status: None,
+            meta: Some(serde_json::json!({ "contextCompaction": marker })),
+        },
+        ContentBlock::ToolResult {
+            tool_use_id: Some(tool_use_id),
+            output_preview: None,
+            is_error: false,
+            agent_stats: None,
+            images: Vec::new(),
+            exit_code: None,
+        },
+    ];
+    if let Some(summary) = compaction_summary(&collect_text(value, "input_text")) {
+        crate::parsers::attach_compaction_summary(&mut content, summary);
+    }
+    Some(UnifiedMessage {
+        id: format!("cb-compaction-{idx}"),
+        role: MessageRole::Assistant,
+        content,
+        timestamp: ts,
+        usage: None,
+        duration_ms: None,
+        model: None,
+        completed_at: Some(ts),
+        agent_message_id: None,
+    })
+}
+
+/// The summary inside a compaction boundary's `<cb_summary>` or
+/// `<conversation_history_summary>` wrapper.
+fn compaction_summary(text: &str) -> Option<String> {
+    let mut text = text.trim();
+    for (open, close) in [
+        ("<cb_summary>", "</cb_summary>"),
+        (
+            "<conversation_history_summary>",
+            "</conversation_history_summary>",
+        ),
+    ] {
+        if let Some(inner) = text.strip_prefix(open) {
+            text = inner.strip_suffix(close).unwrap_or(inner).trim();
+            break;
+        }
+    }
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 /// Record the `<task-notification>` an injected user message carries, keyed by
@@ -1658,6 +1815,113 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Compaction records (shapes from 2.185.0 and 2.186.0 transcripts, text
+    /// shortened) are no prompts: each boundary becomes a compaction divider
+    /// holding its summary, and the continue prompt and the old compact agent's
+    /// exchange disappear.
+    #[test]
+    fn compaction_records_become_dividers_not_messages() {
+        let root = std::env::temp_dir().join(format!("codeg-cb-compact-{}", uuid::Uuid::new_v4()));
+        let sid = "sess-compact";
+        let user = |ts: i64, text: &str, data: Value| {
+            json!({"type":"message","role":"user","timestamp":ts,"cwd":"/Users/demo/app","sessionId":sid,
+                   "content":[{"type":"input_text","text":text}],"providerData":data})
+        };
+        let reply = |ts: i64, text: &str, data: Value| {
+            json!({"type":"message","role":"assistant","timestamp":ts,"cwd":"/Users/demo/app","sessionId":sid,
+                   "content":[{"type":"output_text","text":text}],"providerData":data})
+        };
+        write_session(
+            &root,
+            "Users-demo-app",
+            sid,
+            &[
+                user(1795542351000, "hello there", json!({"agent":"cli"})),
+                reply(1795542352000, "hi", json!({"agent":"cli"})),
+                // 2.185.0's `/compact`: the compact agent's own exchange.
+                user(1795542357010, "**IMPORTANT CONSTRAINTS:**\n- Do NOT use any tools",
+                     json!({"startsNewUserRequest":true,"agent":"compact"})),
+                reply(1795542357062, "<conversation_history_summary>old</conversation_history_summary>",
+                      json!({"agent":"compact"})),
+                // 2.186.0's `/compact`: the typed command, then the boundary.
+                user(1795542379441, "/compact",
+                     json!({"skipRun":true,"isManualCompactCommand":true,"agent":"cli"})),
+                user(1795542379480, "<cb_summary>\nSummary of the conversation so far:\nhello there\n</cb_summary>",
+                     json!({"compactType":"user-command","compactionId":"cmp_manual","isCompacted":true,
+                            "isCompactInternal":true,"isSummary":false,"agent":"cli"})),
+                // An automatic compaction: the boundary, then the continue prompt.
+                user(1795542389359, "<conversation_history_summary>\nhello from fake model\n</conversation_history_summary>",
+                     json!({"compactType":"emergency-auto","compactionId":"cmp_auto","isCompacted":true,
+                            "isCompactInternal":true,"isSummary":true,"agent":"cli"})),
+                user(1795542389369, "Please continue with the conversation based on the summarized context above.",
+                     json!({"isCompactInternal":true,"agent":"cli"})),
+                reply(1795542389408, "continuing", json!({"agent":"cli"})),
+            ],
+        );
+
+        let parser = CodeBuddyParser::with_base_dir(root.clone());
+        let summaries = parser.list_conversations().expect("list");
+        // hello there, hi, /compact, continuing.
+        assert_eq!(summaries[0].message_count, 4);
+        let detail = parser.get_conversation(sid).expect("detail");
+        assert_eq!(detail.summary.message_count, 4);
+
+        let texts: Vec<String> = detail
+            .turns
+            .iter()
+            .flat_map(|t| &t.blocks)
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["hello there", "hi", "/compact", "continuing"]);
+
+        let dividers: Vec<(String, Value, Option<String>, Option<Value>)> = detail
+            .turns
+            .iter()
+            .flat_map(|t| t.blocks.windows(2))
+            .filter_map(|pair| match pair {
+                [ContentBlock::ToolUse {
+                    tool_use_id: Some(id),
+                    tool_name,
+                    meta: Some(meta),
+                    ..
+                }, ContentBlock::ToolResult { output_preview, .. }]
+                    if tool_name == "context_compaction" =>
+                {
+                    Some((
+                        id.clone(),
+                        meta["contextCompaction"].clone(),
+                        output_preview.clone(),
+                        meta.get(crate::parsers::COMPACTION_SUMMARY_META_KEY)
+                            .cloned(),
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dividers,
+            vec![
+                (
+                    "cmp_manual".to_string(),
+                    json!({"version": 1, "trigger": "manual"}),
+                    Some("Summary of the conversation so far:\nhello there".to_string()),
+                    Some(json!(true)),
+                ),
+                (
+                    "cmp_auto".to_string(),
+                    json!({"version": 1, "trigger": "auto"}),
+                    Some("hello from fake model".to_string()),
+                    Some(json!(true)),
+                ),
+            ]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// A Responses-API model's record carries the agents SDK's `response_done`
     /// usage, which is what CodeBuddy stores when the raw stream reports none.
     #[test]
@@ -2105,6 +2369,82 @@ mod tests {
         assert!(
             !read_output.contains("1→"),
             "line-number prefixes must be stripped, got: {read_output}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A 2.184.0 Read result as its transcript stores it: the numbered lines,
+    /// the empty `N→` line and the line-range hint for the model (captured).
+    const READ_2184: &str = "   1→outside one\n   2→outside two\n   3→\n<system-reminder data-role=\"tool-hint\">Read lines 1-2 of 2.</system-reminder>";
+
+    #[test]
+    fn read_range_hint_comes_off_and_leaves_what_2183_sent() {
+        assert_eq!(
+            strip_read_range_hint(READ_2184),
+            "   1→outside one\n   2→outside two\n   3→"
+        );
+        // A partial read's notice and a read past the end (captured).
+        let partial = " 119→big line 119\n 120→\n<system-reminder data-role=\"tool-hint\">[Truncated: PARTIAL view — big.txt: showing lines 100-119 (total unknown). Call Read with offset=120 limit=20 for the next page, or Grep to find a specific section. Do NOT answer from this page alone if the answer may be further in the file.]</system-reminder>";
+        assert_eq!(strip_read_range_hint(partial), " 119→big line 119\n 120→");
+        let past_end = "1000→\n<system-reminder data-role=\"tool-hint\">Read 0 lines from line 1000 (total unknown).</system-reminder>";
+        assert_eq!(strip_read_range_hint(past_end), "1000→");
+    }
+
+    #[test]
+    fn a_tool_hint_after_anything_but_numbered_lines_stays() {
+        // A background task snapshot's hint follows prose, not numbered lines.
+        let snapshot = "Status: running\n<system-reminder data-role=\"tool-hint\">Do NOT poll TaskOutput in a loop.</system-reminder>";
+        assert_eq!(strip_read_range_hint(snapshot), snapshot);
+        // Not at the end, another role, or spanning lines: kept as sent.
+        let not_last = format!("{READ_2184}\nmore");
+        assert_eq!(strip_read_range_hint(&not_last), not_last);
+        let other_role = "   1→a\n   2→\n<system-reminder data-role=\"other\">x</system-reminder>";
+        assert_eq!(strip_read_range_hint(other_role), other_role);
+        let multi_line =
+            "   1→a\n   2→\n<system-reminder data-role=\"tool-hint\">x\ny</system-reminder>";
+        assert_eq!(strip_read_range_hint(multi_line), multi_line);
+        assert_eq!(strip_read_range_hint("   1→a\n   2→b"), "   1→a\n   2→b");
+    }
+
+    #[test]
+    fn read_result_with_a_range_hint_shows_only_the_file_lines() {
+        let root = std::env::temp_dir().join(format!("codeg-cb-readhint-{}", uuid::Uuid::new_v4()));
+        let sid = "sess-readhint";
+        write_session(
+            &root,
+            "Users-demo-app",
+            sid,
+            &[
+                json!({"type":"message","role":"user","timestamp":1781821844000i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "content":[{"type":"input_text","text":"read it"}]}),
+                json!({"type":"function_call","timestamp":1781821845000i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"Read","callId":"r1","arguments":"{\"file_path\": \"/x\"}"}),
+                json!({"type":"function_call_result","timestamp":1781821845100i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"Read","callId":"r1","status":"completed",
+                       "output":{"type":"text","text":READ_2184}}),
+            ],
+        );
+
+        let parser = CodeBuddyParser::with_base_dir(root.clone());
+        let detail = parser.get_conversation(sid).expect("detail");
+        let read_output = detail
+            .turns
+            .iter()
+            .flat_map(|t| &t.blocks)
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id: Some(id),
+                    output_preview,
+                    ..
+                } if id == "r1" => output_preview.clone(),
+                _ => None,
+            })
+            .expect("read tool result");
+        assert_eq!(
+            Some(read_output),
+            crate::parsers::strip_numbered_lines("   1→outside one\n   2→outside two\n   3→"),
+            "the card gets the same lines as for 2.183.0's result"
         );
 
         std::fs::remove_dir_all(&root).ok();

@@ -18,6 +18,11 @@ import {
 } from "lucide-react"
 import { toast } from "sonner"
 
+import {
+  AgentPanelCard,
+  AgentPanelGroup,
+  AgentPanelSaveBar,
+} from "@/components/settings/agent-panel-layout"
 import { Button } from "@/components/ui/button"
 import { ProviderModelsRefreshButton } from "@/components/settings/provider-models"
 import {
@@ -432,6 +437,7 @@ export function CursorConfigPanel({
   // Probe on mount and whenever the method changes (the ref above is updated
   // first, so the probe sees the right credential for the new mode).
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- auth probe against the CLI; the loader flips its loading flag first
     void refreshAuth()
   }, [refreshAuth, mode])
 
@@ -473,12 +479,16 @@ export function CursorConfigPanel({
   useEffect(() => {
     if (authState !== "ok") return
     if (modelsLoaded || modelsLoading) return
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- model list fetch; the loader flips its loading flag first
     void loadModels()
   }, [authState, loadModels, modelsLoaded, modelsLoading])
 
   // Reset the "loaded" latch when the method changes so the effect above
-  // re-probes the model list for the newly-selected credential.
+  // re-probes the model list for the newly-selected credential. Kept as an
+  // effect: it must run after the auth probe above has flipped `authLoading`,
+  // or the model fetch would fire against the previous method's auth state.
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- ordered after the auth-probe effect, see above
     setModelsLoaded(false)
     setModels([])
     setModelsError(null)
@@ -662,44 +672,44 @@ export function CursorConfigPanel({
   const busy = saving || savingAll
 
   return (
-    <div className="space-y-3 rounded-md border bg-muted/10 p-3">
-      <div>
-        <label className="text-xs font-medium">{t("configManagement")}</label>
-        <p className="mt-1 text-2xs text-muted-foreground">
-          {t("cursor.configDescription")}
-        </p>
-      </div>
-
+    <AgentPanelGroup
+      title={t("configManagement")}
+      description={t("cursor.configDescription")}
+    >
       {/* ---- Authentication method ---- */}
-      <div className="space-y-1.5">
-        <label className="text-2xs text-muted-foreground">
-          {t("cursor.authMode")}
-        </label>
-        <Select
-          value={mode}
-          onValueChange={(value) => setMode(value as CursorAuthMethod)}
-        >
-          <SelectTrigger className="w-full">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent align="start">
-            <SelectItem value="subscription">
-              {t("authModeOfficialSubscription")}
-            </SelectItem>
-            <SelectItem value="custom">{t("cursor.authModeApiKey")}</SelectItem>
-          </SelectContent>
-        </Select>
-        <p className="text-2xs text-muted-foreground">
-          {mode === "subscription"
-            ? t("cursor.subscriptionHint")
-            : t("cursor.authModeApiKeyHint")}
-        </p>
-      </div>
+      <AgentPanelCard>
+        <div className="space-y-1.5">
+          <label className="text-2xs text-muted-foreground">
+            {t("cursor.authMode")}
+          </label>
+          <Select
+            value={mode}
+            onValueChange={(value) => setMode(value as CursorAuthMethod)}
+          >
+            <SelectTrigger className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent align="start">
+              <SelectItem value="subscription">
+                {t("authModeOfficialSubscription")}
+              </SelectItem>
+              <SelectItem value="custom">
+                {t("cursor.authModeApiKey")}
+              </SelectItem>
+            </SelectContent>
+          </Select>
+          <p className="text-2xs text-muted-foreground">
+            {mode === "subscription"
+              ? t("cursor.subscriptionHint")
+              : t("cursor.authModeApiKeyHint")}
+          </p>
+        </div>
+      </AgentPanelCard>
 
       {/* ---- Credential card: shared auth status + method-specific body ---- */}
-      <div className="space-y-2 rounded-md border bg-background/60 p-2.5">
-        <div className="flex items-center justify-between gap-2">
-          <span className="text-2xs font-medium">{t("cursor.authTitle")}</span>
+      <AgentPanelCard
+        title={t("cursor.authTitle")}
+        control={
           <div className="flex items-center gap-1.5">
             <span
               className={cn(
@@ -741,8 +751,8 @@ export function CursorConfigPanel({
               />
             </Button>
           </div>
-        </div>
-
+        }
+      >
         {/* A credential that is on disk but did not work is the case the
             session error comes from, so say what it means. The two modes fail
             for different reasons and recover differently — a browser login can
@@ -815,7 +825,7 @@ export function CursorConfigPanel({
                 )}
               </Button>
             </div>
-            <p className="text-3xs text-muted-foreground">
+            <p className="text-2xs text-muted-foreground">
               {t("cursor.apiKeyHint")}
             </p>
           </div>
@@ -830,25 +840,24 @@ export function CursorConfigPanel({
         {authState !== "missing" &&
         authState !== "loading" &&
         models.length === 0 ? (
-          <p className="text-3xs text-muted-foreground">
+          <p className="text-2xs text-muted-foreground">
             {t("cursor.modelsNeedAuth")}
           </p>
         ) : null}
-      </div>
+      </AgentPanelCard>
 
       {/* ---- Model picker (only when real models were fetched) ---- */}
       {models.length > 0 ? (
-        <div className="space-y-2 rounded-md border bg-background/60 p-2.5">
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-2xs font-medium">
-              {t("cursor.modelTitle")}
-            </span>
+        <AgentPanelCard
+          title={t("cursor.modelTitle")}
+          control={
             <ProviderModelsRefreshButton
               fetching={modelsLoading}
               onRefresh={() => void loadModels()}
               label={t("cursor.loadModels")}
             />
-          </div>
+          }
+        >
           <Combobox
             key={currentBase || UNSET}
             items={familyItems}
@@ -983,40 +992,34 @@ export function CursorConfigPanel({
           {/* The exact id `--model` receives. A repaired pick (an unavailable
               combination clamped to its nearest sibling) is only visible here. */}
           {resolvedEntry ? (
-            <p className="text-3xs text-muted-foreground">
+            <p className="text-2xs text-muted-foreground">
               <span className="text-foreground/80">{resolvedEntry.label}</span>{" "}
               <span className="font-mono">{resolvedEntry.id}</span>
             </p>
           ) : null}
 
           {modelsError ? (
-            <p className="text-3xs text-muted-foreground">
+            <p className="text-2xs text-muted-foreground">
               {t("cursor.modelsUnavailable")}: {modelsError}
             </p>
           ) : null}
-          <p className="text-3xs text-muted-foreground">
+          <p className="text-2xs text-muted-foreground">
             {t("cursor.modelHint")}
           </p>
           {hasVariantControls ? (
-            <p className="text-3xs text-muted-foreground">
+            <p className="text-2xs text-muted-foreground">
               {t("cursor.modelVariantHint")}
             </p>
           ) : null}
-        </div>
+        </AgentPanelCard>
       ) : null}
 
       {/* ---- Permissions & sandbox card (both methods) ---- */}
-      <div className="space-y-2 rounded-md border bg-background/60 p-2.5">
-        <div className="flex items-center gap-1.5">
-          <ShieldCheck className="h-3.5 w-3.5 text-muted-foreground" />
-          <span className="text-2xs font-medium">
-            {t("cursor.permissionsTitle")}
-          </span>
-        </div>
-        <p className="text-3xs text-muted-foreground">
-          {t("cursor.permissionsDescription")}
-        </p>
-
+      <AgentPanelCard
+        icon={ShieldCheck}
+        title={t("cursor.permissionsTitle")}
+        description={t("cursor.permissionsDescription")}
+      >
         <div className="grid gap-2 md:grid-cols-2">
           <div className="space-y-1">
             <label className="text-2xs text-muted-foreground">
@@ -1070,7 +1073,7 @@ export function CursorConfigPanel({
             half matters most: Cursor's own prompt carries an "Allow always"
             button, and the rule it writes lands in the Allowed list right
             below — the connection is invisible otherwise. */}
-        <p className="text-3xs text-muted-foreground">
+        <p className="text-2xs text-muted-foreground">
           {force
             ? t("cursor.permissionModeHint")
             : t("cursor.permissionModeAskHint")}
@@ -1104,13 +1107,13 @@ export function CursorConfigPanel({
             />
           </div>
         </div>
-        <p className="text-3xs text-muted-foreground">
+        <p className="text-2xs text-muted-foreground">
           {t("cursor.rulesSyntaxHint")}
         </p>
-      </div>
+      </AgentPanelCard>
 
       {/* ---- One save for auth method + model + permissions ---- */}
-      <div className="flex justify-end">
+      <AgentPanelSaveBar>
         <Button
           className="h-7 gap-1.5 px-2.5 text-xs"
           disabled={busy}
@@ -1125,10 +1128,10 @@ export function CursorConfigPanel({
           )}
           {t("cursor.saveConfig")}
         </Button>
-      </div>
+      </AgentPanelSaveBar>
 
       {/* ---- Advanced: raw cli-config.json ---- */}
-      <div className="space-y-2">
+      <AgentPanelCard className="space-y-2">
         <button
           className="flex items-center gap-1 text-2xs text-muted-foreground hover:text-foreground"
           onClick={() => setAdvancedOpen((v) => !v)}
@@ -1143,7 +1146,7 @@ export function CursorConfigPanel({
         </button>
         {advancedOpen ? (
           <div className="space-y-1.5">
-            <p className="text-3xs text-muted-foreground">
+            <p className="text-2xs text-muted-foreground">
               {t("cursor.advancedHint")}
             </p>
             <Textarea
@@ -1171,7 +1174,7 @@ export function CursorConfigPanel({
             </div>
           </div>
         ) : null}
-      </div>
-    </div>
+      </AgentPanelCard>
+    </AgentPanelGroup>
   )
 }

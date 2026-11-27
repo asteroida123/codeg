@@ -63,6 +63,13 @@ mod m20261020_000001_folder_command_run_local;
 mod m20261022_000001_tool_approval;
 mod m20261022_000001_work_task_delivery;
 mod m20261023_000001_delegation_cache_tokens;
+mod m20261106_000001_work_task_source_key;
+mod m20261112_000001_work_task_writeback_drafts;
+mod m20261116_000001_srn_web;
+mod m20261123_000001_conversation_selector_state;
+mod m20261125_000001_personal_agent;
+mod m20261125_000002_personal_agent_item_closure;
+mod m20261125_000003_personal_agent_indexes;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -132,6 +139,13 @@ impl MigratorTrait for Migrator {
             Box::new(m20261022_000001_tool_approval::Migration),
             Box::new(m20261022_000001_work_task_delivery::Migration),
             Box::new(m20261023_000001_delegation_cache_tokens::Migration),
+            Box::new(m20261106_000001_work_task_source_key::Migration),
+            Box::new(m20261112_000001_work_task_writeback_drafts::Migration),
+            Box::new(m20261116_000001_srn_web::Migration),
+            Box::new(m20261123_000001_conversation_selector_state::Migration),
+            Box::new(m20261125_000001_personal_agent::Migration),
+            Box::new(m20261125_000002_personal_agent_item_closure::Migration),
+            Box::new(m20261125_000003_personal_agent_indexes::Migration),
         ]
     }
 }

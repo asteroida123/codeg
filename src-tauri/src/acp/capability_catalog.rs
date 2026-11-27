@@ -656,6 +656,7 @@ mod tests {
                         value: v.to_string(),
                         name: v.to_string(),
                         description: None,
+                        reasoning_efforts: None,
                     })
                     .collect(),
                 groups: Vec::new(),
@@ -963,6 +964,7 @@ mod zcode_precedence_tests {
                         value: value.to_string(),
                         name: value.to_string(),
                         description: None,
+                        reasoning_efforts: None,
                     })
                     .collect(),
                 groups: Vec::new(),

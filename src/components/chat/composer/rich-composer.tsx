@@ -48,7 +48,7 @@ import type {
   SuggestionGroupKind,
   SuggestionPopupHandle,
 } from "./suggestion/types"
-import type { ReferenceAttrs } from "./types"
+import type { ReferenceAttrs, ReferenceKind } from "./types"
 
 /**
  * Imperative handle exposed to the parent (e.g. the message input that owns
@@ -154,6 +154,12 @@ export interface RichComposerProps {
    * Commits/Skills). English fallbacks apply when omitted. Render-only.
    */
   tabLabels?: Record<SuggestionGroupKind, string>
+  /**
+   * `@` tabs this host never shows, whatever the user's preference (the
+   * personal agent's composer has no executor configs to mention). Keep it
+   * referentially stable.
+   */
+  hiddenMentionTabs?: readonly ReferenceKind[]
   /**
    * Box the `@` panel lines up with: it adopts this element's width and left
    * edge and opens above it. Point it at the composer's outer chrome so the
@@ -269,6 +275,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       referenceSearch,
       mentionUiLabels,
       tabLabels,
+      hiddenMentionTabs,
       mentionAnchorRef,
       knownInvocations,
       submitShortcut,
@@ -344,7 +351,14 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
     // Which `@` tabs to show and in what order — the user's preference from
     // Settings → General, the same for every host. Read here rather than by
     // each host so none of them can forget it; live across windows.
-    const mentionTabs = useVisibleMentionTabs()
+    const visibleTabs = useVisibleMentionTabs()
+    const mentionTabs = useMemo(
+      () =>
+        hiddenMentionTabs?.length
+          ? visibleTabs.filter((k) => !hiddenMentionTabs.includes(k))
+          : visibleTabs,
+      [visibleTabs, hiddenMentionTabs]
+    )
     // Stable controller created once (refs/setState are stable), so the editor
     // is built a single time with it.
     const mentionController = useMemo<MentionController>(
@@ -389,9 +403,8 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       // it stays inert until `referenceSearch` is set (checked at runtime in the
       // controller). `mentionController` (stable, from useMemo) captures refs
       // but only dereferences them inside event-time callbacks, never during
-      // render — the React Compiler lint can't prove that. Mirrors Tiptap's own
-      // React suggestion pattern (render() → component.ref.onKeyDown).
-      // eslint-disable-next-line react-hooks/refs
+      // render. Mirrors Tiptap's own React suggestion pattern
+      // (render() → component.ref.onKeyDown).
       extensions: buildComposerExtensions({
         placeholder: getPlaceholder,
         mentionController,
@@ -673,9 +686,18 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
     useEffect(() => {
       if (!referenceSearch && mentionOpenRef.current) closeMention()
     }, [referenceSearch, closeMention])
+    // Turned read-only while a panel is open (a box locked while it sends):
+    // the panel goes too — its picks insert through editor commands, which
+    // a read-only editor does not stop.
+    const disabledRef = useRef(disabled)
+    useEffect(() => {
+      disabledRef.current = disabled
+      if (disabled && mentionOpenRef.current) closeMention()
+    }, [disabled, closeMention])
 
     const handleReferenceSelect = useCallback(
       (reference: ReferenceAttrs, range: { from: number; to: number }) => {
+        if (disabledRef.current) return
         editor
           ?.chain()
           .focus()
@@ -767,6 +789,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
             listboxLabel={mentionUiLabels?.listbox}
             moreLabel={mentionUiLabels?.more}
             countLabel={mentionUiLabels?.count}
+            manageAssistants={mentionUiLabels?.manageAssistants}
             tabLabels={tabLabels}
             tabs={mentionTabs}
           />

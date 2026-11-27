@@ -2,6 +2,7 @@
 
 import {
   forwardRef,
+  useCallback,
   useEffect,
   useImperativeHandle,
   useLayoutEffect,
@@ -107,6 +108,8 @@ export interface SuggestionPopupProps {
   countLabel?: (count: number) => string
   /** Non-selectable hint shown under a tab whose matches were capped. */
   moreLabel?: string
+  /** A row closing the assistants tab, opening where they are managed. */
+  manageAssistants?: { label: string; open: () => void }
   /** Localized per-kind tab labels (English fallbacks apply when omitted). */
   tabLabels?: Record<SuggestionGroupKind, string>
   /**
@@ -158,6 +161,7 @@ export const SuggestionPopup = forwardRef<
     moreLabel = "More results — keep typing to filter",
     tabLabels = DEFAULT_TAB_LABELS,
     tabs = MENTION_TAB_KINDS,
+    manageAssistants,
     anchorRef,
     onActiveOptionChange,
   },
@@ -178,11 +182,16 @@ export const SuggestionPopup = forwardRef<
     // null until the first fetch resolves, so results read as "stale"
     // (and the panel shows loading) before any search has answered.
     query: string | null
-    kinds: readonly ReferenceKind[]
+    kinds: readonly SuggestionGroupKind[]
     groups: SuggestionGroup[]
   }>({ query: null, kinds: [], groups: [] })
-  const [selectedIndex, setSelectedIndex] = useState(0)
-  // The tab the user explicitly chose (via Tab/click), or null to auto-follow
+  const [selection, setSelection] = useState<{
+    query: string
+    kind: SuggestionGroupKind
+    id: string
+    index: number
+  } | null>(null)
+  // The tab the user explicitly chose or navigated, or null to auto-follow
   // the first non-empty tab. Pinning survives subsequent keystrokes within this
   // open session; reopening the panel remounts and resets it to null.
   const [pinnedTab, setPinnedTab] = useState<SuggestionGroupKind | null>(null)
@@ -204,33 +213,6 @@ export const SuggestionPopup = forwardRef<
     fresh &&
     result.kinds.includes(kind === "delegatedSession" ? "session" : kind)
 
-  // Debounced, abortable fetch on every query change — and when the shown tabs
-  // change while the panel is open (the preference lives in another window), so
-  // a tab switched back on gets its source loaded. All state updates run inside
-  // the (async) timer callback, never synchronously in the effect body.
-  useEffect(() => {
-    const abort = new AbortController()
-    let active = true
-    const timer = setTimeout(() => {
-      Promise.resolve(search(state.query, abort.signal, searchTabs))
-        .then((groups) => {
-          if (!active || abort.signal.aborted) return
-          setResult({ query: state.query, kinds: searchTabs, groups })
-          setSelectedIndex(0)
-        })
-        .catch(() => {
-          if (!active || abort.signal.aborted) return
-          setResult({ query: state.query, kinds: searchTabs, groups: [] })
-          setSelectedIndex(0)
-        })
-    }, FETCH_DEBOUNCE_MS)
-    return () => {
-      active = false
-      abort.abort()
-      clearTimeout(timer)
-    }
-  }, [state.query, search, searchTabs])
-
   const groupByKind = useMemo(
     () => new Map(result.groups.map((group) => [group.kind, group])),
     [result.groups]
@@ -244,6 +226,63 @@ export const SuggestionPopup = forwardRef<
       ),
     [searchTabs, groupByKind]
   )
+  // The publish-time ordering is computed from the arriving groups rather
+  // than the memo above: the memo's identity changes with every publication,
+  // and depending on it here would retrigger the fetch and reset the
+  // selection it is trying to preserve.
+  const orderFor = useCallback(
+    (groups: SuggestionGroup[]): readonly SuggestionGroupKind[] =>
+      searchTabs.flatMap((kind) =>
+        kind === "session" &&
+        groups.some((group) => group.kind === "delegatedSession")
+          ? ["delegatedSession", kind]
+          : [kind]
+      ),
+    [searchTabs]
+  )
+
+  // Debounced, abortable fetch on every query change — and when the shown tabs
+  // change while the panel is open (the preference lives in another window), so
+  // a tab switched back on gets its source loaded. All state updates run inside
+  // the (async) timer callback, never synchronously in the effect body.
+  useEffect(() => {
+    const abort = new AbortController()
+    let active = true
+    let published = false
+    const publish = (groups: SuggestionGroup[]) => {
+      if (!active || abort.signal.aborted) return
+      const kinds = orderFor(groups).filter(
+        (kind) => !groups.some((group) => group.kind === kind && group.loading)
+      )
+      setResult({ query: state.query, kinds, groups })
+      // A late file result must not reset navigation within a ready group.
+      const firstPublication = !published
+      setSelection((current) => {
+        if (firstPublication || current?.query !== state.query) return null
+        const group = groups.find(({ kind }) => kind === current.kind)
+        if (!group || group.loading) return current
+        const found = group.items.findIndex(
+          ({ reference }) => reference.id === current.id
+        )
+        const index =
+          found >= 0 ? found : Math.min(current.index, group.items.length - 1)
+        const chosen = group.items[index]
+        return chosen ? { ...current, index, id: chosen.reference.id } : null
+      })
+      published = true
+    }
+    const timer = setTimeout(() => {
+      Promise.resolve(search(state.query, abort.signal, searchTabs, publish))
+        .then(publish)
+        .catch(() => publish([]))
+    }, FETCH_DEBOUNCE_MS)
+    return () => {
+      active = false
+      abort.abort()
+      clearTimeout(timer)
+    }
+  }, [state.query, search, searchTabs, orderFor])
+
   // Auto-target the first non-empty tab, in the user's order, until the user
   // pins one — so a file/session/… query never strands the user on an empty
   // first tab.
@@ -269,6 +308,31 @@ export const SuggestionPopup = forwardRef<
   const flat = useMemo(
     () => (stale || !activeGroup ? [] : activeGroup.items),
     [stale, activeGroup]
+  )
+  const currentSelection =
+    selection?.query === state.query && selection.kind === activeTab
+      ? selection
+      : null
+  const foundIndex = currentSelection
+    ? flat.findIndex(({ reference }) => reference.id === currentSelection.id)
+    : -1
+  const selectedIndex =
+    foundIndex >= 0
+      ? foundIndex
+      : Math.min(currentSelection?.index ?? 0, Math.max(0, flat.length - 1))
+  const selectIndex = useCallback(
+    (index: number) => {
+      const item = flat[index]
+      if (!item) return
+      setPinnedTab(activeTab)
+      setSelection({
+        query: state.query,
+        kind: activeTab,
+        id: item.reference.id,
+        index,
+      })
+    },
+    [flat, activeTab, state.query]
   )
 
   // Scroll the active option into view (scoped to options so it never targets
@@ -435,14 +499,12 @@ export const SuggestionPopup = forwardRef<
         switch (event.key) {
           case "ArrowDown":
             if (flat.length > 0) {
-              setSelectedIndex((index) => (index + 1) % flat.length)
+              selectIndex((selectedIndex + 1) % flat.length)
             }
             return true
           case "ArrowUp":
             if (flat.length > 0) {
-              setSelectedIndex(
-                (index) => (index - 1 + flat.length) % flat.length
-              )
+              selectIndex((selectedIndex - 1 + flat.length) % flat.length)
             }
             return true
           case "Tab": {
@@ -453,7 +515,7 @@ export const SuggestionPopup = forwardRef<
             setPinnedTab(
               tabOrder[(at + dir + tabOrder.length) % tabOrder.length]
             )
-            setSelectedIndex(0)
+            setSelection(null)
             return true
           }
           case "Enter": {
@@ -481,7 +543,16 @@ export const SuggestionPopup = forwardRef<
         }
       },
     }),
-    [flat, selectedIndex, activeTab, tabOrder, onSelect, onClose, state.range]
+    [
+      flat,
+      selectedIndex,
+      selectIndex,
+      activeTab,
+      tabOrder,
+      onSelect,
+      onClose,
+      state.range,
+    ]
   )
 
   const activeLabel = tabLabels[activeTab]
@@ -565,7 +636,7 @@ export const SuggestionPopup = forwardRef<
                 onMouseDown={(event) => event.preventDefault()}
                 onClick={() => {
                   setPinnedTab(kind)
-                  setSelectedIndex(0)
+                  setSelection(null)
                 }}
                 className={cn(
                   "flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs font-medium",
@@ -630,7 +701,7 @@ export const SuggestionPopup = forwardRef<
                       event.preventDefault()
                       onSelect(item.reference, state.range)
                     }}
-                    onMouseEnter={() => setSelectedIndex(index)}
+                    onMouseEnter={() => selectIndex(index)}
                   >
                     <ReferenceIcon data={item.reference} variant="option" />
                     {/* Label at its content width (shrinking + truncating only
@@ -672,6 +743,22 @@ export const SuggestionPopup = forwardRef<
               {moreLabel}
             </div>
           )}
+          {manageAssistants && activeGroup?.kind === "assistant" ? (
+            // Not an option: a way out of the panel, to where the
+            // assistants are managed.
+            <button
+              type="button"
+              data-mention-manage-assistants
+              className="mt-0.5 flex w-full items-center rounded-md border-t border-border/50 px-2 py-1.5 text-start text-xs text-muted-foreground hover:bg-accent/50 hover:text-foreground"
+              onMouseDown={(event) => {
+                event.preventDefault()
+                onClose()
+                manageAssistants.open()
+              }}
+            >
+              {manageAssistants.label}
+            </button>
+          ) : null}
         </div>
       </div>
       {/* Announce loading / active tab + result count / empty state to screen

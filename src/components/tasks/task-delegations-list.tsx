@@ -60,6 +60,7 @@ export function TaskDelegationsList({ open, task }: TaskDelegationsListProps) {
     const offReconnect = onTransportReconnect(() => {
       void reload()
     })
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial load; reload() awaits before any setState
     void reload()
     return () => {
       cancelled = true

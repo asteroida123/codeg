@@ -966,6 +966,7 @@ pub async fn boot_reconcile_interrupted(conn: &DatabaseConnection) -> Result<u64
                 selectors: None,
                 assistant_id: None,
                 assistant_name: None,
+                bot: None,
                 progress: None,
             };
             active.status = Set(status_string(TaskStatus::Unknown));
@@ -1409,6 +1410,7 @@ fn running_report(
         selectors: None,
         assistant_id: None,
         assistant_name: None,
+        bot: None,
         progress: None,
     }
 }
@@ -1647,6 +1649,7 @@ mod tests {
             selectors: None,
             assistant_id: None,
             assistant_name: None,
+            bot: None,
             progress: None,
         }
     }
@@ -3412,6 +3415,8 @@ mod tests {
                 max_concurrent_children: Set(None),
                 max_runs_per_child: Set(None),
                 token_budget: Set(None),
+                personal_agent_dispatch_id: Set(None),
+                writeback_drafts: Set(None),
                 created_at: Set(now),
                 updated_at: Set(now),
                 started_at: Set(None),

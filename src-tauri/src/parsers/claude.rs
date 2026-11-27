@@ -919,12 +919,29 @@ fn context_continuation_text(content: &[ContentBlock]) -> Option<&str> {
 }
 
 /// The framing ahead of the summary in a continuation message: its opening
-/// sentence, then the `Summary:` line the CLI puts the summary under.
+/// sentence, any `<system-reminder>` blocks, then the `Summary:` line the CLI
+/// puts the summary under.
+///
+/// Claude Code 2.1.312 started putting a reminder for the model between the
+/// opening sentence and `Summary:` (every summary written by 2.1.312, 2.1.316
+/// and 2.1.318 on the machine this was measured on has one):
+///
+/// ```text
+/// This session is being continued from a previous conversation that ran out of context. …
+///
+/// <system-reminder>
+/// <tools-used-before-summary>Bash, Read, …</tools-used-before-summary>
+/// </system-reminder>
+/// Summary:
+/// ```
+///
+/// Only closed reminder blocks are skipped. An unclosed one, or any other text
+/// there, stays in the summary, as an unknown framing always has.
 fn continuation_preamble_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(&format!(
-            r"\A\s*{}[^\n]*\n(?:[ \t]*\r?\n)*(?:[ \t]*Summary:[ \t]*\r?\n)?",
+            r"\A\s*{}[^\n]*\n(?:[ \t]*\r?\n)*(?:[ \t]*<system-reminder>[\s\S]*?</system-reminder>[ \t]*\r?\n(?:[ \t]*\r?\n)*)*(?:[ \t]*Summary:[ \t]*\r?\n)?",
             regex::escape(CONTEXT_CONTINUATION_PREFIX)
         ))
         .unwrap()
@@ -933,12 +950,17 @@ fn continuation_preamble_regex() -> &'static Regex {
 
 /// Whether `line` is one of the instructions the CLI appends to a continuation
 /// message after the summary: where the full pre-compaction transcript lives,
-/// and to pick the work back up without asking.
+/// to pick the work back up without asking, and (Claude Code 2.1.293 and
+/// later, after every summary) that the messages kept after the summary are
+/// newer than it.
 fn is_continuation_trailer(line: &str) -> bool {
     let line = line.trim_start();
     line.starts_with("If you need specific details from before compaction")
         || line.starts_with("Continue the conversation from where it left off")
         || line.starts_with("Please continue the conversation from where")
+        || line.starts_with(
+            "The messages after this summary are the most recent messages from before compaction",
+        )
 }
 
 /// The summary a continuation message carries, without the framing the CLI
@@ -972,7 +994,7 @@ fn continuation_summary_text(message: &str) -> String {
 
 /// Whether a reconstructed slash-command display line is a `/compact`
 /// invocation — bare, or carrying the focus instructions it accepts.
-fn is_compact_command(display: &str) -> bool {
+pub(crate) fn is_compact_command(display: &str) -> bool {
     display == "/compact" || display.starts_with("/compact ")
 }
 
@@ -1681,6 +1703,12 @@ fn resolve_claude_config_dir_from(
 }
 
 impl AgentParser for ClaudeParser {
+    /// Claude Code's own `<session>.jsonl`, read raw.
+    fn own_record_contains(&self, conversation_id: &str, needle: &str) -> Option<bool> {
+        let path = find_session_file_in(&self.base_dir, conversation_id)?;
+        super::file_lines_contain(&path, needle)
+    }
+
     fn list_conversations(&self) -> Result<Vec<ConversationSummary>, ParseError> {
         let mut conversations = Vec::new();
 
@@ -2151,10 +2179,13 @@ impl ClaudeRecordAccumulator {
                     //
                     // `background_watch` also keys its overlay turn ids by
                     // position, so an insert inside an open episode re-emits
-                    // everything after it. Only a manual compaction inserts,
-                    // and a manual one is a foreground submission — the
-                    // watcher's foreground window is closed around it. Were
-                    // that ever to change the cost is a duplicate overlay
+                    // everything after it. A `/compact` codeg sent is a
+                    // foreground submission, which no episode sees. One it did
+                    // not send (claude-agent-acp 0.101.0 sends its own for an
+                    // idle session) opens an episode AT this echo, handed the
+                    // boundary and the summary the watcher held back for it,
+                    // so the insert lands before the episode's first emission.
+                    // Were that ever to change the cost is a duplicate overlay
                     // turn, which the refetch watermark retires.
                     for owner in usage_owner_by_message_id.values_mut() {
                         if *owner >= at {
@@ -2345,6 +2376,15 @@ impl ClaudeRecordAccumulator {
                     }
                 }
 
+                // A typed prompt's rewind point: claude-agent-acp 0.112.0 names
+                // the spot just before a user message `before:<record uuid>`
+                // (`_session/rewind`, see `crate::acp::rewind`). Tool results
+                // are absorbed into the reply before them and never become a
+                // user turn, so they need no exclusion here.
+                let agent_message_id = (matches!(role, MessageRole::User)
+                    && !uuid.is_empty()
+                    && value.get("isSidechain").and_then(|v| v.as_bool()) != Some(true))
+                .then(|| uuid.clone());
                 messages.push(UnifiedMessage {
                     id: uuid,
                     role,
@@ -2354,7 +2394,7 @@ impl ClaudeRecordAccumulator {
                     duration_ms: None,
                     model: None,
                     completed_at: Some(timestamp),
-                agent_message_id: None,
+                    agent_message_id,
                 });
             }
             "assistant" => {
@@ -2871,13 +2911,21 @@ impl ClaudeParser {
         let bytes = fs::read(path)?;
         let transcript_watermark = bytes.len() as u64;
 
+        // Mirror `BufReader::lines()`: a line that isn't valid UTF-8 is
+        // skipped (the old loop's per-line `Err(_) => continue`).
+        let lines: Vec<&str> = bytes
+            .split(|b| *b == b'\n')
+            .filter_map(|chunk| std::str::from_utf8(chunk).ok())
+            .collect();
+        // A rewound branch is still in the file; Claude Code no longer reads
+        // it, and neither does this (see `claude_rewind`).
+        let pending_drop = super::claude_rewind::pending_rewind_drop(path);
+        let rewound = super::claude_rewind::rewound_lines(&lines, pending_drop.as_deref());
         let mut acc = ClaudeRecordAccumulator::new(path.clone());
-        for chunk in bytes.split(|b| *b == b'\n') {
-            // Mirror `BufReader::lines()`: a line that isn't valid UTF-8 is
-            // skipped (the old loop's per-line `Err(_) => continue`).
-            let Ok(line) = std::str::from_utf8(chunk) else {
+        for (idx, line) in lines.iter().enumerate() {
+            if rewound.as_ref().is_some_and(|mask| mask[idx]) {
                 continue;
-            };
+            }
             acc.feed_line(line);
         }
         acc.finalize_background_lifecycle();
@@ -4250,7 +4298,8 @@ pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
-            agent_message_id: None,
+                // The prompt record's uuid: what `_session/rewind` names it by.
+                agent_message_id: msg.agent_message_id.clone(),
             });
             i += 1;
         }
@@ -5541,6 +5590,87 @@ mod tests {
             .unwrap()
     }
 
+    /// The shape claude-agent-acp 0.112.0 leaves after `_session/rewind` of the
+    /// second of three prompts and an edited prompt sent in its place (t605
+    /// live capture, trimmed): the old branch stays in the file, the new
+    /// prompt hangs off the entry before it.
+    #[test]
+    fn a_rewound_branch_is_not_rendered_and_prompts_carry_their_record_uuid() {
+        let user = |uuid: &str, parent: Option<&str>, text: &str| {
+            json!({"type": "user", "uuid": uuid, "parentUuid": parent,
+                   "timestamp": "2026-11-24T23:37:59.000Z", "sessionId": "s-rw",
+                   "message": {"role": "user", "content": text}})
+            .to_string()
+        };
+        let assistant = |uuid: &str, parent: &str, id: &str, text: &str| {
+            json!({"type": "assistant", "uuid": uuid, "parentUuid": parent,
+                   "timestamp": "2026-11-24T23:38:00.000Z", "sessionId": "s-rw",
+                   "message": {"id": id, "role": "assistant", "model": "claude-sonnet-5-5",
+                               "content": [{"type": "text", "text": text}]}})
+            .to_string()
+        };
+        let lines = vec![
+            user("u1", None, "first question"),
+            assistant("a1", "u1", "msg_1", "answer one"),
+            user("u2", Some("a1"), "second question"),
+            assistant("a2", "u2", "msg_2", "answer two"),
+            user("u3", Some("a2"), "third question"),
+            assistant("a3", "u3", "msg_3", "answer three"),
+            user("u4", Some("a1"), "edited question"),
+            assistant("a4", "u4", "msg_4", "answer four"),
+        ];
+        let detail = parse_lines("s-rw", &lines);
+        assert_eq!(
+            turn_shapes(&detail),
+            vec![
+                "User:first questi",
+                "Assistant:answer one",
+                "User:edited quest",
+                "Assistant:answer four",
+            ]
+        );
+        let user_ids: Vec<Option<&str>> = detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::User))
+            .map(|t| t.agent_message_id.as_deref())
+            .collect();
+        assert_eq!(user_ids, vec![Some("u1"), Some("u4")]);
+    }
+
+    /// Before the edited prompt arrives, only `rewind.json` says the last
+    /// prompt was dropped.
+    #[test]
+    fn a_pending_rewind_point_hides_its_prompt_before_a_new_one_is_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("-Users-test-proj");
+        std::fs::create_dir_all(proj.join("s-pend")).unwrap();
+        let lines = [
+            json!({"type": "user", "uuid": "u1", "parentUuid": null, "timestamp": "2026-11-24T23:37:59.000Z",
+                   "message": {"role": "user", "content": "first question"}}),
+            json!({"type": "assistant", "uuid": "a1", "parentUuid": "u1", "timestamp": "2026-11-24T23:38:00.000Z",
+                   "message": {"id": "msg_1", "role": "assistant", "content": [{"type": "text", "text": "answer one"}]}}),
+            json!({"type": "user", "uuid": "u2", "parentUuid": "a1", "timestamp": "2026-11-24T23:38:01.000Z",
+                   "message": {"role": "user", "content": "second question"}}),
+            json!({"type": "assistant", "uuid": "a2", "parentUuid": "u2", "timestamp": "2026-11-24T23:38:02.000Z",
+                   "message": {"id": "msg_2", "role": "assistant", "content": [{"type": "text", "text": "answer two"}]}}),
+        ]
+        .map(|v| v.to_string());
+        std::fs::write(proj.join("s-pend.jsonl"), lines.join("\n") + "\n").unwrap();
+        std::fs::write(
+            proj.join("s-pend").join("rewind.json"),
+            r#"{"resumeSessionAt":"a1","droppedPromptUuid":"u2"}"#,
+        )
+        .unwrap();
+        let detail = ClaudeParser::with_base_dir(dir.path().to_path_buf())
+            .get_conversation("s-pend")
+            .unwrap();
+        assert_eq!(
+            turn_shapes(&detail),
+            vec!["User:first questi", "Assistant:answer one"]
+        );
+    }
+
     /// One line per turn: role plus either its text or the tool it carries.
     fn turn_shapes(detail: &ConversationDetail) -> Vec<String> {
         detail
@@ -5837,6 +5967,43 @@ mod tests {
         // Nothing but the opening sentence: better the sentence than nothing.
         let bare = "This session is being continued from a previous conversation…";
         assert_eq!(continuation_summary_text(bare), bare);
+    }
+
+    /// Claude Code 2.1.312 puts a `<system-reminder>` block between the opening
+    /// sentence and `Summary:`, and from 2.1.293 every summary ends with a line
+    /// about the messages kept after it. Both are framing for the model, and
+    /// come off like the rest of it.
+    #[test]
+    fn continuation_summary_text_strips_the_2_1_312_framing() {
+        let current = CONTINUATION
+            .replace(
+                "conversation.\n\nSummary:\n",
+                "conversation.\n\n<system-reminder>\n<tools-used-before-summary>Agent, Bash, Read</tools-used-before-summary>\n</system-reminder>\nSummary:\n",
+            )
+            + "\n\nThe messages after this summary are the most recent messages from before compaction, kept verbatim. The summary was written without seeing them, so something it says has not happened yet may already have happened in them.";
+        assert!(current.contains("<system-reminder>"), "fixture applies");
+        assert_eq!(continuation_summary_text(&current), CONTINUATION_SUMMARY);
+
+        // Two reminder blocks, and blank lines around them.
+        let two = CONTINUATION.replace(
+            "conversation.\n\nSummary:\n",
+            "conversation.\n\n<system-reminder>\na\n</system-reminder>\n\n<system-reminder>b</system-reminder>\n\nSummary:\n",
+        );
+        assert_eq!(continuation_summary_text(&two), CONTINUATION_SUMMARY);
+
+        // An unclosed reminder is not framing this knows: it stays.
+        let unclosed = CONTINUATION.replace(
+            "conversation.\n\nSummary:\n",
+            "conversation.\n\n<system-reminder>\nnever closed\nSummary:\n",
+        );
+        assert!(continuation_summary_text(&unclosed).starts_with("<system-reminder>"));
+
+        // A summary that only quotes the kept-messages line mid-body keeps it.
+        let quoting = CONTINUATION.replace(
+            "   Fix the parser.",
+            "   Fix the parser.\nThe messages after this summary are the most recent messages from before compaction, it says.\n   Then test it.",
+        );
+        assert!(continuation_summary_text(&quoting).contains("it says.\n   Then test it."));
     }
 
     /// A compaction is a boundary between turns, so history has to draw the
@@ -10083,6 +10250,14 @@ mod tests {
                 Some("r1"),
                 &["b9052120", "a79caadf", "39e44cd0"],
             ),
+            // CLI 2.1.328 adds this one to the family: a request that resumed
+            // a paused one. Fields as named in the 2.1.328 binary's code,
+            // trimmed; not seen in a live transcript.
+            json!({
+                "type": "api-request-resumed", "sessionId": "s1",
+                "timestamp": "2026-10-15T13:55:17.035Z",
+                "messageId": "msg_2", "pausedRequestId": "r2", "resumedRequestId": "r3",
+            }),
             assistant(
                 "a2",
                 "2026-10-15T13:55:17.040Z",
@@ -10103,7 +10278,7 @@ mod tests {
                 r
             })
             .collect();
-        assert_eq!(with_requests.len() - without_requests.len(), 6);
+        assert_eq!(with_requests.len() - without_requests.len(), 7);
 
         let with = parse_lines("req", &record_lines(&with_requests));
         let without = parse_lines("req", &record_lines(&without_requests));
