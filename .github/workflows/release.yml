@@ -417,8 +417,9 @@ jobs:
           done
 
           if [ "${#missing[@]}" -ne 0 ]; then
-            printf '::error::Missing required Apple signing secret(s): %s\n' "${missing[*]}"
-            exit 1
+            printf '::warning::No Apple signing secret(s) (%s) — building UNSIGNED, unnotarized artifacts for personal use. First launch needs right-click > Open or xattr -d com.apple.quarantine.\n' "${missing[*]}"
+            echo "CODEG_UNSIGNED=1" >> "$GITHUB_ENV"
+            exit 0
           fi
 
           keychain_path="$RUNNER_TEMP/codeg-signing.keychain-db"
@@ -466,7 +467,7 @@ jobs:
           security find-identity -v -p codesigning "$keychain_path"
 
       - name: Resolve Apple Developer ID identity
-        if: contains(matrix.target, 'apple-darwin')
+        if: contains(matrix.target, 'apple-darwin') && env.CODEG_UNSIGNED != '1'
         shell: bash
         run: |
           set -euo pipefail
@@ -493,7 +494,7 @@ jobs:
       # Apple requires — with the hardened runtime, a secure timestamp and no
       # entitlements, as notarization and the gate below need.
       - name: Sign the computer-use helper app (macOS)
-        if: contains(matrix.target, 'apple-darwin')
+        if: contains(matrix.target, 'apple-darwin') && env.CODEG_UNSIGNED != '1'
         shell: bash
         run: |
           set -euo pipefail
@@ -649,7 +650,7 @@ jobs:
       #     WebKit): the copies `tauri build` compiles itself stay out
       #     (`server-bin` / `mcp-bin` / `cli-bin`).
       - name: Verify computer-use signing and symbols (macOS)
-        if: contains(matrix.target, 'apple-darwin')
+        if: contains(matrix.target, 'apple-darwin') && env.CODEG_UNSIGNED != '1'
         shell: bash
         run: |
           set -euo pipefail
@@ -912,8 +913,9 @@ jobs:
           done
 
           if [ "${#missing[@]}" -ne 0 ]; then
-            printf '::error::Missing required Apple signing secret(s): %s\n' "${missing[*]}"
-            exit 1
+            printf '::warning::No Apple signing secret(s) (%s) — building UNSIGNED, unnotarized artifacts for personal use. First launch needs right-click > Open or xattr -d com.apple.quarantine.\n' "${missing[*]}"
+            echo "CODEG_UNSIGNED=1" >> "$GITHUB_ENV"
+            exit 0
           fi
 
           keychain_path="$RUNNER_TEMP/codeg-signing.keychain-db"
@@ -960,7 +962,7 @@ jobs:
           security find-identity -v -p codesigning "$keychain_path"
 
       - name: Resolve Apple Developer ID identity (macOS)
-        if: contains(matrix.target, 'apple-darwin')
+        if: contains(matrix.target, 'apple-darwin') && env.CODEG_UNSIGNED != '1'
         shell: bash
         run: |
           set -euo pipefail
@@ -994,7 +996,7 @@ jobs:
       # build pins none. Last, the signed server is run once (`--version`) to
       # show it still launches under the hardened runtime.
       - name: Sign the server's executables with the Developer ID (macOS)
-        if: contains(matrix.target, 'apple-darwin')
+        if: contains(matrix.target, 'apple-darwin') && env.CODEG_UNSIGNED != '1'
         shell: bash
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
