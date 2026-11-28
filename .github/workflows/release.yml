@@ -338,8 +338,8 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           if [ -z "${APPLE_TEAM_ID}" ]; then
-            echo "FATAL: APPLE_TEAM_ID is required to pin the computer-use trust anchors"
-            exit 1
+            echo "::warning::No APPLE_TEAM_ID — the computer-use pair is built WITHOUT pinned trust anchors, falling back to the dev-build behavior (no requirement check). Fine for personal unsigned use."
+            exit 0
           fi
           anchor="anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = \"${APPLE_TEAM_ID}\""
           echo "CODEG_COMPUTER_PEER_REQUIREMENT=identifier \"app.codeg\" and ${anchor}" >> "$GITHUB_ENV"
