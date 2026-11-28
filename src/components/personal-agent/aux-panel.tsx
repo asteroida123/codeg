@@ -18,7 +18,7 @@
  * - Output: what it made, newest first — the work that ended (tasks, the
  *   reports of the rest) and the documents it wrote in its working
  *   directory — filtered by kind.
- * - Workspace: the work running now, each as a small live view of its
+ * - Workspace: the work running now, each as a card with the way to its
  *   session; a screen with its face asleep on it when nothing runs.
  * - Stats: how it runs, as Session Details shows a conversation — what it
  *   runs on, its state, model and mode, its session (which opens), its
@@ -36,6 +36,7 @@ import { useTranslations } from "next-intl"
 import { Badge } from "@/components/ui/badge"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { usePersonalAgent } from "@/contexts/personal-agent-context"
+import { readGroups } from "@/lib/activity-groups"
 import type { PersonalAgentSnapshot } from "@/lib/types"
 import { useActivity } from "@/stores/personal-agent-activity-store"
 import { useChatMotion } from "@/hooks/use-chat-motion"
@@ -69,10 +70,14 @@ export function PersonalAgentAuxPanel({
   const work = useWork()
   const { botId, itemVersion, dispatchVersion, routineVersion } =
     usePersonalAgent()
-  // What waits on the owner: the activity's own count (C6).
-  const waiting =
-    useActivity(botId, [itemVersion, dispatchVersion, routineVersion])
-      ?.waiting ?? 0
+  // What waits on the owner: the activity's own count (C6), no suggestion
+  // counted.
+  const activity = useActivity(botId, [
+    itemVersion,
+    dispatchVersion,
+    routineVersion,
+  ])
+  const waiting = activity ? readGroups(activity).waiting : 0
   // Another assistant shown: its panel comes in, as its conversation does.
   const asideRef = useRef<HTMLElement | null>(null)
   const motion = useChatMotion()

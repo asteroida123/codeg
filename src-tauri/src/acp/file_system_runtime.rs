@@ -2788,7 +2788,7 @@ mod tests {
                 AgentType::Antigravity,
                 parsers::antigravity::resolve_antigravity_sessions_dir_for_env,
                 0,
-                &["antigravity-acp", "conversations"],
+                &["antigravity-cli", "conversations"],
             ),
             (
                 AgentType::Kiro,

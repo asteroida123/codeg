@@ -292,6 +292,36 @@ fn default_ci_rounds() -> u32 {
     DEFAULT_CI_ROUNDS
 }
 
+/// How many hours a watched pull request's checks may run with no result
+/// before it is the owner's to look at (6.6).
+pub const DEFAULT_PR_CHECKS_WAIT_HOURS: u32 = 2;
+pub const MAX_PR_CHECKS_WAIT_HOURS: u32 = 48;
+/// How many days one may wait for its review before it is.
+pub const DEFAULT_PR_REVIEW_WAIT_DAYS: u32 = 1;
+pub const MAX_PR_REVIEW_WAIT_DAYS: u32 = 14;
+
+fn default_pr_checks_wait_hours() -> u32 {
+    DEFAULT_PR_CHECKS_WAIT_HOURS
+}
+
+fn lenient_pr_checks_wait_hours<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    let v = Value::deserialize(d)?;
+    Ok(v.as_u64()
+        .map(|n| n.clamp(1, MAX_PR_CHECKS_WAIT_HOURS as u64) as u32)
+        .unwrap_or(DEFAULT_PR_CHECKS_WAIT_HOURS))
+}
+
+fn default_pr_review_wait_days() -> u32 {
+    DEFAULT_PR_REVIEW_WAIT_DAYS
+}
+
+fn lenient_pr_review_wait_days<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    let v = Value::deserialize(d)?;
+    Ok(v.as_u64()
+        .map(|n| n.clamp(1, MAX_PR_REVIEW_WAIT_DAYS as u64) as u32)
+        .unwrap_or(DEFAULT_PR_REVIEW_WAIT_DAYS))
+}
+
 fn lenient_ci_rounds<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     let v = Value::deserialize(d)?;
     Ok(v.as_u64()
@@ -365,14 +395,26 @@ pub enum AskFirst {
     Ask,
 }
 
+/// The default of the items that act outside codeg or on a pull request by
+/// themselves (merging, closing, commenting, resolving a conflict): asked
+/// first until the owner says otherwise.
+fn ask_first() -> AskFirst {
+    AskFirst::Ask
+}
+
+fn lenient_ask<'de, D: Deserializer<'de>>(d: D) -> Result<AskFirst, D::Error> {
+    let v = Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).unwrap_or(AskFirst::Ask))
+}
+
 /// What codeg does when a watched pull request's checks fail (7.4).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CiFailure {
     /// Its task fixes it: a follow-up, or a new task on the pull request.
-    #[default]
     Fix,
     /// The owner is asked on its card first.
+    #[default]
     Ask,
     /// Only the card.
     Tell,
@@ -898,14 +940,14 @@ pub struct Prefs {
     pub accept_rounds: u32,
     /// A comment an assistant posts on a forge (7.4): posted at once, or
     /// put to the owner on an approval card first.
-    #[serde(default, deserialize_with = "lenient")]
+    #[serde(default = "ask_first", deserialize_with = "lenient_ask")]
     pub forge_comment: AskFirst,
     /// An issue an assistant closes on a forge.
-    #[serde(default, deserialize_with = "lenient")]
+    #[serde(default = "ask_first", deserialize_with = "lenient_ask")]
     pub issue_close: AskFirst,
     /// A pull request an assistant merges: when its head is the version to
     /// merge and its checks are green; CNB always asks.
-    #[serde(default, deserialize_with = "lenient")]
+    #[serde(default = "ask_first", deserialize_with = "lenient_ask")]
     pub pr_merge: AskFirst,
     /// The work a dispatch routine hands out (6.9): handed out at once, or
     /// put to the owner on a confirm card first.
@@ -926,7 +968,7 @@ pub struct Prefs {
     pub ci_failure: CiFailure,
     /// A watched pull request that conflicts with its base: its task brings
     /// it up to date at once, or the owner is asked first.
-    #[serde(default, deserialize_with = "lenient")]
+    #[serde(default = "ask_first", deserialize_with = "lenient_ask")]
     pub pr_conflict: AskFirst,
     /// Review feedback from those who can write to the repository: handed
     /// to the pull request's task at once, or the owner asked first.
@@ -939,6 +981,19 @@ pub struct Prefs {
     /// Rounds codeg starts by itself to fix one pull request; 0 is never.
     #[serde(default = "default_ci_rounds", deserialize_with = "lenient_ci_rounds")]
     pub ci_rounds: u32,
+    /// Hours a watched pull request's checks may run with no result before
+    /// it is the owner's (1 to 48).
+    #[serde(
+        default = "default_pr_checks_wait_hours",
+        deserialize_with = "lenient_pr_checks_wait_hours"
+    )]
+    pub pr_checks_wait_hours: u32,
+    /// Days it may wait for its review before it is (1 to 14).
+    #[serde(
+        default = "default_pr_review_wait_days",
+        deserialize_with = "lenient_pr_review_wait_days"
+    )]
+    pub pr_review_wait_days: u32,
     /// The owner's time zone: `system`, or an IANA name (1.12).
     #[serde(default = "default_zone", deserialize_with = "lenient_zone")]
     pub time_zone: String,
@@ -1177,17 +1232,19 @@ impl Default for Prefs {
             flush: OnOff::On,
             accept_revise: AskFirst::default(),
             accept_rounds: DEFAULT_ACCEPT_ROUNDS,
-            forge_comment: AskFirst::default(),
-            issue_close: AskFirst::default(),
-            pr_merge: AskFirst::default(),
+            forge_comment: AskFirst::Ask,
+            issue_close: AskFirst::Ask,
+            pr_merge: AskFirst::Ask,
             routine_dispatch: AskFirst::default(),
             plans: AskFirst::default(),
             tidy: TidyMode::default(),
             ci_failure: CiFailure::default(),
-            pr_conflict: AskFirst::default(),
+            pr_conflict: AskFirst::Ask,
             review_feedback: AskFirst::default(),
             outsider_comments: AskFirst::default(),
             ci_rounds: DEFAULT_CI_ROUNDS,
+            pr_checks_wait_hours: DEFAULT_PR_CHECKS_WAIT_HOURS,
+            pr_review_wait_days: DEFAULT_PR_REVIEW_WAIT_DAYS,
             time_zone: default_zone(),
             presence: OnOff::default(),
             proactive: OnOff::default(),
@@ -1437,6 +1494,20 @@ pub const PREFS: &[PrefSpec] = &[
         key: "ci_rounds",
         kind: PrefKind::Count { max: MAX_CI_ROUNDS },
         label: "rounds codeg starts by itself to fix one pull request",
+    },
+    PrefSpec {
+        key: "pr_checks_wait_hours",
+        kind: PrefKind::Count {
+            max: MAX_PR_CHECKS_WAIT_HOURS,
+        },
+        label: "hours a watched pull request's checks may run with no result before it is the owner's",
+    },
+    PrefSpec {
+        key: "pr_review_wait_days",
+        kind: PrefKind::Count {
+            max: MAX_PR_REVIEW_WAIT_DAYS,
+        },
+        label: "days a watched pull request may wait for its review before it is the owner's",
     },
     PrefSpec {
         key: "time_zone",
@@ -1938,14 +2009,14 @@ pub fn automation_preset(level: &str) -> Option<Vec<(&'static str, Value)>> {
             ("exec_questions", json!("assistant")),
             ("exec_plans", json!("assistant")),
             ("accept_revise", json!("auto")),
-            ("forge_comment", json!("auto")),
-            ("issue_close", json!("auto")),
-            ("pr_merge", json!("auto")),
+            ("forge_comment", json!("ask")),
+            ("issue_close", json!("ask")),
+            ("pr_merge", json!("ask")),
             ("routine_dispatch", json!("auto")),
             ("plans", json!("auto")),
             ("tidy", json!("auto")),
-            ("ci_failure", json!("fix")),
-            ("pr_conflict", json!("auto")),
+            ("ci_failure", json!("ask")),
+            ("pr_conflict", json!("ask")),
             ("review_feedback", json!("auto")),
             ("outsider_comments", json!("auto")),
         ]),
@@ -1990,12 +2061,14 @@ pub fn check_pref(key: &str, value: &Value) -> Result<Value, String> {
             }
         }
         PrefKind::Count { max } => {
+            // A wait of none would have nothing to wait for (6.6).
+            let min = u64::from(matches!(key, "pr_checks_wait_hours" | "pr_review_wait_days"));
             let n = value
                 .as_u64()
                 .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
-                .ok_or_else(|| format!("`{key}` takes a whole number, 0 to {max}"))?;
-            if n > max as u64 {
-                return Err(format!("`{key}` takes a whole number, 0 to {max}"));
+                .ok_or_else(|| format!("`{key}` takes a whole number, {min} to {max}"))?;
+            if n > max as u64 || n < min {
+                return Err(format!("`{key}` takes a whole number, {min} to {max}"));
             }
             Ok(json!(n))
         }
@@ -2397,6 +2470,21 @@ fn brain_value(key: &str, value: &Value) -> String {
             Some(n) => format!(
                 "at most {n} for one pull request, then it is the owner's — urgently, with what \
                  each round changed"
+            ),
+            None => value.to_string(),
+        },
+        ("pr_checks_wait_hours", _) => match value.as_u64() {
+            Some(n) => format!(
+                "{} h: a watched pull request whose checks have run that long with no result is \
+                 the owner's to look at",
+                n.max(1)
+            ),
+            None => value.to_string(),
+        },
+        ("pr_review_wait_days", _) => match value.as_u64() {
+            Some(n) => format!(
+                "{} d: one waiting that long for its review is the owner's to chase",
+                n.max(1)
             ),
             None => value.to_string(),
         },
@@ -2958,6 +3046,57 @@ mod tests {
         let more: Prefs = serde_json::from_value(Value::Object(map)).unwrap();
         assert_eq!(more.disturb_level(), "more");
         assert_eq!(more.automation_level(), "standard", "the presets are apart");
+    }
+
+    #[test]
+    fn acting_on_a_forge_and_fixing_pull_requests_ask_first_by_default() {
+        let asks = |p: &Prefs| {
+            assert_eq!(p.pr_merge, AskFirst::Ask);
+            assert_eq!(p.issue_close, AskFirst::Ask);
+            assert_eq!(p.forge_comment, AskFirst::Ask);
+            assert_eq!(p.ci_failure, CiFailure::Ask);
+            assert_eq!(p.pr_conflict, AskFirst::Ask);
+        };
+        asks(&Prefs::default());
+        asks(&Prefs::parse(None));
+        asks(&Prefs::parse(Some(&json!({}))));
+        asks(&Prefs::parse(Some(&json!({
+            "pr_merge": "maybe",
+            "issue_close": 3,
+            "forge_comment": null,
+            "ci_failure": "later",
+            "pr_conflict": ["auto"],
+        }))));
+        let map = Prefs::default().to_map();
+        for k in [
+            "pr_merge",
+            "issue_close",
+            "forge_comment",
+            "ci_failure",
+            "pr_conflict",
+        ] {
+            assert_eq!(map.get(k), Some(&json!("ask")), "{k}");
+        }
+        // What the owner saved stays theirs.
+        let p = Prefs::parse(Some(&json!({
+            "pr_merge": "auto",
+            "issue_close": "auto",
+            "forge_comment": "auto",
+            "ci_failure": "fix",
+            "pr_conflict": "auto",
+        })));
+        assert_eq!(p.pr_merge, AskFirst::Auto);
+        assert_eq!(p.issue_close, AskFirst::Auto);
+        assert_eq!(p.forge_comment, AskFirst::Auto);
+        assert_eq!(p.ci_failure, CiFailure::Fix);
+        assert_eq!(p.pr_conflict, AskFirst::Auto);
+        let p = Prefs::parse(Some(&json!({ "ci_failure": "tell" })));
+        assert_eq!(p.ci_failure, CiFailure::Tell);
+        // The other ask-first items keep theirs.
+        let d = Prefs::default();
+        assert_eq!(d.followups, AskFirst::Auto);
+        assert_eq!(d.review_feedback, AskFirst::Auto);
+        assert_eq!(d.routine_dispatch, AskFirst::Auto);
     }
 
     #[test]

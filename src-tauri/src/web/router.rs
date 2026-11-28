@@ -456,6 +456,26 @@ pub fn build_router_with_srn(
             post(handlers::personal_agent::personal_agent_cancel),
         )
         .route(
+            "/personal_agent_message_nudge",
+            post(handlers::personal_agent::personal_agent_message_nudge),
+        )
+        .route(
+            "/personal_agent_pr_merge",
+            post(handlers::personal_agent::personal_agent_pr_merge),
+        )
+        .route(
+            "/personal_agent_dispatch_hand",
+            post(handlers::personal_agent::personal_agent_dispatch_hand),
+        )
+        .route(
+            "/personal_agent_work_retry",
+            post(handlers::personal_agent::personal_agent_work_retry),
+        )
+        .route(
+            "/personal_agent_cancel_turn",
+            post(handlers::personal_agent::personal_agent_cancel_turn),
+        )
+        .route(
             "/personal_agent_stop_all",
             post(handlers::personal_agent::personal_agent_stop_all),
         )
@@ -522,6 +542,10 @@ pub fn build_router_with_srn(
         .route(
             "/personal_agent_activity",
             post(handlers::personal_agent::personal_agent_activity),
+        )
+        .route(
+            "/personal_agent_activity_dismiss",
+            post(handlers::personal_agent::personal_agent_activity_dismiss),
         )
         .route(
             "/notification_prefs_sync",
@@ -1506,14 +1530,6 @@ pub fn build_router_with_srn(
             post(handlers::acp::acp_clear_binary_cache),
         )
         .route(
-            "/acp_scan_leaked_temp",
-            post(handlers::acp::acp_scan_leaked_temp),
-        )
-        .route(
-            "/acp_reclaim_leaked_temp",
-            post(handlers::acp::acp_reclaim_leaked_temp),
-        )
-        .route(
             "/acp_update_agent_preferences",
             post(handlers::acp::acp_update_agent_preferences),
         )
@@ -1580,10 +1596,6 @@ pub fn build_router_with_srn(
         .route(
             "/acp_validate_pi_command",
             post(handlers::acp::acp_validate_pi_command),
-        )
-        .route(
-            "/acp_sync_antigravity_settings",
-            post(handlers::acp::acp_sync_antigravity_settings),
         )
         .route(
             "/acp_antigravity_login_start",

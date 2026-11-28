@@ -52,35 +52,9 @@ vi.mock("@/lib/platform", () => ({
   isDesktop: () => false,
 }))
 vi.mock("sonner", () => ({ toast: toasts }))
-vi.mock("@/components/message/live-transcript-view", () => ({
-  LiveTranscriptView: ({
-    conversationId,
-    connectionId,
-  }: {
-    conversationId: number
-    connectionId: string | null
-  }) => (
-    <div
-      data-live-transcript={conversationId}
-      data-connection={connectionId ?? ""}
-    />
-  ),
-}))
-const acp = vi.hoisted(() => ({
-  attachDelegationChild: vi.fn(),
-  detachDelegationChild: vi.fn(),
-}))
-vi.mock("@/contexts/acp-connections-context", () => ({
-  useAcpActions: () => acp,
-}))
 const board = vi.hoisted(() => ({ tasks: [] as unknown[] }))
 vi.mock("@/contexts/tasks-view-context", () => ({
   useTasksView: () => ({ tasks: board.tasks, loading: false }),
-}))
-vi.mock("@/components/tasks/task-transcript-dialog", () => ({
-  TaskTranscriptView: ({ task }: { task: { id: number } }) => (
-    <div data-task-preview={task.id} />
-  ),
 }))
 vi.mock("@/contexts/personal-agent-context", () => ({
   useBotId: () => null,
@@ -780,7 +754,7 @@ describe("the activity", () => {
         container.querySelector(
           '[data-pa-activity-group="needs"]'
         ) as HTMLElement
-      ).getByText("Waiting for you")
+      ).getByText("Needs you")
     ).toBeTruthy()
     // No "Status" heading, no card of it here.
     expect(screen.queryByText("Status")).toBeNull()
@@ -822,7 +796,7 @@ describe("the activity", () => {
     const row = error.closest<HTMLElement>("[data-pa-activity-row]")!
     // What it runs on, what done looks like, the whole error: unfolded.
     expect(within(row).queryByText("The login works on Safari")).toBeNull()
-    fireEvent.click(within(row).getByRole("button", { name: "Show details" }))
+    fireEvent.click(row.querySelector<HTMLElement>("[data-pa-item-open]")!)
     const details = row.querySelector<HTMLElement>("[data-pa-row-details]")!
     expect(details.textContent).toContain("Ran on Codex")
     expect(details.textContent).toContain("my-app")
@@ -1058,7 +1032,7 @@ describe("the activity", () => {
     const row = screen
       .getByText("Stand-up notes")
       .closest<HTMLElement>("[data-pa-activity-row]")!
-    fireEvent.click(within(row).getByRole("button", { name: "Show details" }))
+    fireEvent.click(row.querySelector<HTMLElement>("[data-pa-item-open]")!)
     expect(row.querySelector("[data-pa-item-on-done]")!.textContent).toContain(
       "Post them in #team"
     )
@@ -1189,9 +1163,7 @@ describe("the activity", () => {
     )
     // What happens once handed-out work is done is its assistant's to know,
     // not said here (B5).
-    fireEvent.click(
-      within(review).getByRole("button", { name: "Show details" })
-    )
+    fireEvent.click(review.querySelector<HTMLElement>("[data-pa-item-open]")!)
     expect(review.querySelector("[data-pa-item-on-done]")).toBeNull()
     expect(review.textContent).not.toContain("Tell the team")
     // Delivered as a pull request: not stoppable, its matter the owner's to
@@ -1320,12 +1292,15 @@ describe("an activity card of a task", () => {
     expect(
       card.querySelector("[data-pa-task-strip] [data-pa-task-act=stop]")
     ).toBeNull()
-    // Its › before its buttons; unfolded, its details after them.
-    const unfold = within(card).getByRole("button", { name: "Show details" })
+    // The button at its head's end before its buttons; pressed, it unfolds,
+    // its details after them.
+    const head = card.querySelector<HTMLElement>(
+      "[data-pa-row-open], [data-pa-unfold]"
+    )!
     expect(
-      unfold.compareDocumentPosition(merge) & Node.DOCUMENT_POSITION_FOLLOWING
+      head.compareDocumentPosition(merge) & Node.DOCUMENT_POSITION_FOLLOWING
     ).toBeTruthy()
-    fireEvent.click(unfold)
+    fireEvent.click(card.querySelector<HTMLElement>("[data-pa-item-open]")!)
     const details = card.querySelector("[data-pa-row-details]")!
     expect(
       merge.compareDocumentPosition(details) & Node.DOCUMENT_POSITION_FOLLOWING
@@ -1577,7 +1552,7 @@ describe("the output tab", () => {
 })
 
 describe("the workspace tab", () => {
-  it("follows each piece of work live, a task's from the board, and stands aside while the drawer shows one", async () => {
+  it("shows each piece of work as a card only, no live session, and opens its session from the card", async () => {
     usePersonalAgentUi.setState({ auxTab: "workspace" })
     board.tasks = [{ id: 7, conversation_id: 70, status: "running" }]
     api.personalAgentDispatches.mockResolvedValue([
@@ -1594,21 +1569,23 @@ describe("the workspace tab", () => {
     ])
     const { unmount } = draw()
     await screen.findByText("#2 Look at the checkout")
-    // The session's connection attached, hydrated, for the preview.
-    expect(acp.attachDelegationChild).toHaveBeenCalledWith(
-      expect.objectContaining({ connectionId: "c-31", hydrate: true })
-    )
-    expect(
-      document
-        .querySelector("[data-live-transcript='31']")
-        ?.getAttribute("data-connection")
-    ).toBe("c-31")
-    // The task's session, from the board.
-    expect(document.querySelector("[data-task-preview='7']")).toBeTruthy()
-    // The drawer opens one: the previews stand aside, and let go.
-    act(() => usePersonalAgentUi.setState({ workOpen: true }))
+    expect(screen.getByText("#3 Fix the bug")).toBeTruthy()
+    // No live view of either session.
     expect(document.querySelector("[data-pa-workspace-preview]")).toBeNull()
-    expect(acp.detachDelegationChild).toHaveBeenCalledWith("c-31")
+    expect(document.querySelector("[data-live-transcript]")).toBeNull()
+    expect(document.querySelector("[data-task-preview]")).toBeNull()
+    // [View session] opens the work, as the old [Open] did.
+    const item = document.querySelector<HTMLElement>(
+      "[data-pa-workspace-item='2']"
+    )!
+    const view = item.querySelector<HTMLElement>(
+      "[data-pa-workspace-open='2']"
+    )!
+    expect(view.textContent).toBe("View session")
+    fireEvent.click(view)
+    expect(usePersonalAgentUi.getState().work).toMatchObject({
+      dispatchId: 2,
+    })
     unmount()
     board.tasks = []
   })
@@ -1644,8 +1621,7 @@ describe("the workspace tab", () => {
     draw()
     const card = await screen.findByText("#2 Run the build")
     const item = card.closest<HTMLElement>("[data-pa-workspace-item]")!
-    expect(item.querySelector("[data-live-transcript='31']")).toBeTruthy()
-    // Where it stands under its title; the view opens it, as [Open] does.
+    // Where it stands under its title; [View session] opens it.
     expect(item.querySelector("[data-pa-ladder]")).toBeTruthy()
     fireEvent.click(item.querySelector("[data-pa-workspace-open='2']")!)
     expect(usePersonalAgentUi.getState().work).toMatchObject({

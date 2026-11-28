@@ -250,12 +250,6 @@
         "appliedToast": "Hintergrund angewendet",
         "credit": "Bilder von wallhaven.cc · nur SFW"
       }
-    },
-    "paAccent": {
-      "title": "Akzentfarbe der Assistenten",
-      "description": "Die Farbe der Kartenränder und Kartenschaltflächen im Gespräch mit einem Assistenten; deine Sprechblasen haben immer die Farbe des Assistenten.",
-      "default": "Standard",
-      "bot": "Farbe des Assistenten übernehmen"
     }
   },
   "SystemSettings": {
@@ -1152,7 +1146,7 @@
       "saveRawConfig": "Datei speichern"
     },
     "antigravity": {
-      "configDescription": "Ohne Authentifizierungsmethode (gespeichert in auth.type) scheitern Sitzungen mit „Authentication required“. Modell und Modus wählst du im Eingabefeld.",
+      "configDescription": "Die Antigravity-CLI verwaltet die Anmeldung selbst. codeg startet `agy acp` direkt; diese Auswahl bestimmt nur die Authentifizierungsmethode: Die Google-Methoden nutzen die zwischengespeicherte Anmeldung der CLI wieder (nutze die browserfreie Anmeldung unten, wenn auf diesem Rechner kein Browser vorhanden ist), und die API-Key-Methoden lesen die hier eingetragenen Zugangsdaten. Modell und Sitzungsmodus sind nicht hier: Antigravity meldet sie über ACP, sodass die eigenen Auswahlfelder des Editors sie pro Sitzung verwalten.",
       "methodLabel": "Authentication method",
       "methods": {
         "oauth-personal": "Sign in with Google",
@@ -1161,8 +1155,8 @@
         "agent-platform": "Gemini Enterprise Agent Platform"
       },
       "methodHints": {
-        "oauth-personal": "Dein Google-Konto, jeder Tarif inkl. kostenlos. Die erste Sitzung öffnet einen Browser – kein Browser? Nutze die browserfreie Anmeldung unten.",
-        "oauth-business": "Gemini-Enterprise-Konto; braucht GCP-Projekt und -Standort. Die erste Sitzung öffnet einen Browser – kein Browser? Nutze die browserfreie Anmeldung unten.",
+        "oauth-personal": "Dein Google-Konto, in jedem Antigravity-Tarif einschließlich der kostenlosen Stufe. Die Antigravity-CLI speichert die Anmeldung zwischen und nutzt sie für agy acp wieder. Kein Browser auf diesem Rechner? Nutze die browserfreie Anmeldung unten.",
+        "oauth-business": "Dein Gemini-Enterprise-Konto. Benötigt ein GCP-Projekt und einen Standort. Die Antigravity-CLI meldet sich beim Start einer Sitzung in einem Browser auf dem Rechner an, auf dem codeg läuft; die browserfreie Anmeldung unterstützt nur persönliche Google-Konten.",
         "gemini-api-key": "A key for the Gemini Developer API, passed to the agent as GEMINI_API_KEY.",
         "agent-platform": "API-Schlüssel oder Projekt und Standort mit Application Default Credentials verwenden. Bei Bedarf gcloud auth application-default login ausführen."
       },
@@ -1174,25 +1168,32 @@
       "missingGeminiApiKey": "Enter a Gemini API key, or pick a different authentication method — sessions will fail to start without it.",
       "missingAgentPlatformConfig": "Enter an API key, or both a project and a location — sessions will fail to start without one of the two.",
       "missingEnterpriseConfig": "Gemini Enterprise needs both a project and a location.",
-      "settingsFileHint": "Saved to auth.type in this file. Any other keys you put there are preserved.",
-      "syncSkipped": "Your choice was saved, but codeg could not write it to the ACP server's settings.json, so Antigravity will keep authenticating the way that file says. Set auth.type in it yourself, or move it aside and save again.",
+      "settingsFileHint": "Eigene Einstellungsdatei der Antigravity-CLI (nur zur Ansicht – codeg überschreibt sie nicht).",
       "save": "Save",
+      "permissionsTitle": "Berechtigungen",
+      "permissionModeLabel": "Berechtigungsmodus",
+      "permissionModeDefault": "Sitzungsmodus folgen (Standard)",
+      "permissionModeTurbo": "Turbo (--dangerously-skip-permissions)",
+      "permissionModeDefaultHint": "Startet `agy acp` regulär, sodass der Sitzungsmodus-Auswähler (default, accept-edits, auto, plan) und deine Berechtigungsregeln Werkzeugfreigaben steuern.",
+      "permissionModeTurboHint": "Startet `agy acp --dangerously-skip-permissions`: genehmigt alle Werkzeugberechtigungsanfragen automatisch ohne Rückfrage (explizite Deny-Regeln und System-Sperrlisten gelten weiterhin). Wirkt ab neuen Sitzungen.",
+      "sandboxLabel": "Terminal-Sandbox",
+      "sandboxHint": "Startet `agy acp --sandbox`: Die Terminalbefehle des Agenten laufen mit den Sandbox-Einschränkungen der CLI. Gilt für neue Sitzungen.",
+      "telemetryTitle": "Telemetrie deaktivieren",
+      "telemetryHint": "Startet `agy acp --disable-telemetry`, sodass die CLI keine Nutzungstelemetrie sendet. Gilt für neue Sitzungen.",
       "headless": {
         "title": "Ohne Browser auf diesem Rechner anmelden",
-        "description": "Kein Browser, wo der Agent läuft (z. B. Server)? Die erste Sitzung würde 5 Min. warten und fehlschlagen. Öffne stattdessen den Link auf einem beliebigen Gerät und füge die Zieladresse zurück ein.",
+        "description": "Die Antigravity-CLI gibt einen Google-Anmeldelink aus und wartet auf den Autorisierungscode. Das funktioniert ohne Browser auf diesem Rechner: Öffne den Link auf einem beliebigen Gerät, bestätige den Zugriff und füge den Autorisierungscode (oder die vollständige Zieladresse) hier ein.",
         "start": "Anmeldelink holen",
         "saveFirst": "Zuerst speichern – die Anmeldung nutzt die gespeicherten Einstellungen, nicht das oben Eingetippte.",
         "step1": "1. Öffne diesen Link und melde dich bei Google an.",
-        "step2": "2. Der Browser landet auf {redirectUri} ohne Verbindung – so gewollt. Füge die vollständige Adresse hier ein.",
+        "step2": "2. Öffne den Link oben und bestätige den Zugriff. Du landest auf {redirectUri}; füge den Autorisierungscode (oder diese vollständige Adresse) hier ein.",
         "copyLink": "Link kopieren",
         "openLink": "In neuem Tab öffnen",
         "complete": "Anmeldung abschließen",
         "cancel": "Abbrechen",
         "signedIn": "Angemeldet. Neue Sitzungen verwenden dieses Konto.",
-        "alreadySignedIn": "Antigravity hatte bereits ein gültiges Token und hat sich ohne Link angemeldet.",
         "failed": "Die Anmeldung wurde nicht abgeschlossen.",
-        "startFailed": "Anmeldung konnte nicht gestartet werden",
-        "credentialHint": "Token liegt hier. Kopiere die Datei auf andere Rechner ohne Desktop, um sie anzumelden."
+        "startFailed": "Anmeldung konnte nicht gestartet werden"
       },
       "signOut": {
         "title": "Mit dem falschen Konto angemeldet?",
@@ -1200,21 +1201,7 @@
         "action": "Abmelden",
         "done": "Abgemeldet. Melde dich erneut an, um ein anderes Konto zu wählen.",
         "failed": "Abmelden fehlgeschlagen"
-      },
-      "tempReclaimTitle": "Übrig gebliebener temporärer Speicher",
-      "tempReclaimHint": "Findet temporäre Verzeichnisse, die dieser Agent unter älteren codeg-Versionen hinterlassen hat. Nichts wird vor deiner Bestätigung gelöscht; Verwendetes wird übersprungen.",
-      "tempReclaimScan": "Suchen",
-      "tempReclaimDelete": "Überreste löschen",
-      "tempReclaimNone": "Nichts zurückzugewinnen.",
-      "tempReclaimFound": "{count} Überrest(e), {size} freigebbar.",
-      "tempReclaimSkipped": "{count} übersprungen (noch in Verwendung oder zu neu).",
-      "tempReclaimed": "{size} aus {count} Element(en) zurückgewonnen.",
-      "tempReclaimSelectAll": "Alle auswählen",
-      "tempReclaimAgeHours": "{hours} Std.",
-      "tempReclaimConfirmTitle": "{count} Element(e) löschen?",
-      "tempReclaimConfirmBody": "Damit werden {size} dauerhaft gelöscht. Der temporäre Systemordner wird von anderen Anwendungen mitbenutzt – prüfe daher jeden Pfad vor dem Bestätigen. Noch verwendete Einträge werden übersprungen.",
-      "tempReclaimConfirmAction": "Löschen",
-      "tempReclaimCancel": "Abbrechen"
+      }
     },
     "kiro": {
       "configManagement": "Konfiguration",
@@ -1762,7 +1749,6 @@
       "qoderSaved": "Qoder-Konfiguration gespeichert",
       "saveQoderConfigFailed": "Qoder-Konfiguration konnte nicht gespeichert werden",
       "antigravitySaved": "Antigravity config saved",
-      "antigravitySyncSkipped": "Saved, but Antigravity's settings.json was left alone",
       "saveAntigravityConfigFailed": "Failed to save Antigravity config",
       "kiroSaved": "Kiro-Konfiguration gespeichert",
       "saveKiroFailed": "Kiro-Konfiguration konnte nicht gespeichert werden",
@@ -3893,6 +3879,7 @@
         "errorUnsupportedLinkProtocol": "Dieses Linkprotokoll wird nicht unterstützt."
       },
       "fileActions": {
+        "openWithDefaultApp": "Mit Standardanwendung öffnen",
         "openInFinder": "In Finder öffnen",
         "openInExplorer": "In Explorer öffnen",
         "openInFileManager": "Im Dateimanager öffnen",
@@ -10372,7 +10359,34 @@
     },
     "work": {
       "taskNotStarted": "Diese Aufgabe hat noch nicht begonnen. Sobald sie startet, erscheint ihre Konversation hier.",
-      "taskGone": "Diese Aufgabe wurde nicht gefunden – vielleicht wurde sie gelöscht."
+      "taskGone": "Diese Aufgabe wurde nicht gefunden – vielleicht wurde sie gelöscht.",
+      "retry": "Erneut versuchen",
+      "handTo": "An {name} übergeben",
+      "viewSession": "Sitzung ansehen",
+      "merge": "Mergen",
+      "mergeTo": "In {base} mergen",
+      "createPr": "PR erstellen",
+      "pushBack": "Zurück in den PR",
+      "mergePr": "PR mergen",
+      "mergeMr": "MR mergen",
+      "openPr": "PR öffnen",
+      "openMr": "MR öffnen",
+      "nudge": "Nochmal fragen",
+      "rehand": "{name} nochmal ranlassen",
+      "toast": {
+        "retried": "Neu gestartet",
+        "handed": "An {name} übergeben",
+        "merging": "Wird gemergt…",
+        "merged": "Zusammengeführt",
+        "mergeAsked": "Wartet auf deine Freigabe auf der Karte",
+        "mergeChanged": "Hat sich geändert: neu gelesen",
+        "ranAgain": "Diese Aufgabe lief seitdem erneut: sieh sie dir noch einmal an",
+        "nudged": "{name} nochmal gefragt",
+        "nudgedAlready": "{name} wurde gerade gefragt",
+        "rehanded": "Nochmal an {name} übergeben",
+        "done": "Erledigt"
+      },
+      "reconnect": "Konto neu verbinden"
     },
     "composer": {
       "placeholder": "Nachricht an {name}…",
@@ -10637,7 +10651,7 @@
           "standard": "Standard",
           "ask_more": "Frag mich öfter",
           "custom": "Benutzerdefiniert",
-          "standardHint": "Alles läuft von selbst und wird dir auf einer Karte gemeldet.",
+          "standardHint": "Das meiste läuft von selbst und wird dir auf einer Karte gemeldet; PRs mergen, Issues schließen, auf einer Forge kommentieren und fehlgeschlagene Checks oder Konflikte eines beobachteten PRs beheben fragt dich zuerst.",
           "ask_moreHint": "Nachfassen und Wiederholungen, das Wiederholen von Arbeit, die ein Neustart unterbrochen hat, Nachrichten an andere Assistenten, Änderungen, um die du im Gespräch bittest, und Zuweisungen, die Code ändern, kommen erst als Karte zu dir; Fragen und Plan-Freigaben der Sitzungen gehen an dich.",
           "customHint": "Einige der Punkte unten hast du selbst eingestellt.",
           "confirmTitle": "Zu „{level}“ wechseln?",
@@ -11157,6 +11171,14 @@
           "auto": "Sofort wirksam, auf der Karte rückgängig",
           "draft": "Erst zeigen (Entwurfskarte, wirksam, wenn ich zustimme)",
           "off": "Nicht"
+        },
+        "pr_checks_wait_hours": {
+          "title": "Stunden Warten auf PR-Prüfungen",
+          "hint": "Ein beobachteter PR, dessen Prüfungen so lange ohne Ergebnis laufen, kommt zu „Wartet auf dich“. 1 bis 48."
+        },
+        "pr_review_wait_days": {
+          "title": "Tage Warten auf PR-Review",
+          "hint": "Ein beobachteter PR, der so lange auf sein Review wartet, kommt zu „Wartet auf dich“. 1 bis 14."
         }
       },
       "workdir": {
@@ -11977,8 +11999,8 @@
       },
       "workspace": {
         "empty": "Gerade läuft nichts",
-        "open": "Öffnen",
-        "emptyHint": "Solange delegierte Arbeit läuft, wird ihre Sitzung hier live angezeigt.",
+        "viewSession": "Sitzung ansehen",
+        "emptyHint": "Solange delegierte Arbeit läuft, wird sie hier angezeigt.",
         "whose": "Arbeitsbereich von {name}"
       },
       "notifyOn": "an",
@@ -12150,11 +12172,16 @@
     "feed": {
       "groups": {
         "needs": "Wartet auf dich",
+        "running": "In Arbeit",
+        "watch": "Im Blick",
         "watching": "In Arbeit",
         "next": "Routinen & Erinnerungen",
         "done": "Heute erledigt"
       },
       "empty": "Nichts für dich zu tun, und nichts läuft.",
+      "suggestions": "{count, plural, one {# weiterer Vorschlag} other {# weitere Vorschläge}}",
+      "ignore": "Ignorieren",
+      "ignoreHint": "Ausblenden; erscheint wieder, sobald sich etwas ändert",
       "failed": "Die Aktivität konnte gerade nicht gelesen werden.",
       "handed": "An {name} übergeben",
       "checking": "Wird geprüft · Runde {round}",
@@ -12166,7 +12193,57 @@
       "viewReminder": "Erinnerung ansehen",
       "viewCheck": "Abnahme-Sitzung ansehen",
       "openTask": "Aufgabe öffnen",
-      "routineDeleted": "Diese Routine wurde gelöscht."
+      "routineDeleted": "Diese Routine wurde gelöscht.",
+      "why": {
+        "no_reply": "Keine Antwort von {name}",
+        "unfinished": "Nicht erledigt",
+        "checks": "Checks fehlgeschlagen · niemand behebt es",
+        "conflict": "Konflikt · niemand behebt es",
+        "fix_pending": "codeg behebt es gleich",
+        "fixing": "Wird behoben",
+        "platform_blocked": "Plattform lässt noch nicht mergen",
+        "merge_queued": "Zum Mergen eingereiht",
+        "merging": "Wird gemergt",
+        "check_preparing": "Prüfung wird vorbereitet",
+        "check_settling": "Prüfung wird abgeschlossen",
+        "queued": "Wartet auf {name}",
+        "in_turn": "{name} ist dran",
+        "looking": "Wartet, dass {name} übernimmt",
+        "no_trigger": "Kein nächster Zeitpunkt",
+        "failed": "Fehlgeschlagen",
+        "readFailed": {
+          "auth": "Nicht lesbar · neu anmelden",
+          "no_account": "Nicht lesbar · kein Konto für diese Forge",
+          "config": "Diese Forge ist nicht lesbar",
+          "network": "Nicht lesbar · keine Verbindung",
+          "api": "Nicht lesbar · die Forge meldet einen Fehler",
+          "timeout": "Nicht lesbar · die Forge antwortet nicht",
+          "other": "Nicht lesbar"
+        },
+        "checks_slow": "Prüfungen seit {hours} h ohne Ergebnis",
+        "review_pending": "Wartet auf Review",
+        "review_slow": "Wartet seit {days} T auf Review"
+      },
+      "stop": {
+        "task": "Stoppen",
+        "turn": "Runde von {name} stoppen"
+      },
+      "ask": {
+        "approvePlan": "Plan genehmigen",
+        "queued": "{count, plural, one {# weitere wartet} other {# weitere warten}}",
+        "settled": "Bereits beantwortet – neu geladen",
+        "planAll": "Ganzen Plan ansehen",
+        "planLess": "Weniger anzeigen",
+        "planRevise": "Mit Hinweis zurückgeben…",
+        "planReviseSend": "Zurückgeben",
+        "planReviseCancel": "Abbrechen",
+        "planReviseHint": "Was soll sich ändern?",
+        "answered": "Antwort gesendet"
+      },
+      "back": {
+        "line": "Aus der Aktivität · {count, plural, one {# weiterer wartet auf dich} other {# weitere warten auf dich}}",
+        "go": "Zurück zur Aktivität"
+      }
     },
     "today": {
       "title": "Heute",
@@ -12207,7 +12284,8 @@
         "memoryUndone": "Gemerkt, dann zurückgenommen",
         "plan_stuck": "Plan hängt fest",
         "routine_paused": "Routine pausiert",
-        "used_up": "Immer noch nicht richtig"
+        "used_up": "Immer noch nicht richtig",
+        "pr_gone": "Beobachtung eines nicht auffindbaren PR beendet"
       },
       "reason": {
         "failed": "Fehlgeschlagen",
@@ -12898,7 +12976,14 @@
         }
       },
       "undoDetail": "Du hast {undone} der {made} auf dein Wort hin gemachten Änderungen der letzten zwei Wochen rückgängig gemacht.",
-      "idleBotDetail": "Seit zwei Wochen hat ihn niemand geweckt."
+      "idleBotDetail": "Seit zwei Wochen hat ihn niemand geweckt.",
+      "group": {
+        "count": "{count, plural, one {# Karte} other {# Karten}}",
+        "expand": "Alle anzeigen",
+        "collapse": "Weniger anzeigen",
+        "more": "{count, plural, one {# weitere nicht angezeigt} other {# weitere nicht angezeigt}}",
+        "mutedEntry": "Verworfen, und diese Art ist abgeschaltet."
+      }
     },
     "brief": {
       "title": "Morgen-Briefing",
@@ -13180,7 +13265,17 @@
         "answer": "Antworten",
         "drop": "Nicht mehr nötig",
         "stop": "Nicht mehr erinnern",
-        "undo": "Rückgängig"
+        "undo": "Rückgängig",
+        "withdrawMessage": "Nachricht zurückziehen",
+        "stopWaiting": "Nicht mehr auf Antwort warten",
+        "noReplyNeeded": "Keine Antwort nötig",
+        "noAnswerNeeded": "Keine Antwort nötig",
+        "stopFollowing": "Nicht mehr nachfassen",
+        "cancelReminder": "Erinnerung absagen",
+        "noNeedToDo": "Nicht nötig",
+        "wontDo": "Nicht machen",
+        "remove": "Entfernen",
+        "giveUp": "Diese Arbeit aufgeben"
       },
       "hint": {
         "doneNext": "Diesmal erledigt; danach wie gewohnt: {rule}",
@@ -13239,6 +13334,7 @@
         "stopped": "Du hast die Arbeit angehalten · {time}",
         "skippedLast": "Du hast das letzte Mal übersprungen · {time}",
         "dropped": "Von dir entfernt · {time}",
+        "givenUp": "Du hast diese Arbeit aufgegeben · {time}",
         "withdrawn": "Du hast die Nachricht an {peer} zurückgezogen · {time}",
         "stoppedWaiting": "Du wartest nicht mehr auf die Antwort von {peer} · {time}",
         "agentDone": "{name} hat es erledigt · {time}",

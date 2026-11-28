@@ -1745,7 +1745,7 @@ pub async fn claim_for_run(
     from: WorkTaskStatus,
     actor: &str,
 ) -> Result<Option<i32>, DbError> {
-    claim_inner(conn, id, from, actor, None, false, false).await
+    claim_inner(conn, id, from, actor, None, false, false, None).await
 }
 
 /// `claim_for_run` for a BULK start ("process all"), which must leave a planned
@@ -1762,7 +1762,7 @@ pub async fn claim_unplanned_for_run(
     from: WorkTaskStatus,
     actor: &str,
 ) -> Result<Option<i32>, DbError> {
-    claim_inner(conn, id, from, actor, None, true, false).await
+    claim_inner(conn, id, from, actor, None, true, false, None).await
 }
 
 /// `claim_for_run` plus a `user_action` event written in the SAME transaction
@@ -1783,7 +1783,31 @@ pub async fn claim_for_run_with_action(
     action: Option<serde_json::Value>,
     allow_duplicate_source: bool,
 ) -> Result<Option<i32>, DbError> {
-    claim_inner(conn, id, from, actor, action, false, allow_duplicate_source).await
+    claim_inner(conn, id, from, actor, action, false, allow_duplicate_source, None).await
+}
+
+/// What a claim from a row that read the task holds to (the personal
+/// agent's activity, 6.5): the task as it read it, and whose it is.
+#[derive(Debug, Clone, Copy)]
+pub struct ClaimSeen {
+    /// Its version as read: anything written since (set aside for later,
+    /// run again, edited) and the claim misses.
+    pub updated_at: chrono::DateTime<Utc>,
+    /// The assistant's work it is of: `Some(d)`, that work's; `None`, the
+    /// owner's own — no assistant's at all.
+    pub dispatch_id: Option<i32>,
+}
+
+/// [`claim_for_run_with_action`] of the task as a row read it (`seen`).
+pub async fn claim_for_run_seen(
+    conn: &DatabaseConnection,
+    id: i32,
+    from: WorkTaskStatus,
+    actor: &str,
+    action: Option<serde_json::Value>,
+    seen: ClaimSeen,
+) -> Result<Option<i32>, DbError> {
+    claim_inner(conn, id, from, actor, action, false, false, Some(seen)).await
 }
 
 /// The `user_action` event a claim wrote for ledger operation `op_id` (the
@@ -1822,6 +1846,7 @@ pub async fn user_action_by_op(
 /// instruction to override its plan. `allow_duplicate_source` waives the
 /// resurrection guard (see [`resurrection_guard`]) for a claim the user
 /// explicitly confirmed.
+#[allow(clippy::too_many_arguments)]
 async fn claim_inner(
     conn: &DatabaseConnection,
     id: i32,
@@ -1830,6 +1855,7 @@ async fn claim_inner(
     action: Option<serde_json::Value>,
     only_unplanned: bool,
     allow_duplicate_source: bool,
+    seen: Option<ClaimSeen>,
 ) -> Result<Option<i32>, DbError> {
     let now = Utc::now();
     let txn = conn.begin().await?;
@@ -1879,6 +1905,13 @@ async fn claim_inner(
     if only_unplanned {
         update = update.filter(work_task::Column::ScheduledAt.is_null());
     }
+    if let Some(seen) = seen {
+        update = update.filter(work_task::Column::UpdatedAt.eq(seen.updated_at));
+        update = match seen.dispatch_id {
+            Some(d) => update.filter(work_task::Column::PersonalAgentDispatchId.eq(d)),
+            None => update.filter(work_task::Column::PersonalAgentDispatchId.is_null()),
+        };
+    }
     let res = update.exec(&txn).await?;
     if res.rows_affected != 1 {
         txn.rollback().await?;
@@ -1919,6 +1952,20 @@ async fn claim_inner(
             txn.rollback().await?;
             return Err(duplicate_active_source_error(&other));
         }
+    }
+    // The owner's press runs it again (6.5): its work is no turn's from
+    // here — a stop of the turn that ran it before never takes the new run.
+    // In the claim's own transaction: refused, nothing is written.
+    if let Some(d) = seen.and_then(|s| s.dispatch_id) {
+        use crate::db::entities::personal_agent_dispatch as dispatch;
+        dispatch::Entity::update_many()
+            .col_expr(
+                dispatch::Column::SourceBatchId,
+                Expr::value(Some(crate::personal_agent::dispatch::NO_TURN)),
+            )
+            .filter(dispatch::Column::Id.eq(d))
+            .exec(&txn)
+            .await?;
     }
     let run_seq = claimed.run_seq;
     // The instruction lands before the status change, so a newest-first scan

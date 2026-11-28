@@ -250,12 +250,6 @@
         "appliedToast": "桌布已套用",
         "credit": "圖片來源 wallhaven.cc · 僅 SFW 內容"
       }
-    },
-    "paAccent": {
-      "title": "助手強調色",
-      "description": "助手對話中卡片強調邊框與卡片按鈕所用的顏色；你的對話泡泡一律使用助手的顏色。",
-      "default": "預設",
-      "bot": "跟隨助手顏色"
     }
   },
   "SystemSettings": {
@@ -1152,7 +1146,7 @@
       "saveRawConfig": "儲存檔案"
     },
     "antigravity": {
-      "configDescription": "未設定認證方式（存於 auth.type）時工作階段會報「Authentication required」。模型與模式在輸入框選擇。",
+      "configDescription": "Antigravity 的登入由 Antigravity CLI 自行管理。codeg 會直接啟動 `agy acp`，這裡只決定它使用哪種方式認證：Google 帳號沿用 CLI 已快取的登入（本機沒有瀏覽器時請使用下方的免瀏覽器登入），API Key 方式則讀取下方填寫的憑證。模型與工作階段模式不在這裡：Antigravity 會透過 ACP 回報它們，由輸入框的選擇器按工作階段管理。",
       "methodLabel": "認證方式",
       "methods": {
         "oauth-personal": "使用 Google 帳號登入",
@@ -1161,8 +1155,8 @@
         "agent-platform": "Gemini Enterprise Agent Platform"
       },
       "methodHints": {
-        "oauth-personal": "你的 Google 帳號，任意方案（含免費版）。首次工作階段會開啟瀏覽器；沒有瀏覽器？用下面的免瀏覽器登入。",
-        "oauth-business": "Gemini Enterprise 帳號，需填 GCP 專案與區域。首次工作階段會開啟瀏覽器；沒有瀏覽器？用下面的免瀏覽器登入。",
+        "oauth-personal": "你的 Google 帳號，任意 Antigravity 方案（含免費版）皆適用。登入由 Antigravity CLI 快取並重複使用；本機沒有瀏覽器時請使用下方的免瀏覽器登入。",
+        "oauth-business": "你的 Gemini Enterprise 帳號。需要填寫 GCP 專案與區域。Antigravity CLI 會在工作階段啟動時，於執行 codeg 的機器上以瀏覽器完成登入；免瀏覽器登入僅支援個人 Google 帳號。",
         "gemini-api-key": "Gemini Developer API 的金鑰，以 GEMINI_API_KEY 傳給智慧體。",
         "agent-platform": "使用 API Key，或專案和區域搭配應用程式預設憑證。如有需要，執行 gcloud auth application-default login。"
       },
@@ -1174,25 +1168,32 @@
       "missingGeminiApiKey": "請填寫 Gemini API Key，或改用其他認證方式 —— 否則工作階段無法啟動。",
       "missingAgentPlatformConfig": "請填寫 API Key，或同時填寫專案與區域 —— 兩者缺一不可，否則工作階段無法啟動。",
       "missingEnterpriseConfig": "Gemini Enterprise 需要同時填寫專案與區域。",
-      "settingsFileHint": "auth.type 會儲存到這個檔案；你自己寫在裡面的其他鍵會原樣保留。",
-      "syncSkipped": "你的選擇已儲存，但 codeg 無法寫入 ACP 伺服器的 settings.json，所以 Antigravity 仍會依照該檔案的設定進行認證。請自行在檔案中設定 auth.type，或先把檔案移開再儲存一次。",
+      "settingsFileHint": "Antigravity CLI 自己的設定檔（僅供參考，codeg 不會改寫此檔案）。",
       "save": "儲存",
+      "permissionsTitle": "權限",
+      "permissionModeLabel": "權限模式",
+      "permissionModeDefault": "遵循工作階段模式（預設）",
+      "permissionModeTurbo": "Turbo（--dangerously-skip-permissions）",
+      "permissionModeDefaultHint": "以預設參數啟動 `agy acp`，由輸入框的工作階段模式（default / accept-edits / auto / plan）與權限規則控制工具審核。",
+      "permissionModeTurboHint": "以 `agy acp --dangerously-skip-permissions` 啟動工作階段：自動核准所有工具權限請求、不再彈出確認（明確的 deny 規則與系統封鎖清單仍然有效）。對新工作階段生效。",
+      "sandboxLabel": "終端機沙箱",
+      "sandboxHint": "以 `agy acp --sandbox` 啟動：智慧體執行的終端機指令受 CLI 沙箱限制。對新工作階段生效。",
+      "telemetryTitle": "停用遙測",
+      "telemetryHint": "以 `agy acp --disable-telemetry` 啟動，CLI 不再回報使用遙測。對新工作階段生效。",
       "headless": {
         "title": "在沒有瀏覽器的機器上登入",
-        "description": "執行智慧體的機器沒有瀏覽器（如伺服器）？首次工作階段會等 5 分鐘後失敗。改為在任意裝置開啟連結，再把跳轉後的網址貼回來。",
+        "description": "Antigravity CLI 會列印一個 Google 登入連結並等待授權碼。此流程不需本機安裝瀏覽器：將連結拿到任意裝置上開啟並授權，再把授權碼（或跳轉後的完整網址）貼回這裡即可。",
         "start": "取得登入連結",
         "saveFirst": "請先儲存——登入用的是已儲存的設定，而不是上面剛填的內容。",
         "step1": "1. 開啟這個連結並登入 Google 帳號。",
-        "step2": "2. 瀏覽器會跳到 {redirectUri} 並無法連線——這是正常的。把完整網址貼到下面。",
+        "step2": "2. 開啟上方連結並授權。頁面會跳轉至 {redirectUri}，請把授權碼（或該完整網址）貼到下方。",
         "copyLink": "複製連結",
         "openLink": "在新分頁開啟",
         "complete": "完成登入",
         "cancel": "取消",
         "signedIn": "已登入，新的工作階段將使用此帳號。",
-        "alreadySignedIn": "Antigravity 本來就持有有效權杖，無需連結即已登入。",
         "failed": "登入未完成。",
-        "startFailed": "無法開始登入",
-        "credentialHint": "權杖快取於此。將此檔案複製到其他無桌面機器即可讓其登入。"
+        "startFailed": "無法開始登入"
       },
       "signOut": {
         "title": "登入了錯誤的帳號？",
@@ -1200,21 +1201,7 @@
         "action": "登出",
         "done": "已登出。重新登入即可選擇其他帳號。",
         "failed": "登出失敗"
-      },
-      "tempReclaimTitle": "殘留暫存空間",
-      "tempReclaimHint": "尋找舊版 codeg 下此代理遺留的暫存目錄。確認前不會刪除任何內容，使用中的項目會被跳過。",
-      "tempReclaimScan": "掃描",
-      "tempReclaimDelete": "刪除殘留",
-      "tempReclaimNone": "沒有可回收的內容。",
-      "tempReclaimFound": "發現 {count} 項殘留，可回收 {size}。",
-      "tempReclaimSkipped": "已跳過 {count} 項（仍在使用或過新）。",
-      "tempReclaimed": "已從 {count} 項中回收 {size}。",
-      "tempReclaimSelectAll": "全選",
-      "tempReclaimAgeHours": "{hours} 小時",
-      "tempReclaimConfirmTitle": "刪除選取的 {count} 項？",
-      "tempReclaimConfirmBody": "將永久刪除 {size}。系統暫存目錄與其他應用程式共用，確認前請先核對每條路徑；仍在使用中的項目會被略過。",
-      "tempReclaimConfirmAction": "刪除",
-      "tempReclaimCancel": "取消"
+      }
     },
     "kiro": {
       "configManagement": "設定管理",
@@ -1762,7 +1749,6 @@
       "qoderSaved": "Qoder 設定已儲存",
       "saveQoderConfigFailed": "儲存 Qoder 設定失敗",
       "antigravitySaved": "Antigravity 設定已儲存",
-      "antigravitySyncSkipped": "已儲存，但未變更 Antigravity 的 settings.json",
       "saveAntigravityConfigFailed": "儲存 Antigravity 設定失敗",
       "kiroSaved": "Kiro 設定已儲存",
       "saveKiroFailed": "儲存 Kiro 設定失敗",
@@ -3893,6 +3879,7 @@
         "errorUnsupportedLinkProtocol": "不支援此連結協議。"
       },
       "fileActions": {
+        "openWithDefaultApp": "使用預設應用程式開啟",
         "openInFinder": "在 Finder 開啟",
         "openInExplorer": "在檔案總管開啟",
         "openInFileManager": "在檔案管理器開啟",
@@ -10372,7 +10359,34 @@
     },
     "work": {
       "taskNotStarted": "這個任務還沒開始，開始後這裡會顯示它的會話。",
-      "taskGone": "找不到這個任務，可能已被刪除。"
+      "taskGone": "找不到這個任務，可能已被刪除。",
+      "retry": "重試",
+      "handTo": "交給{name}處理",
+      "viewSession": "看會話",
+      "merge": "合併",
+      "mergeTo": "合併到 {base}",
+      "createPr": "建立 PR",
+      "pushBack": "推回 PR",
+      "mergePr": "合併 PR",
+      "mergeMr": "合併 MR",
+      "openPr": "開啟 PR",
+      "openMr": "開啟 MR",
+      "nudge": "催一下",
+      "rehand": "讓{name}再處理一次",
+      "toast": {
+        "retried": "已重新開始",
+        "handed": "已交給{name}",
+        "merging": "正在合併…",
+        "merged": "已合併",
+        "mergeAsked": "在卡片上等你核准",
+        "mergeChanged": "剛有變化，已重新讀取",
+        "ranAgain": "這個任務在你查看後又跑了一輪，請重新查看",
+        "nudged": "已催{name}",
+        "nudgedAlready": "剛催過{name}",
+        "rehanded": "已再交給{name}",
+        "done": "已處理"
+      },
+      "reconnect": "重新連接帳號"
     },
     "composer": {
       "placeholder": "傳訊息給 {name}…",
@@ -10637,7 +10651,7 @@
           "standard": "標準",
           "ask_more": "多問我",
           "custom": "自訂",
-          "standardHint": "一切自動，做了都出卡告訴你。",
+          "standardHint": "大多自動，做了出卡片告訴你；合併 PR、關 issue、在 forge 上留言、修看護 PR 的檢查失敗或衝突，都先問你。",
           "ask_moreHint": "續作與重試、中斷後的重試、傳訊息給其他助理、對話裡的變更、會改程式碼的派工，都先出卡片，你點了才做；執行工作階段的提問和計畫審批一律轉給你。",
           "customHint": "下面有幾項是你自己調過的。",
           "confirmTitle": "切換到「{level}」？",
@@ -11157,6 +11171,14 @@
           "auto": "自動生效，出卡可撤銷",
           "draft": "先給我看（出草稿卡，點了才生效）",
           "off": "不做"
+        },
+        "pr_checks_wait_hours": {
+          "title": "PR 檢查最多等幾小時",
+          "hint": "在盯的 PR 檢查跑了這麼久還沒結果，就提到「等你處理」。1–48。"
+        },
+        "pr_review_wait_days": {
+          "title": "PR 評審最多等幾天",
+          "hint": "在盯的 PR 等評審超過這麼多天，就提到「等你處理」。1–14。"
         }
       },
       "workdir": {
@@ -11977,8 +11999,8 @@
       },
       "workspace": {
         "empty": "目前沒有在跑的工作",
-        "open": "開啟",
-        "emptyHint": "派出去的工作在執行時，這裡即時顯示它的工作階段。",
+        "viewSession": "查看工作階段",
+        "emptyHint": "派出去的工作在執行時，會顯示在這裡。",
         "whose": "{name} 的工作區"
       },
       "notifyOn": "已開啟",
@@ -12149,12 +12171,17 @@
     },
     "feed": {
       "groups": {
-        "needs": "等你",
+        "needs": "等你處理",
+        "running": "進行中",
+        "watch": "在盯",
         "watching": "進行中",
         "next": "例程與提醒",
         "done": "今天完成"
       },
       "empty": "沒有要你做的，也沒有在跑的。",
+      "suggestions": "還有 {count} 條建議",
+      "ignore": "忽略",
+      "ignoreHint": "不再顯示；有新變化時會重新出現",
       "failed": "暫時讀不到動態。",
       "handed": "交給{name}了",
       "checking": "驗收中 · 第 {round} 輪",
@@ -12166,7 +12193,57 @@
       "viewReminder": "查看提醒",
       "viewCheck": "查看驗收會話",
       "openTask": "開啟任務",
-      "routineDeleted": "這個例程已經刪除了。"
+      "routineDeleted": "這個例程已經刪除了。",
+      "why": {
+        "no_reply": "{name}沒回覆",
+        "unfinished": "沒處理完",
+        "checks": "檢查沒過 · 沒人在修",
+        "conflict": "有衝突 · 沒人在修",
+        "fix_pending": "codeg 準備修",
+        "fixing": "修復中",
+        "platform_blocked": "平台還不讓合併",
+        "merge_queued": "排隊合併",
+        "merging": "合併中",
+        "check_preparing": "驗收準備中",
+        "check_settling": "驗收收尾中",
+        "queued": "排隊等{name}",
+        "in_turn": "{name}在處理",
+        "looking": "等{name}接手",
+        "no_trigger": "沒定下次時間",
+        "failed": "失敗了",
+        "readFailed": {
+          "auth": "讀不到狀態 · 需要重新登入",
+          "no_account": "讀不到狀態 · 沒有這個平台的帳號",
+          "config": "這個平台讀不了",
+          "network": "讀不到狀態 · 連不上",
+          "api": "讀不到狀態 · 平台回傳錯誤",
+          "timeout": "讀不到狀態 · 平台沒回應",
+          "other": "讀不到狀態"
+        },
+        "checks_slow": "檢查跑了 {hours} 小時還沒結果",
+        "review_pending": "等評審",
+        "review_slow": "等評審 {days} 天了"
+      },
+      "stop": {
+        "task": "停止",
+        "turn": "停止{name}這一輪"
+      },
+      "ask": {
+        "approvePlan": "批准計畫",
+        "queued": "後面還有 {count} 個在等",
+        "settled": "已經有人回答了，已重新讀取",
+        "planAll": "看完整計畫",
+        "planLess": "收起",
+        "planRevise": "退回並說明…",
+        "planReviseSend": "退回",
+        "planReviseCancel": "取消",
+        "planReviseHint": "需要改什麼？",
+        "answered": "已提交回答"
+      },
+      "back": {
+        "line": "從動態來的 · 還有 {count} 件等你處理",
+        "go": "回到動態"
+      }
     },
     "today": {
       "title": "今日",
@@ -12207,7 +12284,8 @@
         "memoryUndone": "記住了，又撤銷了",
         "plan_stuck": "計畫卡住",
         "routine_paused": "例程已暫停",
-        "used_up": "退回幾輪仍不對"
+        "used_up": "退回幾輪仍不對",
+        "pr_gone": "找不到這個 PR，不再盯了"
       },
       "reason": {
         "failed": "失敗",
@@ -12898,7 +12976,14 @@
         }
       },
       "undoDetail": "最近兩週按你的話直接做的 {made} 處改動，你撤銷了 {undone} 處。",
-      "idleBotDetail": "已經兩週沒被叫醒了。"
+      "idleBotDetail": "已經兩週沒被叫醒了。",
+      "group": {
+        "count": "{count} 則",
+        "expand": "展開全部",
+        "collapse": "收起",
+        "more": "還有 {count} 則",
+        "mutedEntry": "已關掉，這類也不再提。"
+      }
     },
     "brief": {
       "title": "晨報",
@@ -13180,7 +13265,17 @@
         "answer": "去回答",
         "drop": "不用了",
         "stop": "不再提醒",
-        "undo": "復原"
+        "undo": "復原",
+        "withdrawMessage": "撤回訊息",
+        "stopWaiting": "不再等回覆",
+        "noReplyNeeded": "不用回覆",
+        "noAnswerNeeded": "不用回答",
+        "stopFollowing": "不再跟進",
+        "cancelReminder": "取消提醒",
+        "noNeedToDo": "不用做了",
+        "wontDo": "不做了",
+        "remove": "移除",
+        "giveUp": "放棄這項工作"
       },
       "hint": {
         "doneNext": "這次完成，之後照常：{rule}",
@@ -13239,6 +13334,7 @@
         "stopped": "你停了這項工作 · {time}",
         "skippedLast": "你跳過了最後一次 · {time}",
         "dropped": "你移除了 · {time}",
+        "givenUp": "你放棄了這項工作 · {time}",
         "withdrawn": "你撤回了傳給{peer}的訊息 · {time}",
         "stoppedWaiting": "你不再等{peer}回覆 · {time}",
         "agentDone": "{name}完成了 · {time}",

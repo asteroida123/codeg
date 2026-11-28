@@ -140,7 +140,7 @@ vi.mock("@/contexts/personal-agent-context", () => ({
   }),
 }))
 
-import { DEFAULT_PREFS } from "./pref-pages"
+import { AUTOMATION_PRESETS, DEFAULT_PREFS } from "./pref-pages"
 import { SettingsView } from "./settings-view"
 
 const PREFS: PersonalAgentPrefs = { ...DEFAULT_PREFS }
@@ -406,6 +406,25 @@ describe("the settings view", () => {
     )
   })
 
+  it("has how long a watched PR's checks and review may wait on “Dispatch & automation” (6.6)", async () => {
+    usePersonalAgentUi.getState().openSettings("automation")
+    draw()
+    expect(
+      document.querySelector('[data-pa-pref="pr_review_wait_days"]')
+    ).not.toBeNull()
+    const hours = document.querySelector(
+      '[data-pa-pref="pr_checks_wait_hours"]'
+    ) as HTMLInputElement
+    fireEvent.change(hours, { target: { value: "6" } })
+    fireEvent.blur(hours)
+    await waitFor(() =>
+      expect(api.personalAgentSettingsPatch).toHaveBeenCalledWith(
+        [{ key: "prefs.pr_checks_wait_hours", value: 6 }],
+        null
+      )
+    )
+  })
+
   it("has commenting, closing issues and merging pull requests on “Dispatch & automation” (7.4)", () => {
     usePersonalAgentUi.getState().openSettings("automation")
     draw()
@@ -418,6 +437,25 @@ describe("the settings view", () => {
     expect(
       screen.getByText(/CNB can't show checks or hold the head/)
     ).toBeInTheDocument()
+  })
+
+  it("asks first by default before merging, closing, commenting or fixing a watched PR", () => {
+    const asked = [
+      "pr_merge",
+      "issue_close",
+      "forge_comment",
+      "ci_failure",
+      "pr_conflict",
+    ] as const
+    for (const item of asked) {
+      expect(DEFAULT_PREFS[item]).toBe("ask")
+      expect(AUTOMATION_PRESETS.standard[item]).toBe("ask")
+      expect(AUTOMATION_PRESETS.ask_more[item]).toBe("ask")
+    }
+    // The defaults still read as the standard level.
+    for (const [k, v] of Object.entries(AUTOMATION_PRESETS.standard)) {
+      expect(DEFAULT_PREFS[k as keyof typeof DEFAULT_PREFS], k).toBe(v)
+    }
   })
 
   it("picks an automation level, and warns before overwriting the owner's own", async () => {

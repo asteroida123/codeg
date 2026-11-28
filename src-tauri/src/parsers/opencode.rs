@@ -272,6 +272,20 @@ impl OpenCodeParser {
                         .or(summary.model.as_deref()),
                 )
             });
+        // After the context reading, which a fork's inherited history still
+        // sizes truthfully: what follows only decides whose spend it is.
+        let created = session_created_ms(&conn, store, conversation_id)
+            .await
+            .map(millis_to_datetime);
+        if let Some(created) = created {
+            disown_copied_history(&mut turns, created);
+        }
+        for (at, usage) in self
+            .spend_beyond_the_transcript(&conn, store, conversation_id, created)
+            .await
+        {
+            super::add_usage_to_turn_current_at(&mut turns, Some(at), &usage);
+        }
         let session_stats = super::merge_context_window_stats(
             super::compute_session_stats(&turns),
             context_window_used_tokens,
@@ -284,6 +298,55 @@ impl OpenCodeParser {
             session_stats,
             transcript_watermark: None,
         })
+    }
+
+    /// Spend a session made that its transcript does not carry: `(when, usage)`.
+    ///
+    /// * Its sub-agents. The `task` tool runs each in a CHILD session
+    ///   (`parentID` set), never a conversation of its own — import refuses a
+    ///   session with a parent — and only its tool calls were read, never its
+    ///   tokens. Every descendant counts, however deep the delegation went,
+    ///   from both of its copies ([`session_spend_across_stores`]).
+    /// * Its own compactions (OpenCode 2). A `compaction` row's `tokens` are
+    ///   the summary request's own usage; the transcript files the divider
+    ///   without them so the context gauge is not sized by what was just
+    ///   dropped, but they were billed all the same. A migrated one lost its
+    ///   tokens in the migration; its 1.x twin, same id, still has them. One
+    ///   older than the session itself (`created`) is a fork's copy, and its
+    ///   source's spend (see [`disown_copied_history`]).
+    ///
+    /// A failed query (an older schema) adds nothing.
+    async fn spend_beyond_the_transcript(
+        &self,
+        conn: &DatabaseConnection,
+        store: SessionStore,
+        session_id: &str,
+        created: Option<DateTime<Utc>>,
+    ) -> Vec<(DateTime<Utc>, TurnUsage)> {
+        let mut spend: Vec<(DateTime<Utc>, TurnUsage)> = Vec::new();
+        if store == SessionStore::V2 {
+            let compactions = stored_rows(conn, SessionStore::V2, session_id, "'compaction'").await;
+            let legacy: HashMap<String, TurnUsage> =
+                if compactions.iter().any(|(_, _, u)| u.is_none()) {
+                    stored_rows(conn, SessionStore::Legacy, session_id, "")
+                        .await
+                        .into_iter()
+                        .filter_map(|(id, _, usage)| Some((id, usage?)))
+                        .collect()
+                } else {
+                    HashMap::new()
+                };
+            spend.extend(compactions.into_iter().filter_map(|(id, at, usage)| {
+                let usage = usage.or_else(|| legacy.get(&id).cloned())?;
+                created
+                    .is_none_or(|created| at >= created)
+                    .then_some((at, usage))
+            }));
+        }
+        for child in descendant_session_ids(conn, session_id).await {
+            spend.extend(session_spend_across_stores(conn, &child).await);
+        }
+        spend
     }
 
     async fn load_sqlite_messages(
@@ -2283,6 +2346,173 @@ fn extract_opencode_usage_from_tokens(tokens: &serde_json::Value) -> Option<Turn
     })
 }
 
+/// A session's own `time_created` (ms), from the store it was read from.
+async fn session_created_ms(
+    conn: &DatabaseConnection,
+    store: SessionStore,
+    session_id: &str,
+) -> Option<i64> {
+    let table = match store {
+        SessionStore::Legacy => "session",
+        SessionStore::V2 => "session_v2",
+    };
+    conn.query_one(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        format!("SELECT time_created FROM {table} WHERE id = ? LIMIT 1"),
+        [session_id.into()],
+    ))
+    .await
+    .ok()
+    .flatten()
+    .and_then(|row| row.try_get::<i64>("", "time_created").ok())
+}
+
+/// Clear the usage of every assistant turn older than its own session: a
+/// fork's copy of the history it forked from.
+///
+/// OpenCode forks a session (`Session.fork`) into a NEW one with no parent
+/// link, cloning every message — `tokens` and `time.created` included — so a
+/// fork listed as a conversation of its own billed its source's spend a second
+/// time. A session cannot have produced a reply before it existed: across a
+/// real 249-session library, the only sessions holding messages older than
+/// themselves were its two forks, 30 and 52 s older, and the 1.x → 2 migration
+/// keeps every session's creation time. The copies still render; only their
+/// spend goes, counted where it was made.
+fn disown_copied_history(turns: &mut [MessageTurn], created: DateTime<Utc>) {
+    for turn in turns {
+        if matches!(turn.role, TurnRole::Assistant) && turn.timestamp < created {
+            turn.usage = None;
+        }
+    }
+}
+
+/// A stored message's spend: when it was created (`data.time.created`, else
+/// the row's), and its usage, if it carries any.
+fn stored_message_spend(row: &QueryResult) -> Option<(String, DateTime<Utc>, Option<TurnUsage>)> {
+    let id: String = row.try_get("", "id").ok()?;
+    let row_time: i64 = row.try_get("", "time_created").ok()?;
+    let data: String = row.try_get("", "data").ok()?;
+    let value: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let at = value
+        .get("time")
+        .and_then(|t| t.get("created"))
+        .and_then(|c| c.as_i64())
+        .unwrap_or(row_time);
+    Some((id, millis_to_datetime(at), extract_opencode_usage(&value)))
+}
+
+/// One session's billed rows in one store: `(id, when, usage)`. 1.x: its
+/// assistant messages. OpenCode 2: its rows of the given types. A failed
+/// query (no such table) yields nothing.
+async fn stored_rows(
+    conn: &DatabaseConnection,
+    store: SessionStore,
+    session_id: &str,
+    v2_types: &str,
+) -> Vec<(String, DateTime<Utc>, Option<TurnUsage>)> {
+    let sql = match store {
+        SessionStore::Legacy => "SELECT id, time_created, data FROM message \
+             WHERE session_id = ? AND json_extract(data, '$.role') = 'assistant'"
+            .to_string(),
+        SessionStore::V2 => format!(
+            "SELECT id, time_created, data FROM session_message \
+             WHERE session_id = ? AND type IN ({v2_types})"
+        ),
+    };
+    let Ok(rows) = conn
+        .query_all(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            [session_id.into()],
+        ))
+        .await
+    else {
+        return Vec::new();
+    };
+    rows.iter().filter_map(stored_message_spend).collect()
+}
+
+/// Everything one session spent across BOTH stores, each message once.
+///
+/// OpenCode 2's migration copies 1.x messages under the SAME ids (every one
+/// of a real library's 237 has its twin), but folds a 1.x summary reply into a
+/// `compaction` row WITHOUT its tokens; and either copy can grow afterwards —
+/// OpenCode 2 continuing the session, or 1.x writing after the migration. So
+/// both copies are read and merged by id: a message carrying usage in either
+/// counts once (the larger reading, should they ever differ), and one only
+/// one copy holds counts from that copy.
+async fn session_spend_across_stores(
+    conn: &DatabaseConnection,
+    session_id: &str,
+) -> Vec<(DateTime<Utc>, TurnUsage)> {
+    let mut by_id: HashMap<String, (DateTime<Utc>, TurnUsage)> = HashMap::new();
+    let rows = stored_rows(conn, SessionStore::Legacy, session_id, "")
+        .await
+        .into_iter()
+        .chain(
+            stored_rows(
+                conn,
+                SessionStore::V2,
+                session_id,
+                "'assistant', 'compaction'",
+            )
+            .await,
+        );
+    for (id, at, usage) in rows {
+        let Some(usage) = usage else { continue };
+        match by_id.get(&id) {
+            Some((_, kept)) if usage_total(kept) >= usage_total(&usage) => {}
+            _ => {
+                by_id.insert(id, (at, usage));
+            }
+        }
+    }
+    let mut spend: Vec<_> = by_id.into_values().collect();
+    spend.sort_by_key(|(at, _)| *at);
+    spend
+}
+
+fn usage_total(usage: &TurnUsage) -> u64 {
+    usage
+        .input_tokens
+        .saturating_add(usage.output_tokens)
+        .saturating_add(usage.cache_creation_input_tokens)
+        .saturating_add(usage.cache_read_input_tokens)
+}
+
+/// Every session descending from `session_id` by `parent_id`, in either store
+/// (a child may have a copy in one, the other, or both).
+async fn descendant_session_ids(conn: &DatabaseConnection, session_id: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for table in ["session", "session_v2"] {
+        let Ok(rows) = conn
+            .query_all(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                format!(
+                    "WITH RECURSIVE descendants(id) AS ( \
+                         SELECT id FROM {table} WHERE parent_id = ? \
+                         UNION \
+                         SELECT s.id FROM {table} s JOIN descendants d ON s.parent_id = d.id \
+                     ) SELECT id FROM descendants"
+                ),
+                [session_id.into()],
+            ))
+            .await
+        else {
+            continue;
+        };
+        for row in rows {
+            if let Ok(id) = row.try_get::<String>("", "id") {
+                if !found.contains(&id) {
+                    found.push(id);
+                }
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
 fn millis_to_datetime(ms: i64) -> DateTime<Utc> {
     let secs = ms / 1000;
     let nsecs = ((ms.rem_euclid(1000)) * 1_000_000) as u32;
@@ -2782,6 +3012,103 @@ fn background_job_of_call(tool_name: &str, state: Option<&serde_json::Value>) ->
     }
 }
 
+/// The image and video jobs a Code Mode script started, keyed as
+/// [`background_job_of_call`] keys them. 2.4.2 offers `generate_image` and
+/// `generate_video` only inside Code Mode (`options.codemode: true` in
+/// `image-generate.ts` / `video-generate.ts`), so the model starts a job from
+/// an `execute` call: its `metadata.toolCalls` names the tool and holds no
+/// `jobID`, and the tool's result, now a plain string, carries the id only in
+/// its text, `Image job <id> started in the background…` / `Video job <id>
+/// started in the background…`. That text is the script's result only when the
+/// script returns it, so a script that drops it leaves its jobs unlinked.
+fn code_mode_background_jobs(state: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(calls) = state
+        .and_then(|s| s.get("metadata"))
+        .and_then(|m| m.get("toolCalls"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let called = |tool: &str| {
+        calls
+            .iter()
+            .any(|call| call.get("tool").and_then(|t| t.as_str()) == Some(tool))
+    };
+    let Some(text) = state
+        .and_then(|s| s.get("output"))
+        .and_then(|v| value_to_preview(Some(v)))
+        .or_else(|| tool_content_text(state))
+    else {
+        return Vec::new();
+    };
+    // (where its start text is, key), so the jobs keep the order they started in.
+    let mut jobs: Vec<(usize, String)> = Vec::new();
+    for (tool, lead, kind) in [
+        ("generate_image", "Image job ", "image"),
+        ("generate_video", "Video job ", "video"),
+    ] {
+        if !called(tool) {
+            continue;
+        }
+        for (at, _) in text.match_indices(lead) {
+            let rest = &text[at + lead.len()..];
+            let Some((id, after)) = rest.split_once(' ') else {
+                continue;
+            };
+            let key = format!("{kind}:{id}");
+            if !id.is_empty()
+                && after.starts_with("started in the background")
+                && !jobs.iter().any(|(_, seen)| *seen == key)
+            {
+                jobs.push((at, key));
+            }
+        }
+    }
+    jobs.sort_by_key(|(at, _)| *at);
+    jobs.into_iter().map(|(_, key)| key).collect()
+}
+
+/// Settle the background work a call started with the notices that report its
+/// end: a command, image or video call's one job (see
+/// [`settle_background_job`]), or the image and video jobs a Code Mode script
+/// started ([`code_mode_background_jobs`]). A script's notices come before its
+/// own result (which holds the "started in the background" texts the notices
+/// answer), the way a tool's own call shows its notice in place of that text,
+/// so a preview cut to its first characters still says how the jobs ended; a
+/// failed job marks the call failed as it would the tool's own call.
+fn settle_background_jobs(
+    normalized: &mut NormalizedToolCall,
+    tool_name: &str,
+    state: Option<&serde_json::Value>,
+    job_notices: &HashMap<String, serde_json::Value>,
+) {
+    if let Some(job) = background_job_of_call(tool_name, state) {
+        if let Some(notice) = job_notices.get(&job) {
+            settle_background_job(normalized, tool_name, notice);
+        }
+        return;
+    }
+    if tool_name != "execute" {
+        return;
+    }
+    let mut endings = Vec::new();
+    for notice in code_mode_background_jobs(state)
+        .iter()
+        .filter_map(|job| job_notices.get(job))
+    {
+        endings.extend(background_job_notice_text(notice));
+        let state = pick_str(notice.get("metadata"), &["state"]).unwrap_or("");
+        normalized.is_error |= is_error_status(state);
+    }
+    if endings.is_empty() {
+        return;
+    }
+    if let Some(output) = normalized.output_preview.take().filter(|o| !o.is_empty()) {
+        endings.push(output);
+    }
+    normalized.output_preview = Some(endings.join("\n\n"));
+}
+
 /// The background job a `synthetic` row reports the end of, when it is the
 /// notice that job's result arrives in. A command's is tagged
 /// `metadata: { source: "shell", shellID, jobID, state, exit? }`, its text the
@@ -2925,11 +3252,7 @@ fn v2_assistant_blocks(
                     .and_then(|n| n.as_str())
                     .unwrap_or("unknown");
                 let mut normalized = normalize_tool_call(tool_name, part.get("state"));
-                if let Some(notice) = background_job_of_call(tool_name, part.get("state"))
-                    .and_then(|job| job_notices.get(&job))
-                {
-                    settle_background_job(&mut normalized, tool_name, notice);
-                }
+                settle_background_jobs(&mut normalized, tool_name, part.get("state"), job_notices);
                 blocks.push(ContentBlock::ToolUse {
                     tool_use_id: call_id.clone(),
                     tool_name: normalized.tool_name,
@@ -3274,11 +3597,7 @@ async fn batch_load_v2_subagent_tool_calls(
                 .unwrap_or("unknown");
             let state = part.get("state");
             let mut normalized = normalize_tool_call(tool_name, state);
-            if let Some(notice) =
-                background_job_of_call(tool_name, state).and_then(|job| job_notices.get(&job))
-            {
-                settle_background_job(&mut normalized, tool_name, notice);
-            }
+            settle_background_jobs(&mut normalized, tool_name, state, &job_notices);
             let status = pick_str(state, &["status"]).unwrap_or("");
 
             result.entry(sid.clone()).or_default().push(AgentToolCall {
@@ -5378,6 +5697,216 @@ mod tests {
         assert_eq!(detail.turns.len(), 2);
     }
 
+    /// 2.4.2 offers `generate_image` and `generate_video` only inside Code
+    /// Mode, so a job starts from an `execute` call that names the tool in
+    /// `metadata.toolCalls` and carries the job's id only in the result text
+    /// the script returns. The image call and its notice are the ones 2.4.2
+    /// stored live (ids and paths shortened); the video's text is its
+    /// source's (`core/src/tool/plugin/video-generate.ts`).
+    #[test]
+    fn jobs_a_code_mode_script_started_report_their_end_on_the_script() {
+        use crate::parsers::AgentParser;
+
+        let t0: i64 = 1_795_853_851_000;
+        let model = serde_json::json!({ "id": "test-model", "providerID": "fake" });
+        let image_started = "Image job image_1 started in the background with fake/img-model. It will be saved as /tmp/images/image_s1 with the extension of its real format (.png, .jpg, .webp or .gif); the notice gives the exact path.\nYou will be notified automatically when it finishes or fails.";
+        let video_started = "Video job video_1 started in the background with fake/vid-model. It will be saved to /tmp/videos/video_1.mp4; if the model returns more than one video, the others are saved next to it with -1, -2, … added to the name.";
+        let execute = |id: &str, code: &str, tools: &[&str], text: &str| {
+            serde_json::json!({
+                "type": "tool",
+                "id": id,
+                "name": "execute",
+                "executed": false,
+                "state": {
+                    "status": "completed",
+                    "input": { "code": code },
+                    "content": [{ "type": "text", "text": text }],
+                    "metadata": {
+                        "toolCalls": tools
+                            .iter()
+                            .map(|tool| serde_json::json!({ "tool": tool, "status": "completed", "input": { "prompt": "a red square" } }))
+                            .collect::<Vec<_>>(),
+                        "truncated": false
+                    }
+                }
+            })
+        };
+        let notice = |source: &str, job: &str, state: &str, kind: &str, body: &str| {
+            serde_json::json!({
+                "metadata": { "source": source, "jobID": job, "state": state, "path": "/tmp/x" },
+                "time": { "created": t0 + 50 },
+                "text": format!("<background-result kind=\"{kind}\" id=\"{job}\" state=\"{state}\">\n{body}\n</background-result>"),
+                "description": "Image generation"
+            })
+        };
+        let mut fx = DbFixture::new(&V2_TABLES);
+        fx.v2_session("ses_main", None, Some("Jobs"), t0, t0 + 900);
+        fx.v2_message(
+            "ses_main",
+            "msg_u1",
+            0,
+            "user",
+            t0,
+            serde_json::json!({ "time": { "created": t0 }, "text": "make an image and a video" }),
+        );
+        fx.v2_message("ses_main", "msg_a1", 1, "assistant", t0 + 10, serde_json::json!({
+            "time": { "created": t0 + 10, "completed": t0 + 20 },
+            "agent": "build",
+            "model": model,
+            "content": [
+                execute(
+                    "call_both",
+                    "const a = await tools.generate_image({ prompt: 'a red square' });\nconst b = await tools.generate_video({ prompt: 'a red square' });\nreturn a + '\\n' + b",
+                    &["generate_image", "generate_video"],
+                    &format!("{image_started}\n{video_started}"),
+                ),
+                // The script dropped the tool's text: nothing links its job.
+                execute(
+                    "call_quiet",
+                    "await tools.generate_image({ prompt: 'a red square' });\nreturn 'ok'",
+                    &["generate_image"],
+                    "ok",
+                ),
+                // Text that reads like a start, from a script that started none.
+                execute(
+                    "call_echo",
+                    "return 'Image job image_1 started in the background'",
+                    &[],
+                    "Image job image_1 started in the background",
+                ),
+                {
+                    "type": "tool",
+                    "id": "call_kid",
+                    "name": "subagent",
+                    "state": {
+                        "status": "completed",
+                        "input": { "agent": "general", "description": "Kid", "prompt": "make one too" },
+                        "content": [{ "type": "text", "text": "<background-result kind=\"subagent\" sessionID=\"ses_kid\" state=\"completed\">\nkid done\n</background-result>" }],
+                        "metadata": { "sessionID": "ses_kid", "status": "completed" }
+                    }
+                },
+            ]
+        }));
+        // The sub-agent runs the same script in its own session, where its
+        // jobs' notices land too; its card's calls are cut to 500 characters.
+        fx.v2_session("ses_kid", Some("ses_main"), Some("Kid"), t0 + 300, t0 + 400);
+        fx.v2_message("ses_kid", "msg_k1", 0, "assistant", t0 + 310, serde_json::json!({
+            "time": { "created": t0 + 310, "completed": t0 + 320 },
+            "agent": "general",
+            "model": model,
+            "content": [execute(
+                "call_kid_both",
+                "const a = await tools.generate_image({ prompt: 'a red square' });\nconst b = await tools.generate_video({ prompt: 'a red square' });\nreturn a + '\\n' + b",
+                &["generate_image", "generate_video"],
+                &format!("{}\n{video_started}", image_started.replace("image_1", "image_k")),
+            )]
+        }));
+        fx.v2_message(
+            "ses_kid",
+            "msg_k2",
+            1,
+            "synthetic",
+            t0 + 330,
+            notice(
+                "generate_image",
+                "image_k",
+                "completed",
+                "image",
+                "Image request finished. Saved image: /tmp/images/image_k.png (fake/img-model).",
+            ),
+        );
+        fx.v2_message(
+            "ses_main",
+            "msg_n1",
+            2,
+            "synthetic",
+            t0 + 50,
+            notice(
+                "generate_image",
+                "image_1",
+                "error",
+                "image",
+                "Image request failed for /tmp/images/image_s1: fake/img-model has no image API opencode can call",
+            ),
+        );
+        fx.v2_message(
+            "ses_main",
+            "msg_n2",
+            3,
+            "synthetic",
+            t0 + 51,
+            notice(
+                "generate_video",
+                "video_1",
+                "completed",
+                "video",
+                "Saved video: /tmp/videos/video_1.mp4",
+            ),
+        );
+        let (_dir, parser) = fx.build();
+
+        let detail = parser.get_conversation("ses_main").expect("detail");
+        let blocks: Vec<&ContentBlock> = detail.turns.iter().flat_map(|t| &t.blocks).collect();
+        let result = |id: &str| {
+            blocks
+                .iter()
+                .find_map(|block| match block {
+                    ContentBlock::ToolResult {
+                        tool_use_id: Some(use_id),
+                        output_preview,
+                        is_error,
+                        ..
+                    } if use_id == id => {
+                        Some((output_preview.clone().unwrap_or_default(), *is_error))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no result for {id}"))
+        };
+        // How the jobs ended comes first, in the order they started, then the
+        // script's own result.
+        assert_eq!(
+            result("call_both"),
+            (
+                format!(
+                    "Image request failed for /tmp/images/image_s1: fake/img-model has no image API opencode can call\n\nSaved video: /tmp/videos/video_1.mp4\n\n{image_started}\n{video_started}"
+                ),
+                true
+            )
+        );
+        // The sub-agent's script, as its card lists it: the image job ended
+        // (the video's notice never came), and the cut keeps that.
+        let kid_calls = blocks
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id: Some(use_id),
+                    agent_stats: Some(stats),
+                    ..
+                } if use_id == "call_kid" => Some(stats.tool_calls.clone()),
+                _ => None,
+            })
+            .expect("the sub-agent's calls");
+        assert_eq!(kid_calls.len(), 1);
+        let kid = kid_calls[0].output_preview.clone().unwrap_or_default();
+        assert!(
+            kid.starts_with(
+                "Image request finished. Saved image: /tmp/images/image_k.png (fake/img-model).\n\nImage job image_k started"
+            ),
+            "{kid}"
+        );
+        assert!(!kid_calls[0].is_error);
+        assert_eq!(result("call_quiet"), ("ok".to_string(), false));
+        assert_eq!(
+            result("call_echo"),
+            (
+                "Image job image_1 started in the background".to_string(),
+                false
+            )
+        );
+        assert_eq!(detail.turns.len(), 2);
+    }
+
     /// A sub-agent's report comes out of 2.4.0's `<background-result
     /// kind="subagent">` as out of 2.x's `<subagent>`, even when the launch's
     /// description (an attribute of the tag) holds a `>`.
@@ -5896,6 +6425,371 @@ mod tests {
         assert_eq!(stats.context_window_used_tokens, Some(4_500));
     }
 
+    fn v2_assistant(created: i64, input: u64, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "time": { "created": created, "completed": created + 5 },
+            "model": { "id": "big-pickle", "providerID": "opencode", "variant": null },
+            "tokens": { "input": input, "output": 0, "reasoning": 0, "cache": { "read": 0, "write": 0 } },
+            "content": [{ "type": "text", "text": text }]
+        })
+    }
+
+    fn turn_input_total(detail: &crate::models::ConversationDetail) -> u64 {
+        detail
+            .turns
+            .iter()
+            .filter_map(|t| t.usage.as_ref())
+            .map(|u| u.input_tokens)
+            .sum()
+    }
+
+    /// A session's spend includes its sub-agents' child sessions (every
+    /// generation) and its compactions' summary requests, none of which its
+    /// own transcript carries.
+    #[test]
+    fn child_sessions_and_compactions_count_toward_the_session_that_ran_them() {
+        use crate::parsers::AgentParser;
+
+        let t0 = 1_793_110_000_000_i64;
+        let mut fx = DbFixture::new(&V2_TABLES);
+        fx.v2_session("ses_main", None, Some("main"), t0, t0 + 1_000);
+        fx.v2_message(
+            "ses_main",
+            "m1",
+            1,
+            "user",
+            t0 + 10,
+            serde_json::json!({ "time": { "created": t0 + 10 }, "text": "go" }),
+        );
+        fx.v2_message(
+            "ses_main",
+            "m2",
+            2,
+            "assistant",
+            t0 + 20,
+            v2_assistant(t0 + 20, 1_000, "delegating"),
+        );
+        fx.v2_message("ses_main", "m3", 3, "compaction", t0 + 60, serde_json::json!({
+            "time": { "created": t0 + 60 }, "auto": true,
+            "tokens": { "input": 300, "output": 0, "reasoning": 0, "cache": { "read": 0, "write": 0 } }
+        }));
+        fx.v2_session(
+            "ses_child",
+            Some("ses_main"),
+            Some("child"),
+            t0 + 25,
+            t0 + 50,
+        );
+        fx.v2_message(
+            "ses_child",
+            "c1",
+            1,
+            "assistant",
+            t0 + 30,
+            v2_assistant(t0 + 30, 200, "child work"),
+        );
+        fx.v2_session(
+            "ses_grand",
+            Some("ses_child"),
+            Some("grandchild"),
+            t0 + 35,
+            t0 + 45,
+        );
+        fx.v2_message(
+            "ses_grand",
+            "g1",
+            1,
+            "assistant",
+            t0 + 40,
+            v2_assistant(t0 + 40, 30, "grand work"),
+        );
+        // Somebody else's child adds nothing here.
+        fx.v2_session("ses_other", None, Some("other"), t0, t0 + 1);
+        fx.v2_session(
+            "ses_stray",
+            Some("ses_other"),
+            Some("stray"),
+            t0 + 2,
+            t0 + 3,
+        );
+        fx.v2_message(
+            "ses_stray",
+            "s1",
+            1,
+            "assistant",
+            t0 + 2,
+            v2_assistant(t0 + 2, 9_000, "x"),
+        );
+        let (_dir, parser) = fx.build();
+
+        let detail = parser.get_conversation("ses_main").expect("detail");
+        assert_eq!(turn_input_total(&detail), 1_000 + 300 + 200 + 30);
+    }
+
+    /// A child migrated to OpenCode 2 and continued there: the migration kept
+    /// every id but folded its 1.x summary into a compaction WITHOUT tokens,
+    /// so each message counts once across both copies, the summary from the
+    /// 1.x twin. The parent's own migrated compaction is read the same way.
+    #[test]
+    fn a_migrated_child_counts_each_message_once_across_both_stores() {
+        use crate::parsers::AgentParser;
+
+        let t0 = 1_793_110_000_000_i64;
+        let mut tables: Vec<&str> = LEGACY_TABLES.to_vec();
+        tables.extend(V2_TABLES);
+        let mut fx = DbFixture::new(&tables);
+        let tokens = |input: u64| serde_json::json!({ "input": input, "output": 0, "reasoning": 0, "cache": { "read": 0, "write": 0 } });
+        let legacy =
+            |fx: &mut DbFixture, session: &str, id: &str, at: i64, extra: serde_json::Value| {
+                let mut data =
+                    serde_json::json!({ "role": "assistant", "time": { "created": at } });
+                for (key, value) in extra.as_object().expect("object") {
+                    data[key] = value.clone();
+                }
+                fx.exec(
+                    "INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)",
+                    [
+                        id.into(),
+                        session.into(),
+                        at.into(),
+                        data.to_string().into(),
+                    ],
+                );
+            };
+        // The parent, migrated: its 1.x summary carries tokens, the v2 twin not.
+        fx.v2_session("ses_main", None, Some("main"), t0, t0 + 1_000);
+        fx.v2_message(
+            "ses_main",
+            "m1",
+            1,
+            "user",
+            t0 + 10,
+            serde_json::json!({ "time": { "created": t0 + 10 }, "text": "go" }),
+        );
+        fx.v2_message(
+            "ses_main",
+            "m2",
+            2,
+            "assistant",
+            t0 + 20,
+            v2_assistant(t0 + 20, 1_000, "delegating"),
+        );
+        fx.v2_message("ses_main", "ms", 3, "compaction", t0 + 60, serde_json::json!({
+            "time": { "created": t0 + 60 }, "status": "completed", "reason": "auto", "summary": "so far"
+        }));
+        legacy(
+            &mut fx,
+            "ses_main",
+            "ms",
+            t0 + 60,
+            serde_json::json!({ "summary": true, "tokens": tokens(70) }),
+        );
+        // The child, in both stores.
+        fx.exec(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated) \
+             VALUES ('ses_child', 'ses_main', '/work/app', 'child', ?, ?)",
+            [(t0 + 25).into(), (t0 + 50).into()],
+        );
+        fx.v2_session(
+            "ses_child",
+            Some("ses_main"),
+            Some("child"),
+            t0 + 25,
+            t0 + 900,
+        );
+        legacy(
+            &mut fx,
+            "ses_child",
+            "c1",
+            t0 + 30,
+            serde_json::json!({ "tokens": tokens(100) }),
+        );
+        legacy(
+            &mut fx,
+            "ses_child",
+            "cs",
+            t0 + 40,
+            serde_json::json!({ "summary": true, "tokens": tokens(200) }),
+        );
+        fx.v2_message(
+            "ses_child",
+            "c1",
+            1,
+            "assistant",
+            t0 + 30,
+            v2_assistant(t0 + 30, 100, "child work"),
+        );
+        fx.v2_message("ses_child", "cs", 2, "compaction", t0 + 40, serde_json::json!({
+            "time": { "created": t0 + 40 }, "status": "completed", "reason": "auto", "summary": "child so far"
+        }));
+        fx.v2_message(
+            "ses_child",
+            "c2",
+            3,
+            "assistant",
+            t0 + 800,
+            v2_assistant(t0 + 800, 250, "more"),
+        );
+        let (_dir, parser) = fx.build();
+
+        let detail = parser.get_conversation("ses_main").expect("detail");
+        assert_eq!(turn_input_total(&detail), 1_000 + 70 + 100 + 200 + 250);
+    }
+
+    /// A child only the 1.x tables hold still counts toward a parent read
+    /// from OpenCode 2's.
+    #[test]
+    fn a_child_left_in_the_legacy_store_still_counts() {
+        use crate::parsers::AgentParser;
+
+        let t0 = 1_793_110_000_000_i64;
+        let mut tables: Vec<&str> = LEGACY_TABLES.to_vec();
+        tables.extend(V2_TABLES);
+        let mut fx = DbFixture::new(&tables);
+        fx.v2_session("ses_main", None, Some("main"), t0, t0 + 1_000);
+        fx.v2_message(
+            "ses_main",
+            "m1",
+            1,
+            "user",
+            t0 + 10,
+            serde_json::json!({ "time": { "created": t0 + 10 }, "text": "go" }),
+        );
+        fx.v2_message(
+            "ses_main",
+            "m2",
+            2,
+            "assistant",
+            t0 + 20,
+            v2_assistant(t0 + 20, 1_000, "delegating"),
+        );
+        fx.exec(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated) \
+             VALUES ('ses_old_child', 'ses_main', '/work/app', 'child', ?, ?)",
+            [(t0 + 25).into(), (t0 + 50).into()],
+        );
+        fx.exec(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES ('c1', 'ses_old_child', ?, ?)",
+            [
+                (t0 + 30).into(),
+                serde_json::json!({
+                    "role": "assistant", "time": { "created": t0 + 30 },
+                    "tokens": { "input": 250, "output": 0, "reasoning": 0, "cache": { "read": 0, "write": 0 } }
+                })
+                .to_string()
+                .into(),
+            ],
+        );
+        let (_dir, parser) = fx.build();
+
+        let detail = parser.get_conversation("ses_main").expect("detail");
+        assert_eq!(turn_input_total(&detail), 1_000 + 250);
+    }
+
+    /// A fork clones its source's messages, tokens and creation times
+    /// included, into a session with no parent link: what predates the fork
+    /// renders but is the source's spend.
+    #[test]
+    fn a_fork_is_not_billed_for_the_messages_it_cloned() {
+        use crate::parsers::AgentParser;
+
+        let t0 = 1_793_110_000_000_i64;
+        let mut fx = DbFixture::new(&V2_TABLES);
+        fx.v2_session("ses_src", None, Some("Greeting"), t0, t0 + 100);
+        fx.v2_message(
+            "ses_src",
+            "a1",
+            1,
+            "user",
+            t0 + 10,
+            serde_json::json!({ "time": { "created": t0 + 10 }, "text": "hi" }),
+        );
+        fx.v2_message(
+            "ses_src",
+            "a2",
+            2,
+            "assistant",
+            t0 + 20,
+            v2_assistant(t0 + 20, 10_000, "hello"),
+        );
+        fx.v2_session(
+            "ses_fork",
+            None,
+            Some("Greeting (fork #1)"),
+            t0 + 30_000,
+            t0 + 40_000,
+        );
+        fx.v2_message(
+            "ses_fork",
+            "b1",
+            1,
+            "user",
+            t0 + 10,
+            serde_json::json!({ "time": { "created": t0 + 10 }, "text": "hi" }),
+        );
+        fx.v2_message(
+            "ses_fork",
+            "b2",
+            2,
+            "assistant",
+            t0 + 20,
+            v2_assistant(t0 + 20, 10_000, "hello"),
+        );
+        fx.v2_message(
+            "ses_fork",
+            "b3",
+            3,
+            "user",
+            t0 + 31_000,
+            serde_json::json!({ "time": { "created": t0 + 31_000 }, "text": "and?" }),
+        );
+        fx.v2_message(
+            "ses_fork",
+            "b4",
+            4,
+            "assistant",
+            t0 + 32_000,
+            v2_assistant(t0 + 32_000, 500, "more"),
+        );
+        // A compaction the source ran, copied along; and one the fork ran.
+        let compaction = |created: i64, input: u64| {
+            serde_json::json!({
+                "time": { "created": created }, "status": "completed", "reason": "auto",
+                "summary": "so far",
+                "tokens": { "input": input, "output": 0, "reasoning": 0, "cache": { "read": 0, "write": 0 } }
+            })
+        };
+        fx.v2_message(
+            "ses_fork",
+            "b0",
+            0,
+            "compaction",
+            t0 + 5,
+            compaction(t0 + 5, 7_000),
+        );
+        fx.v2_message(
+            "ses_fork",
+            "b5",
+            5,
+            "compaction",
+            t0 + 33_000,
+            compaction(t0 + 33_000, 60),
+        );
+        let (_dir, parser) = fx.build();
+
+        let forked = parser.get_conversation("ses_fork").expect("fork");
+        assert_eq!(turn_input_total(&forked), 500 + 60);
+        assert!(
+            forked.turns.iter().any(|t| t
+                .blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text == "hello"))),
+            "the cloned history still renders"
+        );
+        let source = parser.get_conversation("ses_src").expect("source");
+        assert_eq!(turn_input_total(&source), 10_000);
+    }
+
     /// A custom provider's window lives only in the config it was declared
     /// in, and a project's config is found from the session's own directory.
     #[test]
@@ -6275,7 +7169,7 @@ mod tests {
     /// The auto compaction a 2.2.0 session ran when its context filled up:
     /// the first attempt failed, the retry completed with a summary.
     #[test]
-    fn compaction_rows_render_as_the_shared_divider_without_usage() {
+    fn compaction_rows_render_as_the_shared_divider_carrying_their_own_spend() {
         use crate::parsers::AgentParser;
 
         const SUMMARY: &str = "## Objective\n- Exercise every OpenCode tool for a history probe.\n\n## Requirements\n- (none)\n\n## Decisions\n- (none)\n\n## Work State\n### Completed\n- Ran shell, read, write, edit, patch, glob, grep, subagent, skill, todowrite, execute, webfetch.\n\n### Active\n- (none)\n\n### Blocked\n- (none)\n\n## Next Move\n1. (none)\n\n## Relevant Files\n- `notes.txt`: edited by the probe\n\n## Important Context\n- (none)";
@@ -6422,9 +7316,19 @@ mod tests {
         assert_eq!(output.as_deref(), Some(SUMMARY));
         assert!(!failed);
 
-        // The summary request's own tokens are not the context's size, and
-        // the turn does not carry them.
-        assert!(detail.turns[3].usage.is_none() && detail.turns[5].usage.is_none());
+        // The summary request's own tokens are not the context's size (the
+        // gauge below never sees them), but they were billed — the failed
+        // attempt's too — and each divider carries its request's spend.
+        let spend = |turn: &crate::models::MessageTurn| {
+            let usage = turn.usage.as_ref().expect("summary request spend");
+            (
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_input_tokens,
+            )
+        };
+        assert_eq!(spend(&detail.turns[3]), (200, 60, 40));
+        assert_eq!(spend(&detail.turns[5]), (100, 30, 20));
         let reply = detail.turns[6].usage.as_ref().expect("reply usage");
         assert_eq!(
             (

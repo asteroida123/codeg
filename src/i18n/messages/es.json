@@ -250,12 +250,6 @@
         "appliedToast": "Fondo aplicado",
         "credit": "Imágenes de wallhaven.cc · solo SFW"
       }
-    },
-    "paAccent": {
-      "title": "Color de acento de los asistentes",
-      "description": "El color de los bordes y botones de las tarjetas en la conversación de un asistente; tus burbujas siempre llevan el color del asistente.",
-      "default": "Predeterminado",
-      "bot": "Seguir el color del asistente"
     }
   },
   "SystemSettings": {
@@ -1152,7 +1146,7 @@
       "saveRawConfig": "Guardar archivo"
     },
     "antigravity": {
-      "configDescription": "Sin un método de autenticación (guardado en auth.type) las sesiones fallan con \"Authentication required\". El modelo y el modo se eligen en el campo de mensaje.",
+      "configDescription": "La CLI de Antigravity gestiona el inicio de sesión. codeg ejecuta `agy acp` directamente; esta opción solo decide cómo se autentica: los métodos de Google reutilizan el inicio de sesión en caché de la CLI (usa el acceso sin navegador de abajo si esta máquina no tiene navegador), y los métodos con clave de API leen la credencial ingresada aquí. El modelo y el modo de sesión no están aquí: Antigravity los reporta mediante ACP y los selectores del editor los gestionan por sesión.",
       "methodLabel": "Authentication method",
       "methods": {
         "oauth-personal": "Sign in with Google",
@@ -1161,8 +1155,8 @@
         "agent-platform": "Gemini Enterprise Agent Platform"
       },
       "methodHints": {
-        "oauth-personal": "Tu cuenta de Google, cualquier plan (incluido el gratuito). La primera sesión abre un navegador; ¿sin navegador? Usa el acceso sin navegador de abajo.",
-        "oauth-business": "Cuenta de Gemini Enterprise; requiere un proyecto y una ubicación de GCP. La primera sesión abre un navegador; ¿sin navegador? Usa el acceso sin navegador de abajo.",
+        "oauth-personal": "Tu cuenta de Google, en cualquier plan de Antigravity incluido el gratuito. La CLI de Antigravity almacena el inicio de sesión en caché y lo reutiliza para agy acp. ¿Sin navegador en esta máquina? Usa el acceso sin navegador de abajo.",
+        "oauth-business": "Tu cuenta de Gemini Enterprise. Necesita un proyecto y una ubicación de GCP. La CLI de Antigravity inicia sesión al empezar una sesión, en un navegador de la máquina donde se ejecuta codeg; el acceso sin navegador solo admite cuentas personales de Google.",
         "gemini-api-key": "A key for the Gemini Developer API, passed to the agent as GEMINI_API_KEY.",
         "agent-platform": "Usa una clave API, o un proyecto y una ubicación con las credenciales predeterminadas de la aplicación. Ejecuta gcloud auth application-default login si hace falta."
       },
@@ -1174,25 +1168,32 @@
       "missingGeminiApiKey": "Enter a Gemini API key, or pick a different authentication method — sessions will fail to start without it.",
       "missingAgentPlatformConfig": "Enter an API key, or both a project and a location — sessions will fail to start without one of the two.",
       "missingEnterpriseConfig": "Gemini Enterprise needs both a project and a location.",
-      "settingsFileHint": "Saved to auth.type in this file. Any other keys you put there are preserved.",
-      "syncSkipped": "Your choice was saved, but codeg could not write it to the ACP server's settings.json, so Antigravity will keep authenticating the way that file says. Set auth.type in it yourself, or move it aside and save again.",
+      "settingsFileHint": "Archivo de configuración propio de Antigravity CLI (referencia de solo lectura; codeg no lo sobrescribe).",
       "save": "Save",
+      "permissionsTitle": "Permisos",
+      "permissionModeLabel": "Modo de permisos",
+      "permissionModeDefault": "Seguir modo de sesión (predeterminado)",
+      "permissionModeTurbo": "Turbo (--dangerously-skip-permissions)",
+      "permissionModeDefaultHint": "Inicia `agy acp` normalmente para que el selector de modo de sesión (default, accept-edits, auto, plan) y tus reglas de permisos controlen las aprobaciones.",
+      "permissionModeTurboHint": "Inicia `agy acp --dangerously-skip-permissions`: aprueba automáticamente todas las solicitudes de permisos de herramientas sin preguntar (las reglas deny explícitas y la lista de bloqueo del sistema siguen aplicando). Aplica a nuevas sesiones.",
+      "sandboxLabel": "Sandbox de terminal",
+      "sandboxHint": "Inicia `agy acp --sandbox`: los comandos de terminal del agente se ejecutan con las restricciones del sandbox de la CLI. Se aplica a las sesiones nuevas.",
+      "telemetryTitle": "Desactivar telemetría",
+      "telemetryHint": "Inicia `agy acp --disable-telemetry`, de modo que la CLI no envía telemetría de uso. Se aplica a las sesiones nuevas.",
       "headless": {
         "title": "Inicia sesión sin navegador en esta máquina",
-        "description": "¿Sin navegador donde corre el agente (p. ej., un servidor)? La primera sesión esperaría 5 min y fallaría. Abre el enlace en cualquier dispositivo y pega de vuelta la dirección a la que llegues.",
+        "description": "Antigravity CLI imprime un enlace de inicio de sesión de Google y espera el código de autorización. Esto funciona sin navegador en esta máquina: abre el enlace en cualquier dispositivo, aprueba el acceso y pega aquí el código de autorización (o la dirección completa a la que llegues).",
         "start": "Obtener enlace de acceso",
         "saveFirst": "Guarda primero: el inicio de sesión usa los ajustes guardados, no lo que acabas de escribir.",
         "step1": "1. Abre este enlace e inicia sesión en Google.",
-        "step2": "2. El navegador llega a {redirectUri} y no conecta; es lo esperado. Pega aquí esa dirección completa.",
+        "step2": "2. Abre el enlace de arriba y aprueba el acceso. Llegarás a {redirectUri}; pega aquí el código de autorización (o esa dirección completa).",
         "copyLink": "Copiar enlace",
         "openLink": "Abrir en una pestaña nueva",
         "complete": "Completar inicio de sesión",
         "cancel": "Cancelar",
         "signedIn": "Sesión iniciada. Las nuevas sesiones usarán esta cuenta.",
-        "alreadySignedIn": "Antigravity ya tenía un token válido, así que inició sesión sin necesidad de enlace.",
         "failed": "El inicio de sesión no se completó.",
-        "startFailed": "No se pudo iniciar el acceso",
-        "credentialHint": "Token guardado aquí. Copia este archivo a otra máquina sin escritorio para iniciar sesión también."
+        "startFailed": "No se pudo iniciar el acceso"
       },
       "signOut": {
         "title": "¿Iniciaste sesión con la cuenta equivocada?",
@@ -1200,21 +1201,7 @@
         "action": "Cerrar sesión",
         "done": "Sesión cerrada. Vuelve a iniciar sesión para elegir otra cuenta.",
         "failed": "No se pudo cerrar la sesión"
-      },
-      "tempReclaimTitle": "Espacio temporal sobrante",
-      "tempReclaimHint": "Busca directorios temporales que este agente dejó con versiones anteriores de codeg. No se elimina nada hasta que confirmes y se omite lo que siga en uso.",
-      "tempReclaimScan": "Analizar",
-      "tempReclaimDelete": "Eliminar restos",
-      "tempReclaimNone": "No hay nada que recuperar.",
-      "tempReclaimFound": "{count} elemento(s) sobrante(s), {size} recuperable(s).",
-      "tempReclaimSkipped": "{count} omitido(s) (en uso o demasiado reciente).",
-      "tempReclaimed": "Se recuperaron {size} de {count} elemento(s).",
-      "tempReclaimSelectAll": "Seleccionar todo",
-      "tempReclaimAgeHours": "{hours} h",
-      "tempReclaimConfirmTitle": "¿Eliminar {count} elemento(s)?",
-      "tempReclaimConfirmBody": "Esto elimina permanentemente {size}. La carpeta temporal del sistema se comparte con otras aplicaciones, así que revisa cada ruta antes de confirmar; lo que siga en uso se omite.",
-      "tempReclaimConfirmAction": "Eliminar",
-      "tempReclaimCancel": "Cancelar"
+      }
     },
     "kiro": {
       "configManagement": "Configuración",
@@ -1762,7 +1749,6 @@
       "qoderSaved": "Configuración de Qoder guardada",
       "saveQoderConfigFailed": "No se pudo guardar la configuración de Qoder",
       "antigravitySaved": "Antigravity config saved",
-      "antigravitySyncSkipped": "Saved, but Antigravity's settings.json was left alone",
       "saveAntigravityConfigFailed": "Failed to save Antigravity config",
       "kiroSaved": "Configuración de Kiro guardada",
       "saveKiroFailed": "No se pudo guardar la configuración de Kiro",
@@ -3893,6 +3879,7 @@
         "errorUnsupportedLinkProtocol": "Este protocolo de enlace no es compatible."
       },
       "fileActions": {
+        "openWithDefaultApp": "Abrir con la aplicación predeterminada",
         "openInFinder": "Abrir en Finder",
         "openInExplorer": "Abrir en Explorer",
         "openInFileManager": "Abrir en el gestor de archivos",
@@ -10372,7 +10359,34 @@
     },
     "work": {
       "taskNotStarted": "Esta tarea aún no ha empezado. Su conversación aparecerá aquí en cuanto empiece.",
-      "taskGone": "No se encuentra esta tarea; puede que se haya eliminado."
+      "taskGone": "No se encuentra esta tarea; puede que se haya eliminado.",
+      "retry": "Reintentar",
+      "handTo": "Pasar a {name}",
+      "viewSession": "Ver sesión",
+      "merge": "Fusionar",
+      "mergeTo": "Fusionar en {base}",
+      "createPr": "Crear PR",
+      "pushBack": "Devolver al PR",
+      "mergePr": "Fusionar PR",
+      "mergeMr": "Fusionar MR",
+      "openPr": "Abrir PR",
+      "openMr": "Abrir MR",
+      "nudge": "Volver a preguntar",
+      "rehand": "Que {name} lo haga otra vez",
+      "toast": {
+        "retried": "Empezó de nuevo",
+        "handed": "Pasado a {name}",
+        "merging": "Fusionando…",
+        "merged": "Fusionado",
+        "mergeAsked": "Espera tu aprobación en su tarjeta",
+        "mergeChanged": "Cambió desde que lo miraste: leído de nuevo",
+        "ranAgain": "Esta tarea se volvió a ejecutar desde que la viste: vuelve a revisarla",
+        "nudged": "Se volvió a preguntar a {name}",
+        "nudgedAlready": "Se preguntó a {name} hace un momento",
+        "rehanded": "Pasado de nuevo a {name}",
+        "done": "Hecho"
+      },
+      "reconnect": "Volver a conectar la cuenta"
     },
     "composer": {
       "placeholder": "Escribe a {name}…",
@@ -10637,7 +10651,7 @@
           "standard": "Estándar",
           "ask_more": "Pregúntame más",
           "custom": "Personalizado",
-          "standardHint": "Todo se hace solo y te lo cuentan en una tarjeta.",
+          "standardHint": "Casi todo se hace solo y te lo cuentan en una tarjeta; fusionar PR, cerrar issues, comentar en una forja y arreglar las comprobaciones fallidas o conflictos de una PR vigilada te lo preguntan primero.",
           "ask_moreHint": "Los seguimientos y reintentos, el reintento del trabajo interrumpido por un reinicio, los mensajes a otros asistentes, los cambios que pides en la conversación y los encargos que cambian código te llegan primero como tarjeta; las preguntas y aprobaciones de plan de las sesiones te llegan a ti.",
           "customHint": "Algunos de los elementos de abajo están ajustados a tu manera.",
           "confirmTitle": "¿Cambiar a «{level}»?",
@@ -11157,6 +11171,14 @@
           "auto": "Al momento, con deshacer en la tarjeta",
           "draft": "Muéstramelo antes (tarjeta en borrador, se aplica cuando lo diga)",
           "off": "No"
+        },
+        "pr_checks_wait_hours": {
+          "title": "Horas de espera de las comprobaciones",
+          "hint": "Un PR vigilado cuyas comprobaciones lleven este tiempo sin resultado pasa a Te espera. De 1 a 48."
+        },
+        "pr_review_wait_days": {
+          "title": "Días de espera de la revisión",
+          "hint": "Un PR vigilado que lleve estos días esperando su revisión pasa a Te espera. De 1 a 14."
         }
       },
       "workdir": {
@@ -11977,8 +11999,8 @@
       },
       "workspace": {
         "empty": "Ahora no hay nada en marcha",
-        "open": "Abrir",
-        "emptyHint": "Mientras se ejecuta el trabajo que delegó, su sesión se ve aquí en directo.",
+        "viewSession": "Ver sesión",
+        "emptyHint": "Mientras se ejecuta el trabajo que delegó, aparece aquí.",
         "whose": "Espacio de trabajo de {name}"
       },
       "notifyOn": "activado",
@@ -12149,12 +12171,17 @@
     },
     "feed": {
       "groups": {
-        "needs": "Esperándote",
+        "needs": "Te toca a ti",
+        "running": "En curso",
+        "watch": "Vigilando",
         "watching": "En curso",
         "next": "Rutinas y recordatorios",
         "done": "Hecho hoy"
       },
       "empty": "No hay nada que hacer ni nada en marcha.",
+      "suggestions": "{count, plural, one {# sugerencia más} other {# sugerencias más}}",
+      "ignore": "Ignorar",
+      "ignoreHint": "Ocultarlo; volverá a aparecer si algo cambia",
       "failed": "No se pudo leer la actividad ahora mismo.",
       "handed": "Pasado a {name}",
       "checking": "En revisión · ronda {round}",
@@ -12166,7 +12193,57 @@
       "viewReminder": "Ver el recordatorio",
       "viewCheck": "Ver la sesión de aceptación",
       "openTask": "Abrir la tarea",
-      "routineDeleted": "Esta rutina se ha eliminado."
+      "routineDeleted": "Esta rutina se ha eliminado.",
+      "why": {
+        "no_reply": "Sin respuesta de {name}",
+        "unfinished": "Sin terminar",
+        "checks": "Comprobaciones fallidas · nadie lo arregla",
+        "conflict": "Conflicto · nadie lo arregla",
+        "fix_pending": "codeg va a arreglarlo",
+        "fixing": "Arreglándose",
+        "platform_blocked": "La plataforma aún no deja fusionar",
+        "merge_queued": "En cola para fusionar",
+        "merging": "Fusionando",
+        "check_preparing": "Preparando la revisión",
+        "check_settling": "Cerrando la revisión",
+        "queued": "En cola para {name}",
+        "in_turn": "{name} está en ello",
+        "looking": "Esperando a que {name} lo retome",
+        "no_trigger": "Sin próxima hora",
+        "failed": "Falló",
+        "readFailed": {
+          "auth": "No se puede leer · vuelve a iniciar sesión",
+          "no_account": "No se puede leer · no hay cuenta para esta forja",
+          "config": "Esta forja no se puede leer",
+          "network": "No se puede leer · sin conexión",
+          "api": "No se puede leer · la forja respondió con un error",
+          "timeout": "No se puede leer · la forja no respondió",
+          "other": "No se puede leer"
+        },
+        "checks_slow": "Comprobaciones {hours} h sin resultado",
+        "review_pending": "Esperando revisión",
+        "review_slow": "{days} d esperando revisión"
+      },
+      "stop": {
+        "task": "Detener",
+        "turn": "Detener el turno de {name}"
+      },
+      "ask": {
+        "approvePlan": "Aprobar el plan",
+        "queued": "{count, plural, one {# más en espera} other {# más en espera}}",
+        "settled": "Ya se respondió: se volvió a leer",
+        "planAll": "Ver el plan completo",
+        "planLess": "Mostrar menos",
+        "planRevise": "Devolver con una nota…",
+        "planReviseSend": "Devolver",
+        "planReviseCancel": "Cancelar",
+        "planReviseHint": "¿Qué debería cambiar?",
+        "answered": "Respuesta enviada"
+      },
+      "back": {
+        "line": "Desde la actividad · {count, plural, one {# más te espera} other {# más te esperan}}",
+        "go": "Volver a la actividad"
+      }
     },
     "today": {
       "title": "Hoy",
@@ -12207,7 +12284,8 @@
         "memoryUndone": "Recordado y luego deshecho",
         "plan_stuck": "Plan atascado",
         "routine_paused": "Rutina en pausa",
-        "used_up": "Aún no está bien"
+        "used_up": "Aún no está bien",
+        "pr_gone": "Dejó de vigilar un PR que no encuentra"
       },
       "reason": {
         "failed": "Falló",
@@ -12898,7 +12976,14 @@
         }
       },
       "undoDetail": "Deshiciste {undone} de los {made} cambios hechos a tu palabra en las dos últimas semanas.",
-      "idleBotDetail": "Nadie lo ha despertado en dos semanas."
+      "idleBotDetail": "Nadie lo ha despertado en dos semanas.",
+      "group": {
+        "count": "{count, plural, one {# tarjeta} other {# tarjetas}}",
+        "expand": "Ver todas",
+        "collapse": "Ver menos",
+        "more": "{count, plural, one {# más sin mostrar} other {# más sin mostrar}}",
+        "mutedEntry": "Descartada, y este tipo desactivado."
+      }
     },
     "brief": {
       "title": "Resumen de la mañana",
@@ -13180,7 +13265,17 @@
         "answer": "Responder",
         "drop": "Ya no hace falta",
         "stop": "Dejar de recordar",
-        "undo": "Deshacer"
+        "undo": "Deshacer",
+        "withdrawMessage": "Retirar mensaje",
+        "stopWaiting": "Dejar de esperar respuesta",
+        "noReplyNeeded": "No hace falta responder",
+        "noAnswerNeeded": "No hace falta contestar",
+        "stopFollowing": "Dejar de dar seguimiento",
+        "cancelReminder": "Cancelar recordatorio",
+        "noNeedToDo": "No hace falta hacerlo",
+        "wontDo": "No lo haré",
+        "remove": "Quitar",
+        "giveUp": "Abandonar este trabajo"
       },
       "hint": {
         "doneNext": "Hecho esta vez; sigue igual: {rule}",
@@ -13239,6 +13334,7 @@
         "stopped": "Detuviste su trabajo · {time}",
         "skippedLast": "Omitiste la última vez · {time}",
         "dropped": "Lo quitaste · {time}",
+        "givenUp": "Dejaste este trabajo · {time}",
         "withdrawn": "Retiraste el mensaje a {peer} · {time}",
         "stoppedWaiting": "Dejaste de esperar la respuesta de {peer} · {time}",
         "agentDone": "{name} lo terminó · {time}",

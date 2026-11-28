@@ -250,12 +250,6 @@
         "appliedToast": "Wallpaper applied",
         "credit": "Images from wallhaven.cc · SFW only"
       }
-    },
-    "paAccent": {
-      "title": "Assistant accent colour",
-      "description": "The colour of the card edges and card buttons in an assistant's conversation; your own bubbles always take the assistant's colour.",
-      "default": "Default",
-      "bot": "Follow the assistant's colour"
     }
   },
   "SystemSettings": {
@@ -1152,7 +1146,7 @@
       "saveRawConfig": "Save file"
     },
     "antigravity": {
-      "configDescription": "Sessions fail with \"Authentication required\" until an auth method is set (saved to auth.type). Model and mode are picked in the composer.",
+      "configDescription": "Antigravity CLI manages the sign-in. codeg launches `agy acp` directly; this choice only decides how it authenticates: the Google methods reuse the CLI's cached login (use the browser-free sign-in below when the machine has no browser), and the API-key methods read the credential entered here. Model and session mode are not here: Antigravity reports them over ACP, so the composer's own selectors own them per session.",
       "methodLabel": "Authentication method",
       "methods": {
         "oauth-personal": "Sign in with Google",
@@ -1161,8 +1155,8 @@
         "agent-platform": "Gemini Enterprise Agent Platform"
       },
       "methodHints": {
-        "oauth-personal": "Your Google account, any plan incl. free. The first session opens a browser — no browser? Use browser-free sign-in below.",
-        "oauth-business": "Gemini Enterprise account; needs a GCP project and location. The first session opens a browser — no browser? Use browser-free sign-in below.",
+        "oauth-personal": "Your Google account, on any Antigravity plan including the free tier. The Antigravity CLI caches the sign-in and reuses it for agy acp. No browser on this machine? Use the browser-free sign-in below.",
+        "oauth-business": "Your Gemini Enterprise account. Needs a GCP project and location. The Antigravity CLI signs in when a session starts, in a browser on the machine codeg runs on — its browser-free sign-in covers personal Google accounts only.",
         "gemini-api-key": "A key for the Gemini Developer API, passed to the agent as GEMINI_API_KEY.",
         "agent-platform": "Use an API key, or a project and location with Application Default Credentials. Run gcloud auth application-default login if needed."
       },
@@ -1174,25 +1168,32 @@
       "missingGeminiApiKey": "Enter a Gemini API key, or pick a different authentication method — sessions will fail to start without it.",
       "missingAgentPlatformConfig": "Enter an API key, or both a project and a location — sessions will fail to start without one of the two.",
       "missingEnterpriseConfig": "Gemini Enterprise needs both a project and a location.",
-      "settingsFileHint": "Saved to auth.type in this file. Any other keys you put there are preserved.",
-      "syncSkipped": "Your choice was saved, but codeg could not write it to the ACP server's settings.json, so Antigravity will keep authenticating the way that file says. Set auth.type in it yourself, or move it aside and save again.",
+      "settingsFileHint": "Antigravity CLI's own settings file (read-only reference — codeg does not overwrite it).",
       "save": "Save",
+      "permissionsTitle": "Permissions",
+      "permissionModeLabel": "Permission mode",
+      "permissionModeDefault": "Follow session mode (default)",
+      "permissionModeTurbo": "Turbo (--dangerously-skip-permissions)",
+      "permissionModeDefaultHint": "Launches `agy acp` normally so the composer mode selector (default, accept-edits, auto, plan) and your permission rules govern tool approvals.",
+      "permissionModeTurboHint": "Launches `agy acp --dangerously-skip-permissions`: auto-approves all tool permission requests without prompting (explicit deny rules and system denylist still apply). Takes effect for new sessions.",
+      "sandboxLabel": "Terminal sandbox",
+      "sandboxHint": "Launches `agy acp --sandbox`: the agent's terminal commands run under the CLI's sandbox restrictions. Takes effect for new sessions.",
+      "telemetryTitle": "Disable telemetry",
+      "telemetryHint": "Launches `agy acp --disable-telemetry`, so the CLI sends no usage telemetry. Takes effect for new sessions.",
       "headless": {
         "title": "Sign in without a browser on this machine",
-        "description": "No browser where the agent runs (e.g. a server)? The first session would wait 5 min and fail. Instead, open the link on any device and paste back the address you land on.",
+        "description": "Antigravity CLI prints a Google sign-in link and waits for the authorization code. This works without a browser on this machine: open the link on any device, approve access, then paste the authorization code (or the full address you land on) back here.",
         "start": "Get sign-in link",
         "saveFirst": "Save first — the sign-in uses the stored settings, not what is typed above.",
         "step1": "1. Open this link and sign in to Google.",
-        "step2": "2. Your browser lands on {redirectUri} and fails to connect — expected. Paste that full address here.",
+        "step2": "2. Open the link above and approve access. You'll land on {redirectUri}; paste the authorization code (or that full address) here.",
         "copyLink": "Copy link",
         "openLink": "Open in a new tab",
         "complete": "Complete sign-in",
         "cancel": "Cancel",
         "signedIn": "Signed in. New sessions will use this account.",
-        "alreadySignedIn": "Antigravity already had a valid token, so it signed in without a link.",
         "failed": "Sign-in did not complete.",
-        "startFailed": "Could not start the sign-in",
-        "credentialHint": "Token cached here. Copy this file to another desktop-less machine to sign it in too."
+        "startFailed": "Could not start the sign-in"
       },
       "signOut": {
         "title": "Signed in as the wrong account?",
@@ -1200,21 +1201,7 @@
         "action": "Sign out",
         "done": "Signed out. Sign in again to pick a different account.",
         "failed": "Could not sign out"
-      },
-      "tempReclaimTitle": "Leftover temp space",
-      "tempReclaimHint": "Finds temp dirs this agent left behind under older codeg versions. Nothing is deleted until you confirm; in-use items are skipped.",
-      "tempReclaimScan": "Scan",
-      "tempReclaimDelete": "Delete leftovers",
-      "tempReclaimNone": "Nothing to reclaim.",
-      "tempReclaimFound": "{count} leftover item(s), {size} reclaimable.",
-      "tempReclaimSkipped": "{count} skipped (still in use or too recent).",
-      "tempReclaimed": "Reclaimed {size} from {count} item(s).",
-      "tempReclaimSelectAll": "Select all",
-      "tempReclaimAgeHours": "{hours}h",
-      "tempReclaimConfirmTitle": "Delete {count} item(s)?",
-      "tempReclaimConfirmBody": "This permanently deletes {size}. The system temp folder is shared with other applications, so check each path before confirming — anything still in use is skipped.",
-      "tempReclaimConfirmAction": "Delete",
-      "tempReclaimCancel": "Cancel"
+      }
     },
     "kiro": {
       "configManagement": "Configuration",
@@ -1762,7 +1749,6 @@
       "qoderSaved": "Qoder config saved",
       "saveQoderConfigFailed": "Failed to save Qoder config",
       "antigravitySaved": "Antigravity config saved",
-      "antigravitySyncSkipped": "Saved, but Antigravity's settings.json was left alone",
       "saveAntigravityConfigFailed": "Failed to save Antigravity config",
       "kiroSaved": "Kiro config saved",
       "saveKiroFailed": "Failed to save Kiro config",
@@ -3893,6 +3879,7 @@
         "errorUnsupportedLinkProtocol": "This link protocol is not supported."
       },
       "fileActions": {
+        "openWithDefaultApp": "Open with default app",
         "openInFinder": "Open in Finder",
         "openInExplorer": "Open in Explorer",
         "openInFileManager": "Open in file manager",
@@ -10372,7 +10359,34 @@
     },
     "work": {
       "taskNotStarted": "This task hasn't started yet. Its session shows here once it does.",
-      "taskGone": "Couldn't find this task — it may have been deleted."
+      "taskGone": "Couldn't find this task — it may have been deleted.",
+      "retry": "Retry",
+      "handTo": "Hand to {name}",
+      "viewSession": "View session",
+      "merge": "Merge",
+      "mergeTo": "Merge into {base}",
+      "createPr": "Create PR",
+      "pushBack": "Push back to the PR",
+      "mergePr": "Merge PR",
+      "mergeMr": "Merge MR",
+      "openPr": "Open PR",
+      "openMr": "Open MR",
+      "nudge": "Ask again",
+      "rehand": "Have {name} do it again",
+      "toast": {
+        "retried": "Started again",
+        "handed": "Handed to {name}",
+        "merging": "Merging…",
+        "merged": "Merged",
+        "mergeAsked": "Waiting for your approval on its card",
+        "mergeChanged": "It changed since you looked: read again",
+        "ranAgain": "This task ran again since you looked: read again",
+        "nudged": "Asked {name} again",
+        "nudgedAlready": "{name} was asked a moment ago",
+        "rehanded": "Handed to {name} again",
+        "done": "Done"
+      },
+      "reconnect": "Reconnect account"
     },
     "composer": {
       "placeholder": "Message {name}…",
@@ -10636,7 +10650,7 @@
           "standard": "Standard",
           "ask_more": "Ask me more",
           "custom": "Custom",
-          "standardHint": "Everything runs on its own and tells you on a card.",
+          "standardHint": "Most things run on their own and tell you on a card; merging pull requests, closing issues, comments on a forge, and fixing a watched PR's failed checks or conflicts ask you first.",
           "ask_moreHint": "Follow-ups and retries, retrying work a restart interrupted, messages to other assistants, changes you ask for in chat and code-changing dispatches go to you as a card first; the sessions' questions and plan approvals come to you.",
           "customHint": "Some of the items below are set your own way.",
           "confirmTitle": "Switch to “{level}”?",
@@ -11156,6 +11170,14 @@
           "auto": "Take effect at once, undo on the card",
           "draft": "Show me first (a draft card, applied when I say)",
           "off": "Don't"
+        },
+        "pr_checks_wait_hours": {
+          "title": "Hours to wait for PR checks",
+          "hint": "A watched PR whose checks have run this long with no result moves to Needs you. 1 to 48."
+        },
+        "pr_review_wait_days": {
+          "title": "Days to wait for a PR review",
+          "hint": "A watched PR waiting this long for its review moves to Needs you. 1 to 14."
         }
       },
       "workdir": {
@@ -11977,8 +11999,8 @@
       },
       "workspace": {
         "empty": "Nothing running right now",
-        "open": "Open",
-        "emptyHint": "While work it handed out runs, its session shows here live.",
+        "viewSession": "View session",
+        "emptyHint": "While work it handed out runs, it shows here.",
         "whose": "{name}'s workspace"
       },
       "notifyOn": "on",
@@ -12149,12 +12171,17 @@
     },
     "feed": {
       "groups": {
-        "needs": "Waiting for you",
+        "needs": "Needs you",
+        "running": "In progress",
+        "watch": "Watching",
         "watching": "In progress",
         "next": "Routines & reminders",
         "done": "Done today"
       },
       "empty": "Nothing for you to do, and nothing running.",
+      "suggestions": "{count, plural, one {# more suggestion} other {# more suggestions}}",
+      "ignore": "Ignore",
+      "ignoreHint": "Hide it; it shows again if anything changes",
       "failed": "The activity could not be read just now.",
       "handed": "Handed to {name}",
       "checking": "Being checked · round {round}",
@@ -12166,7 +12193,57 @@
       "viewReminder": "View the reminder",
       "viewCheck": "View the acceptance session",
       "openTask": "Open the task",
-      "routineDeleted": "This routine has been deleted."
+      "routineDeleted": "This routine has been deleted.",
+      "why": {
+        "no_reply": "No reply from {name}",
+        "unfinished": "Not finished",
+        "checks": "Checks failed · nobody fixing",
+        "conflict": "Conflict · nobody fixing",
+        "fix_pending": "codeg is about to fix it",
+        "fixing": "Being fixed",
+        "platform_blocked": "Platform won't merge yet",
+        "merge_queued": "Queued to merge",
+        "merging": "Merging",
+        "check_preparing": "Preparing the check",
+        "check_settling": "Settling the check",
+        "queued": "Queued for {name}",
+        "in_turn": "{name} is on it",
+        "looking": "Waiting for {name} to pick it up",
+        "no_trigger": "No next time set",
+        "failed": "Failed",
+        "readFailed": {
+          "auth": "Can't read it · sign in again",
+          "no_account": "Can't read it · no account for this forge",
+          "config": "This forge can't be read",
+          "network": "Can't read it · no connection",
+          "api": "Can't read it · the forge answered with an error",
+          "timeout": "Can't read it · the forge didn't answer",
+          "other": "Can't read it"
+        },
+        "checks_slow": "Checks running {hours} h with no result",
+        "review_pending": "Waiting for review",
+        "review_slow": "Waiting {days} d for review"
+      },
+      "stop": {
+        "task": "Stop",
+        "turn": "Stop {name}'s turn"
+      },
+      "ask": {
+        "approvePlan": "Approve plan",
+        "queued": "{count, plural, one {# more waiting} other {# more waiting}}",
+        "settled": "Answered already — read again",
+        "planAll": "See the whole plan",
+        "planLess": "Show less",
+        "planRevise": "Send back with a note…",
+        "planReviseSend": "Send back",
+        "planReviseCancel": "Cancel",
+        "planReviseHint": "What should change?",
+        "answered": "Answer sent"
+      },
+      "back": {
+        "line": "From the activity · {count, plural, one {# more waits on you} other {# more wait on you}}",
+        "go": "Back to the activity"
+      }
     },
     "today": {
       "title": "Today",
@@ -12207,7 +12284,8 @@
         "memoryUndone": "Remembered, then taken back",
         "plan_stuck": "Plan stuck",
         "routine_paused": "Routine paused",
-        "used_up": "Still not right"
+        "used_up": "Still not right",
+        "pr_gone": "Stopped watching a PR it can't find"
       },
       "reason": {
         "failed": "Failed",
@@ -12898,7 +12976,14 @@
         }
       },
       "undoDetail": "You undid {undone} of the {made} changes made at your word in the last two weeks.",
-      "idleBotDetail": "Nobody has woken it for two weeks."
+      "idleBotDetail": "Nobody has woken it for two weeks.",
+      "group": {
+        "count": "{count, plural, one {# card} other {# cards}}",
+        "expand": "Show all",
+        "collapse": "Show less",
+        "more": "{count} more",
+        "mutedEntry": "Dismissed, and this kind turned off."
+      }
     },
     "brief": {
       "title": "Morning brief",
@@ -13180,7 +13265,17 @@
         "answer": "Answer",
         "drop": "Not needed",
         "stop": "Stop reminding",
-        "undo": "Undo"
+        "undo": "Undo",
+        "withdrawMessage": "Withdraw message",
+        "stopWaiting": "Stop waiting for a reply",
+        "noReplyNeeded": "No reply needed",
+        "noAnswerNeeded": "No answer needed",
+        "stopFollowing": "Stop following up",
+        "cancelReminder": "Cancel reminder",
+        "noNeedToDo": "Don't do it",
+        "wontDo": "Won't do",
+        "remove": "Remove",
+        "giveUp": "Give up on this work"
       },
       "hint": {
         "doneNext": "Done for this time; it goes on: {rule}",
@@ -13239,6 +13334,7 @@
         "stopped": "You stopped its work · {time}",
         "skippedLast": "You skipped the last time · {time}",
         "dropped": "You removed it · {time}",
+        "givenUp": "You gave up on this work · {time}",
         "withdrawn": "You took back the message to {peer} · {time}",
         "stoppedWaiting": "You stopped waiting for {peer}'s reply · {time}",
         "agentDone": "{name} finished it · {time}",

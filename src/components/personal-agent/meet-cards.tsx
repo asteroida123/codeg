@@ -627,11 +627,14 @@ export function StarterCard({ item }: { item: NoticeItem }) {
 
 /** The switches of what the assistants do unasked, each a preference and
  *  the values it is turned on and off by. Anything but off is on: a wrap-up
- *  that asks first is still a wrap-up. */
+ *  that asks first is still a wrap-up. `alsoOff` are other values that do
+ *  nothing unasked: a red pull request put to the owner first is not fixed
+ *  on its own. */
 export const PROMISES: ReadonlyArray<{
   key: PersonalAgentPrefKey
   on: string
   off: string
+  alsoOff?: readonly string[]
 }> = [
   { key: "proactive", on: "on", off: "off" },
   { key: "brief", on: "on", off: "off" },
@@ -639,7 +642,7 @@ export const PROMISES: ReadonlyArray<{
   { key: "exec_questions", on: "assistant", off: "owner" },
   { key: "exec_plans", on: "assistant", off: "owner" },
   { key: "followups", on: "auto", off: "ask" },
-  { key: "ci_failure", on: "fix", off: "tell" },
+  { key: "ci_failure", on: "fix", off: "tell", alsoOff: ["ask"] },
   { key: "auto_accept", on: "on", off: "off" },
   { key: "interrupt_retry", on: "auto", off: "ask" },
   { key: "presence", on: "on", off: "off" },
@@ -648,6 +651,14 @@ export const PROMISES: ReadonlyArray<{
 /** A settings group as a band of the card: no frame or wash of its own,
  *  its rows the card's room from its edge, a hairline between them. */
 const FLAT_GROUP = "rounded-none border-0 bg-transparent"
+
+/** Whether a promise's switch reads as on for `value`. */
+export function promiseOn(
+  promise: (typeof PROMISES)[number],
+  value: string
+): boolean {
+  return value !== promise.off && !promise.alsoOff?.includes(value)
+}
 
 export function PromisesCard({ item }: { item: NoticeItem }) {
   const t = useTranslations("PersonalAgent.meet.promises")
@@ -675,8 +686,8 @@ export function PromisesCard({ item }: { item: NoticeItem }) {
 
   const level = account ? disturbOf(account) : "standard"
   const promisesOn = account
-    ? PROMISES.filter(
-        ({ key, off }) => (account.prefs[key] as unknown as string) !== off
+    ? PROMISES.filter((p) =>
+        promiseOn(p, account.prefs[p.key] as unknown as string)
       ).length
     : 0
   const done = state === "done"
@@ -687,7 +698,7 @@ export function PromisesCard({ item }: { item: NoticeItem }) {
   const groups = account ? (
     <>
       <SettingCard
-        className={cn(FLAT_GROUP, "[&>*]:px-3.5")}
+        className={cn(FLAT_GROUP, "[&>*]:px-3")}
         data-pa-surface
         data-pa-meet-level
       >
@@ -710,7 +721,7 @@ export function PromisesCard({ item }: { item: NoticeItem }) {
           type="button"
           onClick={() => setListOpen((o) => !o)}
           aria-expanded={listOpen}
-          className="flex w-full items-center gap-2 px-3.5 py-3 text-start text-sm leading-5 transition-colors outline-none hover:bg-muted/40 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+          className="flex w-full items-center gap-2 px-3 py-3 text-start text-sm leading-5 transition-colors outline-none hover:bg-muted/40 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
           data-pa-meet-promises-toggle
         >
           <ListChecks
@@ -732,13 +743,14 @@ export function PromisesCard({ item }: { item: NoticeItem }) {
           />
         </button>
         {listOpen
-          ? PROMISES.map(({ key, on, off }) => {
+          ? PROMISES.map((promise) => {
+              const { key, on, off } = promise
               const id = `pa-meet-promise-${row.id}-${key}`
               const value = account.prefs[key] as unknown as string
               return (
                 <div key={key} data-pa-promise={key}>
                   <SettingRow
-                    className="px-3.5"
+                    className="px-3"
                     icon={PREF_ICONS[key]}
                     title={t(`items.${key}.title` as "items.proactive.title")}
                     description={t(
@@ -748,7 +760,7 @@ export function PromisesCard({ item }: { item: NoticeItem }) {
                     control={
                       <Switch
                         id={id}
-                        checked={value !== off}
+                        checked={promiseOn(promise, value)}
                         disabled={disabled || patching != null}
                         onCheckedChange={(checked) =>
                           void patch([

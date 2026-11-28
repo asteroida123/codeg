@@ -28,8 +28,6 @@ import type { FollowUpIntent } from "./task-follow-up"
 import type {
   CardClick,
   MessageCheck,
-  LeakedTempReclaim,
-  LeakedTempScan,
   AgentType,
   CliAccessStatus,
   CliToolStatus,
@@ -644,21 +642,6 @@ export async function acpClearBinaryCache(agentType: AgentType): Promise<void> {
   return getTransport().call("acp_clear_binary_cache", { agentType })
 }
 
-/** Read-only scan of the system temp dir for pre-isolation launch leftovers. */
-export async function acpScanLeakedTemp(): Promise<LeakedTempScan> {
-  return getTransport().call("acp_scan_leaked_temp", {})
-}
-
-/**
- * Delete leaked temp artifacts. The backend re-validates every path
- * immediately before deleting — this list is never trusted as-is.
- */
-export async function acpReclaimLeakedTemp(
-  paths: string[]
-): Promise<LeakedTempReclaim> {
-  return getTransport().call("acp_reclaim_leaked_temp", { paths })
-}
-
 export async function acpDownloadAgentBinary(
   agentType: AgentType,
   taskId: string,
@@ -1129,64 +1112,25 @@ export type PiProjectTrustState = {
 }
 
 /**
- * What one settings.json sync did. Mirrors `AntigravitySyncReport` in
- * src-tauri/src/acp/connection.rs.
- *
- * `skipped` is the one that matters: the file was left as it was, so the
- * agent's auth is NOT what the panel now shows, and `reason` says why in the
- * same words the log uses.
- */
-export type AntigravitySyncReport = {
-  path: string
-  status: "written" | "already_current" | "skipped"
-  reason: string | null
-}
-
-/**
- * Write the saved Antigravity auth choice into the ACP server's settings.json
- * and report what happened.
- *
- * Call it right after saving the env row. The row is not what authenticates
- * Antigravity — `<GEMINI_HOME>/antigravity-acp/settings.json` is — and the file
- * can legitimately refuse to be rewritten (Hjson with comments, an `auth` key
- * that is not an object). Reporting "saved" without asking would be claiming
- * something that never happened: the launch would go on using the OLD
- * auth.type with the NEW method's credentials scrubbed out from under it.
- */
-export async function acpSyncAntigravitySettings(): Promise<AntigravitySyncReport> {
-  return getTransport().call("acp_sync_antigravity_settings", {})
-}
-
-/**
  * Step one of a browser-free Antigravity sign-in. Mirrors
- * `AntigravityLoginStart` in src-tauri/src/acp/antigravity_login.rs, as a union
- * on `alreadySignedIn` — the agent may hold a still-usable token, in which case
- * it authenticates on the spot and there is no link and nothing to complete.
+ * `AntigravityLoginStart` in src-tauri/src/acp/antigravity_login.rs.
+ * `agy acp --login` always asks for consent, so there is always a link.
  */
-export type AntigravityLoginStart =
-  | {
-      alreadySignedIn: true
-      handle: null
-      authUrl: null
-      redirectUri: null
-      methodId: string
-      expiresInSecs: number
-    }
-  | {
-      alreadySignedIn: false
-      /** Opaque id for this attempt; pass it back to finish/cancel. */
-      handle: string
-      /** The Google consent URL — open it in any browser, on any machine. */
-      authUrl: string
-      /**
-       * Where the browser will be redirected and fail to connect. Shown so the
-       * dead page reads as an expected step rather than a broken login.
-       */
-      redirectUri: string
-      methodId: string
-      /** Antigravity stops waiting after this many seconds. */
-      expiresInSecs: number
-    }
+export type AntigravityLoginStart = {
+  /** Opaque id for this attempt; pass it back to finish/cancel. */
+  handle: string
+  /** The Google consent URL — open it in any browser, on any machine. */
+  authUrl: string
+  /**
+   * Where the browser lands after consent. The CLI asks the user to paste
+   * that address (or the code) back, so the panel shows it as the expected
+   * next step.
+   */
+  redirectUri: string
+  methodId: string
+  /** codeg ends the waiting sign-in after this many seconds. */
+  expiresInSecs: number
+}
 
 /** Step two's answer. Mirrors `AntigravityLoginOutcome` in the same file. */
 export type AntigravityLoginOutcome = {
@@ -1195,32 +1139,26 @@ export type AntigravityLoginOutcome = {
   message: string | null
   /**
    * Whether the same link still works. True only when codeg rejected the paste
-   * itself — the agent never saw it, so the consent already given is still good
-   * and only the paste needs fixing. False once the redirect went out: the
-   * agent's listener answers exactly one request.
+   * itself — the CLI never saw it, so the consent already given is still good
+   * and only the paste needs fixing. False once the code went out:
+   * `agy acp --login` consumes it and exits.
    */
   retryable: boolean
-  /** Where the credential landed, when codeg can name the file. */
-  credentialPath: string | null
 }
 
 /**
  * Begin signing in to Antigravity on a machine with no browser.
  *
- * Antigravity authenticates through a loopback browser flow the AGENT runs, so
- * on a headless server (codeg deployed on Linux, no desktop) the first session
- * opens a browser that does not exist and then blocks for five minutes. This
- * runs the same flow out of band and hands back the link, so the consent can
- * happen in whatever browser the user does have.
+ * `agy acp --login` prints a Google consent URL and waits on stdin for the
+ * authorization code. The backend spawns that child, scrapes the link, and
+ * hands it back so the consent can happen in whatever browser the user has.
  */
 export async function acpAntigravityLoginStart(
   methodId: string
 ): Promise<AntigravityLoginStart> {
-  // The backend spawns the agent and waits for it: up to 60s for `initialize`
-  // (CPython inside a PAR, unpacked on first run) plus 90s for the printed
-  // link. The transport defaults — 60s on web, 30s through the remote-desktop
-  // proxy — would abort with "Request timed out" while that child is still
-  // starting, so the ceiling has to clear the backend's own with a margin.
+  // The backend spawns `agy acp --login` and waits up to 20s for the printed
+  // link. The remote-desktop proxy's 30s default leaves little margin on a
+  // loaded machine, so the ceiling clears the backend's own generously.
   return getTransport().call(
     "acp_antigravity_login_start",
     { methodId },
@@ -1229,21 +1167,17 @@ export async function acpAntigravityLoginStart(
 }
 
 /**
- * Finish that sign-in with the address the browser was redirected to.
- *
- * That address points at `127.0.0.1` on the *server*, which the user's browser
- * cannot reach — codeg can, so it performs the redirect on their behalf. Only
- * the OAuth parameters are taken from the paste; the target itself comes from
- * the link codeg issued.
+ * Finish that sign-in with the authorization code (or the full address the
+ * browser landed on). The backend writes it to the `agy acp --login` child's
+ * stdin and waits for the CLI to exchange it and store the credential.
  */
 export async function acpAntigravityLoginFinish(
   handle: string,
   redirect: string
 ): Promise<AntigravityLoginOutcome> {
-  // 20s to deliver the redirect plus 180s for the agent's token exchange and
-  // onboarding round-trips. Timing out under that would be the worst case
-  // available: the attempt is already spent, so the sign-in cannot be retried,
-  // and its result would be lost with it.
+  // Up to 180s for the CLI's token exchange. Timing out under that would be the
+  // worst case available: the attempt is already spent, so the sign-in cannot
+  // be retried, and its result would be lost with it.
   return getTransport().call(
     "acp_antigravity_login_finish",
     { handle, redirect },
@@ -1257,24 +1191,14 @@ export async function acpAntigravityLoginCancel(handle: string): Promise<void> {
 }
 
 /**
- * Clear the credential Antigravity is holding, so the next sign-in can reach a
- * different Google account.
- *
- * Without it a signed-in Antigravity cannot switch accounts at all: the agent
- * refreshes its cached token silently, so `acpAntigravityLoginStart` answers
- * `alreadySignedIn` and never produces a consent link.
- *
- * Returns the settings.json sync report rather than a success flag. Signing out
- * removes `auth.type` from that file, so the backend writes the saved method
- * straight back — and a `skipped` report is the warning that it could not, and
- * that every later session will fail with "Authentication required" until the
- * user edits the file themselves.
+ * Clear the credential Antigravity is holding (through the CLI's ACP
+ * `logout`), so the next sign-in can reach a different Google account.
+ * Running Antigravity sessions end first, since they would write it back.
  */
-export async function acpAntigravitySignOut(): Promise<AntigravitySyncReport> {
-  // The backend spawns the agent and puts two requests to it: up to 60s for
-  // `initialize` (CPython inside a PAR, unpacked on first run) plus 60s for the
-  // sign-out itself. The transport defaults — 60s on web, 30s through the
-  // remote-desktop proxy — would abort while that child is still starting.
+export async function acpAntigravitySignOut(): Promise<void> {
+  // The backend spawns `agy acp` and puts two requests to it, 30s each, after
+  // ending any sign-in still exchanging a code. The transport defaults — 60s
+  // on web, 30s through the remote-desktop proxy — could abort mid-way.
   return getTransport().call(
     "acp_antigravity_sign_out",
     {},
@@ -2645,6 +2569,93 @@ export async function personalAgentCancel(bot?: number | null): Promise<void> {
   return getTransport().call("personal_agent_cancel", { botId: bot ?? null })
 }
 
+/** [Retry] on a failed row of the activity: the work again, or — no
+ *  assistant handed it out — the board's failed task; as the row read it
+ *  (`expectUpdatedAt`), refused when it changed since. */
+export async function personalAgentWorkRetry(
+  bot: number | null,
+  target: { dispatchId: number } | { taskId: number },
+  expectUpdatedAt: string,
+  /** Work that is a board task's: the task's version as the row read it. */
+  expectTaskUpdatedAt?: string | null
+): Promise<{ dispatch_id?: number; task_id?: number; retry_of?: number }> {
+  return getTransport().call("personal_agent_work_retry", {
+    botId: bot ?? null,
+    dispatchId: "dispatchId" in target ? target.dispatchId : null,
+    taskId: "taskId" in target ? target.taskId : null,
+    expectUpdatedAt,
+    expectTaskUpdatedAt: expectTaskUpdatedAt ?? null,
+  })
+}
+
+/** [Hand to {name}] on a failed row: the work's assistant asked to look
+ *  into it, as the row read it. */
+export async function personalAgentDispatchHand(
+  bot: number | null,
+  dispatchId: number,
+  expectUpdatedAt: string
+): Promise<void> {
+  return getTransport().call("personal_agent_dispatch_hand", {
+    botId: bot ?? null,
+    dispatchId,
+    expectUpdatedAt,
+  })
+}
+
+/** What merging a watched pull request from the activity came to. */
+export interface PrMergeOutcome {
+  outcome:
+    | "merging"
+    | "merged"
+    | "failed"
+    | "asked"
+    | "refused"
+    | "unread"
+    | "changed"
+  notice_id?: number
+  why?: string
+}
+
+/** [Merge PR] on the activity: the watched pull request merged at the head
+ *  the row read. */
+export async function personalAgentPrMerge(
+  bot: number | null,
+  watchId: number,
+  headSha: string
+): Promise<PrMergeOutcome> {
+  return getTransport().call("personal_agent_pr_merge", {
+    botId: bot ?? null,
+    watchId,
+    headSha,
+  })
+}
+
+/** [Ask again] on the activity: the message matter `itemId` waits on, its
+ *  receiver's turn over without an answer, asked again. Whether this press
+ *  asked (`false`: asked a moment ago). */
+export async function personalAgentMessageNudge(
+  bot: number | null,
+  itemId: number
+): Promise<boolean> {
+  return getTransport().call("personal_agent_message_nudge", {
+    botId: bot ?? null,
+    itemId,
+  })
+}
+
+/** Stop the assistant's turn of batch `batchId` only — the one a row of the
+ *  activity read: one over already, or another begun since, is left.
+ *  Whether it was stopped. */
+export async function personalAgentCancelTurn(
+  bot: number | null,
+  batchId: number
+): Promise<boolean> {
+  return getTransport().call("personal_agent_cancel_turn", {
+    botId: bot ?? null,
+    batchId,
+  })
+}
+
 /** "Stop everything": all the assistant has going — its turn, the work it
  *  dispatched, the messages nobody started on. */
 export async function personalAgentStopAll(bot?: number | null): Promise<void> {
@@ -2807,6 +2818,14 @@ export async function personalAgentActivity(
   bot?: number | null
 ): Promise<PersonalAgentActivity> {
   return getTransport().call("personal_agent_activity", { botId: bot ?? null })
+}
+
+/** [Ignore] on a row waiting on the owner: `mark` (`ActivityRow.dismiss`),
+ *  the row as it stood, out of every list until it moves on. */
+export async function personalAgentActivityDismiss(
+  mark: string
+): Promise<void> {
+  return getTransport().call("personal_agent_activity_dismiss", { mark })
 }
 
 /** An assistant's routines, with their latest runs (6.9). */
@@ -3145,6 +3164,9 @@ export type NoticeAction =
   | "snooze:1h"
   | "snooze:tomorrow"
   | "hand_over"
+  // [Hand again] on the activity (6.5): a reminder handed over before,
+  // whose assistant's turn on it is over.
+  | "hand_again"
   | `accept:${string}`
   | "skip"
   | "hand"
@@ -5211,12 +5233,16 @@ export async function workTaskReturn(
 export async function workTaskCancel(
   id: number,
   reason?: string | null,
-  deleteWorktree = false
+  deleteWorktree = false,
+  /** The run the asking dialog showed: one run again since is left running.
+   *  Omitted: whatever runs now. */
+  expectRunSeq?: number
 ): Promise<void> {
   return getTransport().call("work_task_cancel", {
     id,
     reason: reason ?? null,
     deleteWorktree,
+    ...(expectRunSeq === undefined ? {} : { expectRunSeq }),
   })
 }
 
@@ -5229,13 +5255,17 @@ export async function workTaskMerge(
   id: number,
   message: string | null,
   deleteWorktree: boolean,
-  instructions: string | null = null
+  instructions: string | null = null,
+  /** The run the asking dialog showed: a task run again since is refused.
+   *  Omitted: the run in review now. */
+  expectRunSeq?: number
 ): Promise<boolean> {
   return getTransport().call("work_task_merge", {
     id,
     message,
     deleteWorktree,
     instructions,
+    ...(expectRunSeq === undefined ? {} : { expectRunSeq }),
   })
 }
 
@@ -5270,7 +5300,10 @@ export async function workTaskDeliverPr(
   /** Commit what the worktree holds uncommitted, with this message, before
    *  the push (see `workTaskUncommittedFiles`). Omitted, a dirty worktree is
    *  refused. */
-  commitMessage?: string
+  commitMessage?: string,
+  /** The run the asking dialog showed: a task run again since is refused.
+   *  Omitted: the run in review now. */
+  expectRunSeq?: number
 ): Promise<string> {
   return getTransport().call("work_task_deliver_pr", {
     id,
@@ -5280,6 +5313,7 @@ export async function workTaskDeliverPr(
     markDone,
     ...(closes === undefined ? {} : { closes }),
     ...(commitMessage === undefined ? {} : { commitMessage }),
+    ...(expectRunSeq === undefined ? {} : { expectRunSeq }),
   })
 }
 

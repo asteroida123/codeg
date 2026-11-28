@@ -250,12 +250,6 @@
         "appliedToast": "壁紙を適用しました",
         "credit": "画像提供 wallhaven.cc · SFW のみ"
       }
-    },
-    "paAccent": {
-      "title": "アシスタントのアクセントカラー",
-      "description": "アシスタントとの会話で、カードの縁取りとカードのボタンに使う色です。あなたの吹き出しは常にアシスタントの色になります。",
-      "default": "デフォルト",
-      "bot": "アシスタントの色に合わせる"
     }
   },
   "SystemSettings": {
@@ -1152,7 +1146,7 @@
       "saveRawConfig": "ファイルを保存"
     },
     "antigravity": {
-      "configDescription": "認証方式（auth.type に保存）を設定しないとセッションは「Authentication required」で失敗します。モデルとモードは入力欄で選びます。",
+      "configDescription": "サインインは Antigravity CLI 自身が管理します。codeg は `agy acp` を直接起動し、この設定は認証方式の選択のみを行います。Google アカウント方式は CLI にキャッシュされたログインを再利用し（このマシンにブラウザがない場合は下のブラウザなしサインインを使用してください）、API キー方式はここに入力した認証情報を読み込みます。モデルとセッションモードは ACP 経由で通知されるため、入力欄のセレクターでセッションごとに管理されます。",
       "methodLabel": "Authentication method",
       "methods": {
         "oauth-personal": "Sign in with Google",
@@ -1161,8 +1155,8 @@
         "agent-platform": "Gemini Enterprise Agent Platform"
       },
       "methodHints": {
-        "oauth-personal": "Google アカウント（無料版を含む全プラン）。最初のセッションでブラウザが開きます。ブラウザがない場合は下のブラウザ不要のサインインを。",
-        "oauth-business": "Gemini Enterprise アカウント。GCP のプロジェクトとロケーションが必要です。最初のセッションでブラウザが開きます。ブラウザがない場合は下のブラウザ不要のサインインを。",
+        "oauth-personal": "無料プランを含むすべての Antigravity プランで利用できる Google アカウントです。Antigravity CLI がサインインをキャッシュし、agy acp で再利用します。このマシンにブラウザがない場合は下のブラウザなしサインインを使用してください。",
+        "oauth-business": "Gemini Enterprise アカウントです。GCP プロジェクトとロケーションが必要です。Antigravity CLI はセッション開始時に、codeg が動作するマシンのブラウザでサインインします。ブラウザなしサインインは個人の Google アカウントのみ対応です。",
         "gemini-api-key": "A key for the Gemini Developer API, passed to the agent as GEMINI_API_KEY.",
         "agent-platform": "API キー、またはプロジェクトとロケーションをアプリケーションのデフォルト認証情報と併用します。必要なら gcloud auth application-default login を実行してください。"
       },
@@ -1174,25 +1168,32 @@
       "missingGeminiApiKey": "Enter a Gemini API key, or pick a different authentication method — sessions will fail to start without it.",
       "missingAgentPlatformConfig": "Enter an API key, or both a project and a location — sessions will fail to start without one of the two.",
       "missingEnterpriseConfig": "Gemini Enterprise needs both a project and a location.",
-      "settingsFileHint": "Saved to auth.type in this file. Any other keys you put there are preserved.",
-      "syncSkipped": "Your choice was saved, but codeg could not write it to the ACP server's settings.json, so Antigravity will keep authenticating the way that file says. Set auth.type in it yourself, or move it aside and save again.",
+      "settingsFileHint": "Antigravity CLI 自身の設定ファイル（参照用・codeg はこのファイルを上書きしません）。",
       "save": "Save",
+      "permissionsTitle": "権限",
+      "permissionModeLabel": "権限モード",
+      "permissionModeDefault": "セッションモードに従う（デフォルト）",
+      "permissionModeTurbo": "Turbo（--dangerously-skip-permissions）",
+      "permissionModeDefaultHint": "通常の `agy acp` で起動し、入力欄のセッションモード（default / accept-edits / auto / plan）と権限ルールに従ってツール承認を行います。",
+      "permissionModeTurboHint": "`agy acp --dangerously-skip-permissions` で起動します。確認なしで全ツールの権限リクエストを自動承認します（明示的な deny ルールとシステム拒否リストは引き続き有効）。新しいセッションから反映されます。",
+      "sandboxLabel": "ターミナルサンドボックス",
+      "sandboxHint": "`agy acp --sandbox` で起動します。エージェントが実行するターミナルコマンドに CLI のサンドボックス制限がかかります。新しいセッションから有効です。",
+      "telemetryTitle": "テレメトリを無効化",
+      "telemetryHint": "`agy acp --disable-telemetry` で起動し、CLI は利用状況のテレメトリを送信しません。新しいセッションから有効です。",
       "headless": {
         "title": "ブラウザのないマシンでサインイン",
-        "description": "エージェントが動くマシンにブラウザがない（サーバーなど）場合、最初のセッションは 5 分待って失敗します。代わりに任意の端末でリンクを開き、移動先のアドレスを貼り戻してください。",
+        "description": "Antigravity CLI は Google サインイン用リンクを表示し、認可コードの入力を待ちます。このマシンにブラウザがなくても利用できます。任意の端末でリンクを開いてアクセスを承認し、認可コード（または移動先の完全な URL）をここに貼り付けてください。",
         "start": "サインインリンクを取得",
         "saveFirst": "先に保存してください。サインインは保存済みの設定を使用し、上の入力内容は参照しません。",
         "step1": "1. このリンクを開いて Google にサインインします。",
-        "step2": "2. ブラウザは {redirectUri} に移動して接続できません（想定どおり）。そのアドレス全体をここに貼り付けます。",
+        "step2": "2. 上のリンクを開いてアクセスを承認してください。{redirectUri} に移動しますので、認可コード（またはその完全な URL）をここに貼り付けてください。",
         "copyLink": "リンクをコピー",
         "openLink": "新しいタブで開く",
         "complete": "サインインを完了",
         "cancel": "キャンセル",
         "signedIn": "サインインしました。新しいセッションはこのアカウントを使用します。",
-        "alreadySignedIn": "Antigravity は有効なトークンを既に保持していたため、リンクなしでサインインしました。",
         "failed": "サインインが完了しませんでした。",
-        "startFailed": "サインインを開始できませんでした",
-        "credentialHint": "トークンはここにキャッシュ。このファイルを別のデスクトップなしマシンにコピーすればサインイン済みに。"
+        "startFailed": "サインインを開始できませんでした"
       },
       "signOut": {
         "title": "間違ったアカウントでサインインしましたか？",
@@ -1200,21 +1201,7 @@
         "action": "サインアウト",
         "done": "サインアウトしました。サインインし直すと別のアカウントを選べます。",
         "failed": "サインアウトできませんでした"
-      },
-      "tempReclaimTitle": "残存した一時領域",
-      "tempReclaimHint": "以前の codeg でこのエージェントが残した一時ディレクトリを探します。確認するまで何も削除されず、使用中の項目はスキップされます。",
-      "tempReclaimScan": "スキャン",
-      "tempReclaimDelete": "残存物を削除",
-      "tempReclaimNone": "回収できるものはありません。",
-      "tempReclaimFound": "残存物 {count} 件、{size} を回収できます。",
-      "tempReclaimSkipped": "{count} 件をスキップしました（使用中または新しすぎます）。",
-      "tempReclaimed": "{count} 件から {size} を回収しました。",
-      "tempReclaimSelectAll": "すべて選択",
-      "tempReclaimAgeHours": "{hours} 時間",
-      "tempReclaimConfirmTitle": "選択した {count} 件を削除しますか？",
-      "tempReclaimConfirmBody": "{size} を完全に削除します。システムの一時フォルダーは他のアプリと共有されるため、確認する前に各パスをご確認ください。使用中のものはスキップされます。",
-      "tempReclaimConfirmAction": "削除",
-      "tempReclaimCancel": "キャンセル"
+      }
     },
     "kiro": {
       "configManagement": "設定管理",
@@ -1762,7 +1749,6 @@
       "qoderSaved": "Qoder の設定を保存しました",
       "saveQoderConfigFailed": "Qoder の設定の保存に失敗しました",
       "antigravitySaved": "Antigravity config saved",
-      "antigravitySyncSkipped": "Saved, but Antigravity's settings.json was left alone",
       "saveAntigravityConfigFailed": "Failed to save Antigravity config",
       "kiroSaved": "Kiro 設定を保存しました",
       "saveKiroFailed": "Kiro 設定の保存に失敗しました",
@@ -3893,6 +3879,7 @@
         "errorUnsupportedLinkProtocol": "このリンクプロトコルはサポートされていません。"
       },
       "fileActions": {
+        "openWithDefaultApp": "既定のアプリで開く",
         "openInFinder": "Finderで開く",
         "openInExplorer": "エクスプローラーで開く",
         "openInFileManager": "ファイルマネージャーで開く",
@@ -10372,7 +10359,34 @@
     },
     "work": {
       "taskNotStarted": "このタスクはまだ始まっていません。始まるとここに会話が表示されます。",
-      "taskGone": "このタスクが見つかりません。削除された可能性があります。"
+      "taskGone": "このタスクが見つかりません。削除された可能性があります。",
+      "retry": "再試行",
+      "handTo": "{name}に任せる",
+      "viewSession": "セッションを見る",
+      "merge": "マージ",
+      "mergeTo": "{base} にマージ",
+      "createPr": "PR を作成",
+      "pushBack": "PR に戻す",
+      "mergePr": "PR をマージ",
+      "mergeMr": "MR をマージ",
+      "openPr": "PR を開く",
+      "openMr": "MR を開く",
+      "nudge": "もう一度聞く",
+      "rehand": "{name}にもう一度任せる",
+      "toast": {
+        "retried": "やり直しました",
+        "handed": "{name}に任せました",
+        "merging": "マージ中…",
+        "merged": "マージしました",
+        "mergeAsked": "カードであなたの承認待ちです",
+        "mergeChanged": "変更があったので読み直しました",
+        "ranAgain": "表示後にこのタスクが再実行されました。もう一度確認してください",
+        "nudged": "{name}にもう一度聞きました",
+        "nudgedAlready": "{name}には少し前に聞いたところです",
+        "rehanded": "{name}にもう一度任せました",
+        "done": "完了しました"
+      },
+      "reconnect": "アカウントを再接続"
     },
     "composer": {
       "placeholder": "{name}にメッセージ…",
@@ -10637,7 +10651,7 @@
           "standard": "標準",
           "ask_more": "もっと確認して",
           "custom": "カスタム",
-          "standardHint": "すべて自動で行い、カードで知らせます。",
+          "standardHint": "ほとんど自動で行い、カードで知らせます。PR のマージ、Issue のクローズ、フォージへのコメント、見守り中の PR のチェック失敗やコンフリクトの修正は、まずあなたに確認します。",
           "ask_moreHint": "フォローアップと再試行、再起動で中断した作業の再試行、他のアシスタントへのメッセージ、会話で頼んだ変更、コードを変更する依頼は、まずカードであなたに確認します。セッションからの質問とプラン承認はあなたに回ります。",
           "customHint": "下の項目のいくつかを個別に設定しています。",
           "confirmTitle": "「{level}」に切り替えますか？",
@@ -11157,6 +11171,14 @@
           "auto": "すぐ反映（カードから元に戻せます）",
           "draft": "先に見せて（下書きカード、承認してから反映）",
           "off": "しない"
+        },
+        "pr_checks_wait_hours": {
+          "title": "PR チェックを待つ時間",
+          "hint": "監視中の PR のチェックがこの時間を過ぎても結果が出なければ「対応待ち」に移します。1〜48。"
+        },
+        "pr_review_wait_days": {
+          "title": "PR レビューを待つ日数",
+          "hint": "監視中の PR がこの日数を超えてレビュー待ちなら「対応待ち」に移します。1〜14。"
         }
       },
       "workdir": {
@@ -11977,8 +11999,8 @@
       },
       "workspace": {
         "empty": "今は実行中のものはありません",
-        "open": "開く",
-        "emptyHint": "任せた作業の実行中は、そのセッションがここにライブ表示されます。",
+        "viewSession": "セッションを見る",
+        "emptyHint": "任せた作業の実行中は、ここに表示されます。",
         "whose": "{name} のワークスペース"
       },
       "notifyOn": "オン",
@@ -12149,12 +12171,17 @@
     },
     "feed": {
       "groups": {
-        "needs": "あなた待ち",
+        "needs": "あなたの番",
+        "running": "進行中",
+        "watch": "見守り中",
         "watching": "進行中",
         "next": "ルーティンとリマインダー",
         "done": "今日完了"
       },
       "empty": "あなたのやることも、実行中のものもありません。",
+      "suggestions": "ほかに提案が {count} 件",
+      "ignore": "無視",
+      "ignoreHint": "非表示にします。変化があれば再び表示されます",
       "failed": "アクティビティを今は読み込めません。",
       "handed": "{name}に任せました",
       "checking": "検収中 · 第 {round} ラウンド",
@@ -12166,7 +12193,57 @@
       "viewReminder": "リマインダーを見る",
       "viewCheck": "検収セッションを見る",
       "openTask": "タスクを開く",
-      "routineDeleted": "このルーティンは削除されています。"
+      "routineDeleted": "このルーティンは削除されています。",
+      "why": {
+        "no_reply": "{name}から返信なし",
+        "unfinished": "未完了",
+        "checks": "チェック失敗 · 誰も修正していない",
+        "conflict": "競合 · 誰も修正していない",
+        "fix_pending": "codeg がまもなく修正",
+        "fixing": "修正中",
+        "platform_blocked": "プラットフォームがまだマージ不可",
+        "merge_queued": "マージ待ち",
+        "merging": "マージ中",
+        "check_preparing": "検収の準備中",
+        "check_settling": "検収の締めくくり中",
+        "queued": "{name}の順番待ち",
+        "in_turn": "{name}が対応中",
+        "looking": "{name}の引き取り待ち",
+        "no_trigger": "次の時間が未設定",
+        "failed": "失敗",
+        "readFailed": {
+          "auth": "読み取れません · 再ログインが必要",
+          "no_account": "読み取れません · このフォージのアカウントがありません",
+          "config": "このフォージは読み取れません",
+          "network": "読み取れません · 接続できません",
+          "api": "読み取れません · フォージがエラーを返しました",
+          "timeout": "読み取れません · フォージが応答しません",
+          "other": "読み取れません"
+        },
+        "checks_slow": "チェックが {hours} 時間結果なし",
+        "review_pending": "レビュー待ち",
+        "review_slow": "レビュー待ち {days} 日"
+      },
+      "stop": {
+        "task": "停止",
+        "turn": "{name}のこのターンを停止"
+      },
+      "ask": {
+        "approvePlan": "計画を承認",
+        "queued": "ほかに {count} 件待機中",
+        "settled": "すでに回答済みです。再読み込みしました",
+        "planAll": "計画全体を見る",
+        "planLess": "折りたたむ",
+        "planRevise": "理由を添えて差し戻す…",
+        "planReviseSend": "差し戻す",
+        "planReviseCancel": "キャンセル",
+        "planReviseHint": "何を変えるべきですか？",
+        "answered": "回答を送りました"
+      },
+      "back": {
+        "line": "アクティビティから · あと {count} 件があなたを待っています",
+        "go": "アクティビティに戻る"
+      }
     },
     "today": {
       "title": "今日",
@@ -12207,7 +12284,8 @@
         "memoryUndone": "覚えたが取り消し",
         "plan_stuck": "計画が止まっています",
         "routine_paused": "ルーティン停止中",
-        "used_up": "差し戻してもまだ不十分"
+        "used_up": "差し戻してもまだ不十分",
+        "pr_gone": "見つからない PR の監視をやめました"
       },
       "reason": {
         "failed": "失敗",
@@ -12898,7 +12976,14 @@
         }
       },
       "undoDetail": "この 2 週間、言われたとおりに行った変更 {made} 件のうち {undone} 件を取り消しました。",
-      "idleBotDetail": "2 週間誰も呼んでいません。"
+      "idleBotDetail": "2 週間誰も呼んでいません。",
+      "group": {
+        "count": "{count} 件",
+        "expand": "すべて表示",
+        "collapse": "折りたたむ",
+        "more": "ほかに {count} 件",
+        "mutedEntry": "閉じました。この種類はもう提案しません。"
+      }
     },
     "brief": {
       "title": "朝のまとめ",
@@ -13180,7 +13265,17 @@
         "answer": "回答する",
         "drop": "不要",
         "stop": "今後は知らせない",
-        "undo": "元に戻す"
+        "undo": "元に戻す",
+        "withdrawMessage": "メッセージを取り消す",
+        "stopWaiting": "返信を待たない",
+        "noReplyNeeded": "返信不要",
+        "noAnswerNeeded": "回答不要",
+        "stopFollowing": "フォローをやめる",
+        "cancelReminder": "リマインダーを取り消す",
+        "noNeedToDo": "やらなくていい",
+        "wontDo": "やらない",
+        "remove": "削除",
+        "giveUp": "この作業をあきらめる"
       },
       "hint": {
         "doneNext": "今回は完了、以降はいつもどおり：{rule}",
@@ -13239,6 +13334,7 @@
         "stopped": "作業を止めました · {time}",
         "skippedLast": "最後の回をスキップしました · {time}",
         "dropped": "あなたが外しました · {time}",
+        "givenUp": "この作業はやめました · {time}",
         "withdrawn": "{peer}へのメッセージを取り消しました · {time}",
         "stoppedWaiting": "{peer}の返事を待つのをやめました · {time}",
         "agentDone": "{name}が完了 · {time}",

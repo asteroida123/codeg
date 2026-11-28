@@ -78,6 +78,7 @@ import {
 } from "@/components/ui/dialog"
 import { usePersonalAgent } from "@/contexts/personal-agent-context"
 import { useChatMotion, useReducedMotion } from "@/hooks/use-chat-motion"
+import { readGroups, waitingKeys } from "@/lib/activity-groups"
 import { toErrorMessage } from "@/lib/app-error"
 import type { TimelineRow } from "@/lib/types"
 import { cn } from "@/lib/utils"
@@ -98,7 +99,11 @@ import {
   type ListRow as ItemRow,
   type MessageItem,
 } from "./message-items"
-import { MessageEnterContext, useEnterClass } from "./message-row"
+import {
+  JumpRowContext,
+  MessageEnterContext,
+  useEnterClass,
+} from "./message-row"
 import { OwnerBubble } from "./owner-bubble"
 import { PaReplyScope } from "./pa-card-scope"
 import { useQuoteAuthor, useQuotedRow } from "./quote-bar"
@@ -291,6 +296,10 @@ function TimeLine({ at }: { at: string }) {
 function rowIdOf(item: MessageItem): number | null {
   if (item.kind === "time") return null
   if (item.kind === "reply") return item.anchor.id
+  // A run of rule cards stands at its newest: one more that joins it came
+  // in.
+  if (item.kind === "notice" && item.rules)
+    return item.rules[item.rules.length - 1].id
   return item.row.id
 }
 
@@ -1154,8 +1163,10 @@ export function MessageList({
   // "today"'s, from the same read as the list — and opens the activity at
   // the first of it (10.7, C6); elsewhere, or with none, the cards here,
   // scrolled to.
+  // What waits on the owner, no suggestion counted (R5).
+  const groupsRead = activity ? readGroups(activity) : null
   const pill = attentionPill(
-    botId == null ? (activity?.pill.count ?? 0) : 0,
+    botId == null ? (groupsRead?.pill.count ?? 0) : 0,
     waits.length
   )
   const showWaiting = usePersonalAgentUi((s) => s.showWaiting)
@@ -1163,7 +1174,7 @@ export function MessageList({
   const conversation = botId == null ? "primary" : String(botId)
   const pillKeys = attentionKeys(
     pill,
-    (activity?.needs ?? []).map((r) => r.key),
+    activity ? waitingKeys(activity) : [],
     waits
   )
   const dismissed = usePersonalAgentUi(
@@ -1351,6 +1362,9 @@ export function MessageList({
   // ── jumps ───────────────────────────────────────────────────────────────
   // A jump asked for before the list is drawn: made once it is.
   const queuedJump = useRef<number | null>(null)
+  // The row the latest jump went to, for a card that draws it folded away
+  // to unfold (`JumpRowContext`).
+  const [jumpRow, setJumpRow] = useState<{ id: number } | null>(null)
   const scrollToRow = useCallback(
     (id: number): boolean => {
       // Held, but not drawn while only the newest rows are: once the rest
@@ -1389,6 +1403,7 @@ export function MessageList({
         until: Infinity,
       }
       jumpHold.current = held
+      setJumpRow({ id })
       let frames = 0
       const look = () => {
         if (jumpHold.current !== held) return
@@ -1478,7 +1493,7 @@ export function MessageList({
           className="top-2"
           onClick={() => {
             if (pill?.today) {
-              showWaiting(activity?.pill.first ?? null)
+              showWaiting(groupsRead?.pill.first ?? null)
               return
             }
             const first = waits[0]
@@ -1604,21 +1619,23 @@ export function MessageList({
               </div>
             ) : null}
             {scrollReady && drawn.length > 0 ? (
-              <Virtualizer
-                // Each assistant's list measured afresh.
-                key={String(botId)}
-                ref={listRef}
-                as={ListContainer}
-                scrollRef={scrollRef}
-                bufferSize={BUFFER_PX}
-                startMargin={olderHeight}
-                shift={shift}
-                keepMounted={keepMounted}
-                onScroll={updateKept}
-                data={drawn}
-              >
-                {renderRow}
-              </Virtualizer>
+              <JumpRowContext.Provider value={jumpRow}>
+                <Virtualizer
+                  // Each assistant's list measured afresh.
+                  key={String(botId)}
+                  ref={listRef}
+                  as={ListContainer}
+                  scrollRef={scrollRef}
+                  bufferSize={BUFFER_PX}
+                  startMargin={olderHeight}
+                  shift={shift}
+                  keepMounted={keepMounted}
+                  onScroll={updateKept}
+                  data={drawn}
+                >
+                  {renderRow}
+                </Virtualizer>
+              </JumpRowContext.Provider>
             ) : null}
             {items.length === 0 ? (
               <p className="py-16 text-center text-sm text-muted-foreground">
